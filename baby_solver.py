@@ -1943,7 +1943,19 @@ def sympy_sat_counterexample_search(
             witnesses.append(and_gate([rhs[k], neg(lhs[k])]))
         add_unit(or_gate(witnesses))
 
-    for env in envs_h:
+    # The route's whole cost — including this base-CNF construction, which
+    # grows as n^|vars(H)| — must respect the caller's budget. Set the
+    # deadline before grounding so a large H cannot stall past the window.
+    deadline = time.monotonic() + max(0.5, time_budget)
+    for env_idx, env in enumerate(envs_h):
+        if env_idx % 8 == 0 and time.monotonic() >= deadline:
+            return "timeout", None, {
+                "n": n,
+                "time_budget": time_budget,
+                "phase": "encoding_h",
+                "grounded_envs": env_idx,
+                "env_count": len(envs_h),
+            }
         memo_h: dict[Term, list[int | None]] = {}
         require_equal(eval_lits(h_eq["lhs"], env, memo_h), eval_lits(h_eq["rhs"], env, memo_h))
 
@@ -1957,7 +1969,6 @@ def sympy_sat_counterexample_search(
         raise SympySatTimeout()
 
     trials: list[dict[str, Any]] = []
-    deadline = time.monotonic() + max(0.5, time_budget)
     try:
         signal.signal(signal.SIGALRM, on_alarm)
         for idx, skolem in enumerate(skolems):
@@ -1973,14 +1984,18 @@ def sympy_sat_counterexample_search(
                 sub_budget = min(remaining, max(0.2, remaining * 0.8))
             else:
                 sub_budget = max(0.2, remaining / max(1, len(skolems) - idx))
-            signal.setitimer(signal.ITIMER_REAL, sub_budget)
             goal_env = dict(zip(gvars, skolem))
-            symbols = symbols[:base_symbol_count]
-            clauses = [set(clause) for clause in clauses[:base_clause_count]]
-            goal_memo: dict[Term, list[int | None]] = {}
-            require_not_equal(eval_lits(g_eq["lhs"], goal_env, goal_memo), eval_lits(g_eq["rhs"], goal_env, goal_memo))
-            enc = EncodedCNF([set(clause) for clause in clauses], {sym: i + 1 for i, sym in enumerate(symbols)})
+            signal.setitimer(signal.ITIMER_REAL, sub_budget)
             try:
+                # The per-skolem goal encoding can rival the SAT call in cost,
+                # so it must sit inside the protected window: an alarm firing
+                # here previously escaped as an uncaught SympySatTimeout and
+                # killed the entire solve.
+                symbols = symbols[:base_symbol_count]
+                clauses = [set(clause) for clause in clauses[:base_clause_count]]
+                goal_memo: dict[Term, list[int | None]] = {}
+                require_not_equal(eval_lits(g_eq["lhs"], goal_env, goal_memo), eval_lits(g_eq["rhs"], goal_env, goal_memo))
+                enc = EncodedCNF([set(clause) for clause in clauses], {sym: i + 1 for i, sym in enumerate(symbols)})
                 model = satisfiable(enc, algorithm="dpll2", all_models=False)
             except SympySatTimeout:
                 trials.append({"skolem": dict(goal_env), "status": "timeout", "sub_budget": round(sub_budget, 3)})
@@ -2021,6 +2036,16 @@ def sympy_sat_counterexample_search(
             "skolem_count": len(skolems),
             "trials": trials,
             "backend": "sympy.logic.inference.satisfiable",
+        }
+    except SympySatTimeout:
+        # Defense in depth: the per-skolem window above catches this, but if
+        # the alarm ever fires outside a protected region, fail soft as a
+        # clean timeout instead of killing the whole solve.
+        return "timeout", None, {
+            "n": n,
+            "time_budget": time_budget,
+            "skolem_count": len(skolems),
+            "trials": trials,
         }
     finally:
         signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
@@ -2216,7 +2241,10 @@ def false_route_budget(routes: list[Any], requested_budget: float) -> float:
             budget = max(budget, 45.0)
         elif max(v2_ns) >= 6:
             budget = max(budget, 24.0)
-    if sympy_ns:
+    if sympy_ns and sympy_sat_available():
+        # Advisory display floor only, and only when the route can actually
+        # run; execution budgets are owned by the caller (see
+        # false_model_search_detailed).
         budget = max(budget, 120.0)
     return max(3.0, budget)
 
@@ -2470,8 +2498,10 @@ def false_model_search_detailed(
             budget = max(budget, 24.0)
         elif max(cp_sat_ns) >= 7:
             budget = max(budget, 16.0)
-    if sympy_sat_ns:
-        budget = max(budget, 120.0)
+    # Deliberately no hidden budget floor for sympy_sat here: the caller owns
+    # the time contract. solve()'s late portfolio grants the exact-route
+    # window explicitly (bounded by remaining solve time), and the route
+    # itself returns a clean timeout when its slice is too small.
     per = max(0.5, budget / max(1, len(active_routes)))
     trials: list[dict[str, Any]] = []
     for route in active_routes:
@@ -7800,6 +7830,14 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     # Fall back to the cheap stochastic witness route and structured
     # polynomial search. These use the same certificate renderer, so any found
     # table is still judge-verified before returning.
+    late_false_budget = min(90.0, max(45.0, budget * 0.08))
+    if sympy_sat_available():
+        # The exact SAT route needs a wide window to be useful. Grant it
+        # explicitly here (previously a hidden 120s floor inside
+        # false_model_search_detailed), but never beyond half the remaining
+        # global budget — the solve() contract outranks any single route.
+        remaining_now = max(0.0, budget - (time.monotonic() - solve_started))
+        late_false_budget = min(max(late_false_budget, 120.0), max(5.0, remaining_now * 0.5))
     found, false_state = false_model_search_detailed(
         h_eq,
         g_eq,
@@ -7813,7 +7851,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                 "poly_ce:tier=2:nmax=13",
                 "structured_ce:max_n=7",
             ],
-            "budget": min(90.0, max(45.0, budget * 0.08)),
+            "budget": late_false_budget,
         },
         8,
         semantic_context=semantic_context,
