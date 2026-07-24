@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.artifacts/
+official-stage2/
+sidecar_runs/
+.venv/
+venv/
+.env
+*.env
+*.log
+configs/*.local.json

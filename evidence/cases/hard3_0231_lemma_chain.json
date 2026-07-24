@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "problem_id": "hard3_0231",
+  "verdict": "true",
+  "model": "gpt-oss-120b via an OpenAI-compatible chat API",
+  "equation1": "x = ((y ◇ x) ◇ y) ◇ (z ◇ z)",
+  "equation2": "x = (y ◇ (x ◇ (y ◇ x))) ◇ x",
+  "mechanical_stuck_state": {
+    "kind": "SearchState",
+    "status": "artificial_frontier_stuck",
+    "target": "x = ((y ◇ (x ◇ (y ◇ x))) ◇ x)",
+    "need_hint": {
+      "kind": "bridge_terms",
+      "left_term": "x",
+      "right_term": "((y ◇ (x ◇ (y ◇ x))) ◇ x)",
+      "reason": "would connect the target equality components"
+    },
+    "left_component_size": 1,
+    "right_component_size": 9,
+    "closest_pairs": [
+      {
+        "left": "x",
+        "right": "((y ◇ (x ◇ (y ◇ x))) ◇ x)",
+        "similarity": 0.077
+      }
+    ]
+  },
+  "llm_action": {
+    "kind": "tool_call",
+    "tool": "lemma_chain",
+    "target": "goal",
+    "lemmas": [
+      {"name": "square_const", "equation": "u ◇ u = v ◇ v"},
+      {"name": "right_id_square", "equation": "u ◇ (v ◇ v) = u"},
+      {"name": "sandwich", "equation": "(v ◇ u) ◇ v = u"},
+      {"name": "left_sandwich", "equation": "v ◇ (u ◇ v) = u"}
+    ],
+    "why": "provides square and sandwich identities needed to transform the hypothesis into the target"
+  },
+  "mechanical_consumption": {
+    "body_built": true,
+    "proved_lemmas": [
+      "square_const",
+      "right_id_square",
+      "sandwich",
+      "left_sandwich"
+    ],
+    "goal_search_status_after_helpers": "proved",
+    "lean_certificate": "evidence/lean/hard3_0231_submission.lean"
+  },
+  "judge": {
+    "status": "accepted",
+    "accepted": true,
+    "message": "certificate accepted",
+    "axioms": [],
+    "seconds": 1.285
+  },
+  "attribution": {
+    "winning_category": "llm_load_bearing",
+    "winning_route": "llm:hint_payload",
+    "llm_calls": 1,
+    "judge_calls": 1
+  }
+}

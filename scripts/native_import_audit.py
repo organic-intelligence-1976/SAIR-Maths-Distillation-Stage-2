@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Audit native tool contracts and verify that the reference mechanical fallback is retired."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import baby_solver  # noqa: E402
+
+
+VALID = {
+    "domain": {"true", "false"},
+    "scope": {"whole_goal", "subgoal", "both"},
+    "cost": {"cheap", "medium", "expensive"},
+    "feedback_quality": {"minimal", "basic", "structured", "rich", "judge_exact"},
+}
+REQUIRED_FIELDS = ("domain", "scope", "cost", "feedback_quality", "native_import")
+RETIRED_MARKERS = (
+    "REFERENCE_SOLVER_B64_ZLIB",
+    "reference_solver_source",
+    "reference_namespace",
+    "run_reference_mechanical_tool",
+    "child_reference",
+    "reference_child_fallback",
+)
+
+NATIVE_COMPONENTS = {
+    "implied_aux_lemmas": {
+        "native_tools": ["standard_aux_superposition"],
+        "next": "Improve lemma selection and consumption only when attributed gaps justify it.",
+    },
+    "superposition_bodies": {
+        "native_tools": ["goal_superposition", "standard_aux_superposition"],
+        "next": "Improve proof-node reuse and frontier feedback.",
+    },
+    "battery_bodies": {
+        "native_tools": ["proof_battery"],
+        "next": "Keep graph-first consumption and add layers only from measured gaps.",
+    },
+    "saturation_bodies": {
+        "native_tools": ["forward_saturation", "deep_saturation"],
+        "next": "Tune bounded pool/depth profiles from attribution.",
+    },
+    "certificate_bodies": {
+        "native_tools": ["rowconst_certificates", "grounding_derived", "grounding_h"],
+        "next": "Add a focused certificate family only when a missing category is identified.",
+    },
+    "finite_model_search": {
+        "native_tools": ["false_model_search:model_finder", "false_model_search:model_finder_v2"],
+        "next": "Keep propagation diagnostics and route-continuation feedback.",
+    },
+    "structured_counterexamples": {
+        "native_tools": ["false_model_search:structured_ce", "false_model_search:poly_ce"],
+        "next": "Add named families independently; do not restore an opaque solver dependency.",
+    },
+    "local_and_exact_search": {
+        "native_tools": ["false_model_search:local_search", "false_model_search:cp_sat"],
+        "next": "Tune scheduling and budgets from fixed-corpus evidence.",
+    },
+}
+
+
+def audit_registry() -> dict[str, Any]:
+    tools = []
+    issues = []
+    for name, spec in baby_solver.TOOL_REGISTRY.items():
+        missing = [field for field in REQUIRED_FIELDS if field not in spec]
+        invalid = {
+            field: spec.get(field)
+            for field, allowed in VALID.items()
+            if field in spec and spec.get(field) not in allowed
+        }
+        if missing or invalid:
+            issues.append({"tool": name, "missing": missing, "invalid": invalid})
+        tools.append({
+            "tool": name,
+            **{field: spec.get(field) for field in REQUIRED_FIELDS},
+            "aliases": spec.get("aliases", [])[:4],
+        })
+    return {"ok": not issues, "issues": issues, "tools": tools}
+
+
+def audit_retirement() -> dict[str, Any]:
+    source = (ROOT / "baby_solver.py").read_text(encoding="utf-8")
+    found_markers = [marker for marker in RETIRED_MARKERS if marker in source]
+    missing_tools = {
+        component: [
+            tool.split(":", 1)[0]
+            for tool in meta["native_tools"]
+            if tool.split(":", 1)[0] not in baby_solver.TOOL_REGISTRY
+        ]
+        for component, meta in NATIVE_COMPONENTS.items()
+    }
+    missing_tools = {name: tools for name, tools in missing_tools.items() if tools}
+    components = [
+        {
+            "component": name,
+            "present_in_embedded_reference": False,
+            "native_status": "native" if name not in missing_tools else "missing",
+            "source_independent": True,
+            **meta,
+        }
+        for name, meta in NATIVE_COMPONENTS.items()
+    ]
+    blockers = []
+    if found_markers:
+        blockers.append(f"retired dependency markers remain: {', '.join(found_markers)}")
+    if missing_tools:
+        blockers.append(f"native component tools are missing: {json.dumps(missing_tools, sort_keys=True)}")
+    return {
+        # Retain these field names so older artifact readers fail gracefully.
+        "embedded_reference_available": False,
+        "child_fallback_enabled": bool(found_markers),
+        "fallback_retired": not blockers,
+        "retired_dependency_markers": found_markers,
+        "components": components,
+        "unmapped_interesting_functions": [],
+        "retirement_blockers": blockers,
+    }
+
+
+def write_markdown(result: dict[str, Any], path: Path) -> None:
+    registry = result["registry"]
+    retirement = result["reference_baseline"]
+    lines = [
+        "# Native Capability Audit",
+        "",
+        "Generated by `scripts/native_import_audit.py`.",
+        "",
+        f"- Registry contract complete: `{registry['ok']}`",
+        f"- Embedded reference mechanical source available: `{retirement['embedded_reference_available']}`",
+        f"- Child fallback enabled: `{retirement['child_fallback_enabled']}`",
+        f"- Fallback fully retired: `{retirement['fallback_retired']}`",
+        "",
+        "## Tool Contracts",
+        "",
+        "| Tool | Domain | Scope | Cost | Feedback | Native implementation |",
+        "|---|---|---|---|---|---|",
+    ]
+    for tool in registry["tools"]:
+        lines.append(
+            f"| {tool['tool']} | {tool['domain']} | {tool['scope']} | "
+            f"{tool['cost']} | {tool['feedback_quality']} | {tool['native_import']} |"
+        )
+    if registry["issues"]:
+        lines.extend(["", "## Registry Issues", ""])
+        for issue in registry["issues"]:
+            lines.append(f"- `{issue['tool']}` missing={issue['missing']} invalid={issue['invalid']}")
+    lines.extend([
+        "",
+        "## Retained Native Capability Categories",
+        "",
+        "| Category | Status | Native tools | Next |",
+        "|---|---|---|---|",
+    ])
+    for component in retirement["components"]:
+        lines.append(
+            f"| {component['component']} | {component['native_status']} | "
+            f"`{json.dumps(component['native_tools'])}` | {component['next']} |"
+        )
+    lines.extend(["", "## Retirement Blockers", ""])
+    if retirement["retirement_blockers"]:
+        lines.extend(f"- {item}" for item in retirement["retirement_blockers"])
+    else:
+        lines.append("- None.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json-output", type=Path, default=ROOT / ".artifacts" / "native_import_audit.json")
+    parser.add_argument("--markdown-output", type=Path, default=ROOT / ".artifacts" / "native_import_audit.md")
+    args = parser.parse_args()
+
+    result = {"registry": audit_registry(), "reference_baseline": audit_retirement()}
+    args.json_output.parent.mkdir(parents=True, exist_ok=True)
+    args.json_output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_markdown(result, args.markdown_output)
+    print(json.dumps({
+        "json_output": str(args.json_output),
+        "markdown_output": str(args.markdown_output),
+        "registry_ok": result["registry"]["ok"],
+        "child_fallback_enabled": result["reference_baseline"]["child_fallback_enabled"],
+        "fallback_retired": result["reference_baseline"]["fallback_retired"],
+        "partial_components": [
+            row["component"]
+            for row in result["reference_baseline"]["components"]
+            if row["native_status"] != "native"
+        ],
+    }, ensure_ascii=False))
+    return 0 if result["registry"]["ok"] and result["reference_baseline"]["fallback_retired"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

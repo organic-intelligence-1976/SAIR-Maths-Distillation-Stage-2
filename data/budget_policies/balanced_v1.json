@@ -1,0 +1,21 @@
+{
+  "schema_version": "sair-midpoint-budget-v1",
+  "budget_policy": {
+    "total_budget": 60.0,
+    "initial_grant": 2.5,
+    "grant_growth": 2.0,
+    "max_grant": 10.0,
+    "max_grants_per_task": 3,
+    "attain_priority": 1.0,
+    "consume_priority": 1.2,
+    "goal_priority": 1.1,
+    "relevance_weight": 0.35,
+    "reuse_weight": 0.25,
+    "exploration_weight": 0.3,
+    "progress_weight": 0.4,
+    "companion_success_weight": 1.25,
+    "failure_penalty": 0.15,
+    "tie_break_weight": 0.001,
+    "seed": 0
+  }
+}

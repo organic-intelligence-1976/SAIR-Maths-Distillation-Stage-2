@@ -1,0 +1,6927 @@
+#!/usr/bin/env python3
+"""Baby collaborative solver for SAIR Stage 2.
+
+This is intentionally not the big coverage-oriented mechanical solver. It is a
+compact, submittable sketch of the newer LLM/mechanical architecture:
+
+1. trusted mechanical tools produce Lean or countermodels;
+2. the LLM may only choose tools or propose helper equations/tables;
+3. every candidate is checked by the official judge before we stop.
+
+The file is self-contained and uses only the Solo stdin/stdout protocol.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import re
+import select
+import sys
+import time
+import difflib
+import zlib
+from collections import Counter
+from dataclasses import dataclass, field
+from itertools import product
+from typing import Any
+
+
+PROMPT = """You are steering trusted mechanical tools for a magma equation problem.
+The magma operator is ◇, never *.
+
+Problem {problem.id}:
+  H    : {problem.equation1}
+  Goal : {problem.equation2}
+
+Problem analysis:
+{solver.problem_analysis}
+
+Mechanical analysis:
+{solver.analysis}
+
+Tool registry:
+{solver.tool_registry}
+
+Recommended tool calls:
+{solver.tool_advice}
+
+Strategy cards:
+{solver.strategy_cards}
+
+Phase directive:
+{solver.phase_directive}
+
+Previous attempts:
+{history.attempts}
+
+Mechanical feedback from solver-side hint attempts:
+{solver.mechanical_feedback}
+
+Few-shot tool-call guidance:
+{solver.fewshots}
+
+Current collaboration goal:
+{solver.collaboration_goal}
+
+Return exactly one JSON object under 600 characters, no prose, no markdown, no
+chain-of-thought. Prefer the simplest concrete tool call or hint.
+
+Allowed responses:
+There is no tool named "true_midpoint"; true-side bridges must use
+{"kind":"midpoint","lemma":"<equation>"} or {"kind":"tool_call","tool":"lemma_chain","lemmas":[...]}.
+{"kind":"tool_call","tool":"right_square_chain","target":"goal","why":"H has x = (y ◇ (y ◇ z)) ◇ (x ◇ x)"}
+{"kind":"tool_call","tool":"square_sandwich_chain","target":"goal","why":"H has x = ((y ◇ x) ◇ y) ◇ (z ◇ z)"}
+{"kind":"tool_call","tool":"rowconst_certificates","target":"goal","why":"try row-constant certificates"}
+{"kind":"tool_call","tool":"grounding_derived","target":"goal","why":"try the square-rowconst grounding-derived closer"}
+{"kind":"tool_call","tool":"proof_battery","target":"goal","why":"try graph-first old battery h-instances"}
+{"kind":"tool_call","tool":"forward_saturation","target":"goal","seed_terms":["x ◇ y","(x ◇ y) ◇ x"],"budget":3,"why":"try graph proof with extra seed terms"}
+{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8,"why":"try broad proof-carrying superposition when graph search is stuck"}
+{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10,"why":"try standard collapse/projection/rowconst lemmas"}
+{"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"direct opconst bridge when feedback shows an opconst-like derived equation"}
+{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}
+{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}
+{"kind":"midpoint","lemma":"a ◇ (b ◇ b) = b","why":"one bridge equation; solver proves H=>lemma and H+lemma=>Goal"}
+{"kind":"midpoint_chain","lemmas":["a ◇ a = b ◇ b","a ◇ (b ◇ b) = a"],"why":"short chain; each proved before use"}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"local_search","routes":["local_search:n=6:seed=2"],"budget":6}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder","routes":["model_finder:n=4"],"budget":6}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder_v2","routes":["model_finder_v2:n=6"],"budget":8}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"structured_ce","routes":["structured_ce:max_n=7"],"budget":8}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}
+{"kind":"goal_proof","proof":"intro x y\\nhave h1 := h x x x\\ngrind"}
+{"kind":"false_table","counterexample_table":[[0,1],[1,0]]}
+
+The equations in midpoint, midpoint_chain, and lemma_chain are untrusted hints.
+The solver tries to prove each helper from H before using it. Bad hints are
+ignored. If mechanical_feedback reports that a tool call or midpoint failed, do
+not repeat the exact same call; repair it or switch strategy.
+Do not write Lean unless you return kind=goal_proof. Prefer tool_call, midpoint,
+midpoint_chain, lemma_hint, lemma_chain, or false_table.
+"""
+
+
+# Protocol
+
+
+def read_msg() -> dict[str, Any]:
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return json.loads(line)
+
+
+def send_msg(msg: dict[str, Any]) -> None:
+    print(json.dumps(msg), flush=True)
+
+
+def call_judge(verdict: str, code: str) -> dict[str, Any]:
+    send_msg({"call": "judge", "verdict": verdict, "code": code})
+    return read_msg()
+
+
+def call_llm(context: dict[str, Any]) -> dict[str, Any]:
+    send_msg({"call": "llm", "context": context})
+    return read_msg()
+
+
+PROTOCOL_VERSION = "sair-collab-protocol-v0"
+
+
+@dataclass(frozen=True)
+class ProtocolIssue:
+    """Small normalized diagnostic for the LLM/mechanical adapter boundary."""
+
+    code: str
+    message: str
+    field: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {"code": self.code, "message": self.message}
+        if self.field:
+            out["field"] = self.field
+        return out
+
+
+def protocol_state(
+    kind: str,
+    status: str,
+    source: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build a protocol-v0 feedback object while preserving plain dict ergonomics."""
+    out: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "kind": kind,
+        "status": status,
+        "source": source,
+    }
+    contract = tool_contract(extra.get("tool") or source) if "tool_contract" not in extra else None
+    if contract:
+        out["tool_contract"] = contract
+    for key, value in extra.items():
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def protocolize_state(
+    state: dict[str, Any] | None,
+    source: str,
+    *,
+    status: str | None = None,
+    suggested_next_actions: list[dict[str, Any]] | None = None,
+    errors: list[dict[str, Any]] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Add protocol-v0 metadata to existing module states without wrapping them."""
+    out = dict(state or {})
+    out.setdefault("protocol_version", PROTOCOL_VERSION)
+    out.setdefault("kind", "MechanicalState")
+    if "source" in out and out["source"] != source:
+        out.setdefault("artifact_source", out["source"])
+    out["source"] = source
+    contract = tool_contract(out.get("tool") or source)
+    if contract:
+        out.setdefault("tool_contract", contract)
+    if status is not None:
+        out["status"] = status
+    else:
+        out.setdefault("status", "unknown")
+    if suggested_next_actions:
+        out["suggested_next_actions"] = suggested_next_actions
+    if errors:
+        out["errors"] = errors
+    for key, value in extra.items():
+        if value is not None:
+            out[key] = value
+    return out
+
+
+# Renewable budget allocation
+
+
+def _finite_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return default
+    return parsed
+
+
+def _clamped_float(value: Any, default: float, low: float, high: float) -> float:
+    return max(low, min(high, _finite_float(value, default)))
+
+
+def _clamped_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, parsed))
+
+
+@dataclass(frozen=True)
+class MidpointBudgetPolicy:
+    """Small, serializable genotype for recursive midpoint allocation.
+
+    Budget units currently mean seconds requested from a mechanical worker. The
+    broker charges the full grant conservatively even when a worker returns
+    early; measured wall time is retained in the event trace for later models.
+    """
+
+    total_budget: float
+    initial_grant: float = 2.5
+    grant_growth: float = 2.0
+    max_grant: float = 10.0
+    max_grants_per_task: int = 3
+    attain_priority: float = 1.0
+    consume_priority: float = 1.2
+    goal_priority: float = 1.1
+    relevance_weight: float = 0.35
+    reuse_weight: float = 0.25
+    exploration_weight: float = 0.30
+    progress_weight: float = 0.40
+    companion_success_weight: float = 1.25
+    failure_penalty: float = 0.15
+    tie_break_weight: float = 0.001
+    seed: int = 0
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Any = None,
+        *,
+        candidate_count: int = 1,
+        requested_total: Any = None,
+    ) -> "MidpointBudgetPolicy":
+        raw = dict(value) if isinstance(value, dict) else {}
+        default_total = max(10.0, 10.0 * (max(1, min(5, candidate_count)) + 1))
+        total = raw.get("total_budget", raw.get("total", requested_total))
+        total_budget = _clamped_float(total, default_total, 1.0, 600.0)
+        initial = _clamped_float(
+            raw.get("initial_grant", raw.get("minimum_grant")),
+            2.5,
+            0.1,
+            min(60.0, total_budget),
+        )
+        max_grant = _clamped_float(
+            raw.get("max_grant"),
+            10.0,
+            initial,
+            min(120.0, total_budget),
+        )
+        return cls(
+            total_budget=total_budget,
+            initial_grant=initial,
+            grant_growth=_clamped_float(raw.get("grant_growth", raw.get("growth_factor")), 2.0, 1.0, 4.0),
+            max_grant=max_grant,
+            max_grants_per_task=_clamped_int(raw.get("max_grants_per_task"), 3, 1, 8),
+            attain_priority=_clamped_float(raw.get("attain_priority"), 1.0, 0.0, 10.0),
+            consume_priority=_clamped_float(raw.get("consume_priority"), 1.2, 0.0, 10.0),
+            goal_priority=_clamped_float(raw.get("goal_priority"), 1.1, 0.0, 10.0),
+            relevance_weight=_clamped_float(raw.get("relevance_weight"), 0.35, 0.0, 10.0),
+            reuse_weight=_clamped_float(raw.get("reuse_weight"), 0.25, 0.0, 10.0),
+            exploration_weight=_clamped_float(raw.get("exploration_weight"), 0.30, 0.0, 10.0),
+            progress_weight=_clamped_float(raw.get("progress_weight"), 0.40, 0.0, 10.0),
+            companion_success_weight=_clamped_float(raw.get("companion_success_weight"), 1.25, 0.0, 10.0),
+            failure_penalty=_clamped_float(raw.get("failure_penalty"), 0.15, 0.0, 10.0),
+            tie_break_weight=_clamped_float(raw.get("tie_break_weight"), 0.001, 0.0, 1.0),
+            seed=_clamped_int(raw.get("seed"), 0, 0, 2**31 - 1),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "total_budget": self.total_budget,
+            "initial_grant": self.initial_grant,
+            "grant_growth": self.grant_growth,
+            "max_grant": self.max_grant,
+            "max_grants_per_task": self.max_grants_per_task,
+            "attain_priority": self.attain_priority,
+            "consume_priority": self.consume_priority,
+            "goal_priority": self.goal_priority,
+            "relevance_weight": self.relevance_weight,
+            "reuse_weight": self.reuse_weight,
+            "exploration_weight": self.exploration_weight,
+            "progress_weight": self.progress_weight,
+            "companion_success_weight": self.companion_success_weight,
+            "failure_penalty": self.failure_penalty,
+            "tie_break_weight": self.tie_break_weight,
+            "seed": self.seed,
+        }
+
+    @property
+    def policy_id(self) -> str:
+        encoded = json.dumps(self.to_mapping(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return f"midpoint_budget_v1_{zlib.crc32(encoded) & 0xFFFFFFFF:08x}"
+
+
+@dataclass
+class BudgetWorkItem:
+    task_id: str
+    base_score: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
+    status: str = "ready"
+    grant_count: int = 0
+    committed_budget: float = 0.0
+    failures: int = 0
+    progress: float = 0.0
+    companion_succeeded: bool = False
+    last_context_version: int = -1
+
+
+class RenewableBudgetBroker:
+    """Deterministic request/grant broker with geometric renewable leases."""
+
+    def __init__(self, policy: MidpointBudgetPolicy):
+        self.policy = policy
+        self.tasks: dict[str, BudgetWorkItem] = {}
+        self.events: list[dict[str, Any]] = []
+        self.committed_budget = 0.0
+        self.context_version = 0
+
+    def register(
+        self,
+        task_id: str,
+        *,
+        base_score: float,
+        metadata: dict[str, Any] | None = None,
+        enabled: bool = True,
+    ) -> None:
+        if task_id in self.tasks:
+            raise ValueError(f"duplicate budget task: {task_id}")
+        self.tasks[task_id] = BudgetWorkItem(
+            task_id=task_id,
+            base_score=float(base_score),
+            metadata=dict(metadata or {}),
+            enabled=enabled,
+        )
+
+    @property
+    def remaining_budget(self) -> float:
+        return max(0.0, self.policy.total_budget - self.committed_budget)
+
+    def advance_context(self) -> int:
+        self.context_version += 1
+        self.events.append({
+            "event": "context_advanced",
+            "context_version": self.context_version,
+        })
+        return self.context_version
+
+    def update(
+        self,
+        task_id: str,
+        *,
+        enabled: bool | None = None,
+        companion_succeeded: bool | None = None,
+        base_score: float | None = None,
+    ) -> None:
+        task = self.tasks[task_id]
+        if enabled is not None:
+            task.enabled = enabled
+        if companion_succeeded is not None:
+            task.companion_succeeded = companion_succeeded
+        if base_score is not None:
+            task.base_score = float(base_score)
+
+    def _tie_break(self, task_id: str) -> float:
+        encoded = f"{self.policy.seed}:{task_id}".encode("utf-8")
+        return ((zlib.crc32(encoded) & 0xFFFFFFFF) / 0xFFFFFFFF) * self.policy.tie_break_weight
+
+    def score(self, task: BudgetWorkItem) -> float:
+        exploration = self.policy.exploration_weight / ((1.0 + task.grant_count) ** 0.5)
+        return (
+            task.base_score
+            + exploration
+            + self.policy.progress_weight * task.progress
+            + (self.policy.companion_success_weight if task.companion_succeeded else 0.0)
+            - self.policy.failure_penalty * task.failures
+            + self._tie_break(task.task_id)
+        )
+
+    def _eligible(self, task: BudgetWorkItem) -> bool:
+        if not task.enabled or task.status in {"succeeded", "refuted", "cancelled"}:
+            return False
+        if task.grant_count == 0:
+            return True
+        if task.grant_count < self.policy.max_grants_per_task:
+            return True
+        return task.last_context_version < self.context_version
+
+    def next_grant(self) -> tuple[BudgetWorkItem, float] | None:
+        if self.remaining_budget <= 1e-9:
+            return None
+        eligible = [task for task in self.tasks.values() if self._eligible(task)]
+        if not eligible:
+            return None
+        unstarted = [task for task in eligible if task.grant_count == 0]
+        pool = unstarted or eligible
+        task = max(pool, key=lambda item: (self.score(item), -len(item.task_id), item.task_id))
+        requested = min(
+            self.policy.max_grant,
+            self.policy.initial_grant * (self.policy.grant_growth ** task.grant_count),
+        )
+        grant = min(requested, self.remaining_budget)
+        if grant <= 1e-9:
+            return None
+        score = self.score(task)
+        task.grant_count += 1
+        task.committed_budget += grant
+        task.last_context_version = self.context_version
+        self.committed_budget += grant
+        self.events.append({
+            "event": "grant",
+            "task_id": task.task_id,
+            "leg": task.metadata.get("leg"),
+            "candidate": task.metadata.get("candidate"),
+            "grant": round(grant, 6),
+            "grant_index": task.grant_count,
+            "score": round(score, 6),
+            "context_version": self.context_version,
+            "committed_total": round(self.committed_budget, 6),
+            "remaining": round(self.remaining_budget, 6),
+        })
+        return task, grant
+
+    def report(
+        self,
+        task_id: str,
+        outcome: str,
+        *,
+        progress: float = 0.0,
+        elapsed_seconds: float | None = None,
+        detail: Any = None,
+    ) -> None:
+        task = self.tasks[task_id]
+        task.progress = max(0.0, min(1.0, float(progress)))
+        if outcome in {"succeeded", "refuted", "cancelled"}:
+            task.status = outcome
+        else:
+            task.status = "retryable"
+            task.failures += 1
+        event: dict[str, Any] = {
+            "event": "report",
+            "task_id": task.task_id,
+            "outcome": task.status,
+            "progress": round(task.progress, 6),
+            "context_version": self.context_version,
+        }
+        if elapsed_seconds is not None:
+            event["elapsed_seconds"] = round(max(0.0, elapsed_seconds), 6)
+        if detail is not None:
+            event["detail"] = detail
+        self.events.append(event)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "kind": "renewable_budget_broker",
+            "policy_id": self.policy.policy_id,
+            "policy": self.policy.to_mapping(),
+            "committed_budget": round(self.committed_budget, 6),
+            "remaining_budget": round(self.remaining_budget, 6),
+            "context_version": self.context_version,
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "status": task.status,
+                    "enabled": task.enabled,
+                    "grant_count": task.grant_count,
+                    "committed_budget": round(task.committed_budget, 6),
+                    "failures": task.failures,
+                    "progress": round(task.progress, 6),
+                    "companion_succeeded": task.companion_succeeded,
+                    **task.metadata,
+                }
+                for task in self.tasks.values()
+            ],
+            "events": list(self.events),
+        }
+
+
+# Term algebra
+
+Term = tuple
+
+
+@dataclass
+class UniversalEquation:
+    name: str
+    eq: dict[str, Any]
+    extra_args: list[tuple[str, ...]]
+    seed_args: list[tuple[str, ...]] | None = None
+    use_args: list[tuple[str, ...]] | None = None
+
+    def as_lemma(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "eq": self.eq,
+            "extra_args": self.use_args if self.use_args is not None else self.extra_args,
+        }
+
+    def proof_extra_args(self) -> list[tuple[str, ...]]:
+        return self.seed_args if self.seed_args is not None else self.extra_args
+
+
+TOOL_REGISTRY: dict[str, dict[str, Any]] = {
+    "forward_saturation": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collaborative",
+        "aliases": ["saturation", "h_graph", "hargs"],
+        "description": "Generate h-instantiations from goal/seed terms and try the equality graph/calc renderer.",
+    },
+    "right_square_chain": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "cheap",
+        "feedback_quality": "basic",
+        "native_import": "collab_focused",
+        "aliases": ["right_square_absorb", "square_absorb_chain", "right_square_absorption"],
+        "description": "Prove/use square_absorb and right_square helper equations.",
+    },
+    "square_sandwich_chain": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "cheap",
+        "feedback_quality": "basic",
+        "native_import": "collab_focused",
+        "aliases": ["square_chain", "sandwich_chain", "square_witness_chain"],
+        "description": "Prove/use square_const, right_id_square, sandwich, and left_sandwich helpers.",
+    },
+    "rowconst_certificates": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "cheap",
+        "feedback_quality": "basic",
+        "native_import": "native_focused",
+        "aliases": ["rowconst_certificate", "explicit_rowconst"],
+        "description": "Try focused row-constant certificates.",
+    },
+    "grounding_derived": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "cheap",
+        "feedback_quality": "structured",
+        "native_import": "native_focused",
+        "aliases": ["grounding_certificates", "derived_grounding", "cert_ground_derived"],
+        "description": "Try the square-rowconst grounding-derived explicit closer.",
+    },
+    "proof_battery": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "structured",
+        "native_import": "native_graph",
+        "aliases": ["battery", "old_battery", "deterministic_battery"],
+        "description": "Try old battery h-instance layers with an explicit h-fact graph consumer first.",
+    },
+    "grounding_h": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "structured",
+        "native_import": "native_certificate",
+        "aliases": ["grounding_h_certificates", "nonorientable_grounding"],
+        "description": "Ground the exclusive variables on both sides of a non-orientable H and emit judgeable collapse certificates.",
+    },
+    "deep_saturation": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "structured",
+        "native_import": "native_saturation",
+        "aliases": ["saturation_certificates", "bounded_saturation"],
+        "description": "Grow a bounded pool from goal subterms, instantiate H in several slots, and close with a Lean-checked grind certificate.",
+    },
+    "lemma_hint": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collab_protocol",
+        "aliases": ["lemma", "midpoint", "midpoint_hint", "bridge_lemma"],
+        "description": "Prove and consume one or more untrusted bridge equations.",
+    },
+    "lemma_chain": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collab_protocol",
+        "aliases": ["chain", "helper_chain", "lemma_sequence"],
+        "description": "Prove and consume an ordered sequence of helper equations.",
+    },
+    "goal_superposition": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "expensive",
+        "feedback_quality": "rich",
+        "native_import": "native_superposition",
+        "aliases": ["superposition", "proof_carrying_superposition", "paramodulation"],
+        "description": "Run bounded proof-carrying superposition as a broad true-side consumer.",
+    },
+    "standard_aux_superposition": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "native_superposition",
+        "aliases": ["aux_superposition", "standard_aux", "collapse_lemmas", "projection_lemmas"],
+        "description": "Try standard auxiliary lemmas such as const, projections, and rowconst via proof-carrying superposition.",
+    },
+    "false_model_search": {
+        "domain": "false",
+        "scope": "whole_goal",
+        "cost": "expensive",
+        "feedback_quality": "rich",
+        "native_import": "native_false_routes",
+        "aliases": ["countermodel_search", "finite_model_search", "local_search", "model_finder", "model_finder_v2", "poly_ce", "cp_sat", "structured_ce"],
+        "description": "Search for finite countermodels. Supports deterministic structured families, local search, propagation model finding, goal-directed search, optional CP-SAT, and polynomial routes.",
+    },
+    "infinite_model_artifact": {
+        "domain": "false",
+        "scope": "whole_goal",
+        "cost": "expensive",
+        "feedback_quality": "judge_exact",
+        "native_import": "research_protocol",
+        "deployability": "research_only",
+        "aliases": ["infinite_model", "infinite_countermodel", "type_level_model"],
+        "description": "Submit a complete Lean Type-level countermodel artifact directly to the trusted false judge.",
+    },
+}
+
+TOOL_ALIASES = {
+    alias: name
+    for name, spec in TOOL_REGISTRY.items()
+    for alias in [name, *spec.get("aliases", [])]
+}
+
+TOOL_CONTRACT_FIELDS = ("domain", "scope", "cost", "feedback_quality", "native_import", "deployability")
+
+
+# Research-layer semantics.  Most competition rows do not yet have an audited
+# finite/general classification, so absence from this table deliberately means
+# "unknown", not "ordinary false".  These two entries are the first regression
+# fixtures for the curriculum described in docs/research_curriculum_plan.md.
+KNOWN_IMPLICATION_SEMANTICS: dict[tuple[int, int], dict[str, Any]] = {
+    (1167, 1763): {
+        "semantic_class": "austin_implication",
+        "semantic_target": "general_implication",
+        "general_status": "false",
+        "finite_status": "true",
+        "certificate_class": "infinite_model",
+        "source": "ETP Austin-pair classification",
+        "source_commit": "df8184f8ae59c71d6f5463b71682d871823a779c",
+        "source_registry_sha256": "38d357e116a578cd6654908c0346b4c6ee70dc801ab0a9b542a604206d926c11",
+        "note": "Every finite 1167-magma satisfies E1763, but the unrestricted implication is false.",
+    },
+    (677, 255): {
+        "semantic_class": "open_finite_implication",
+        "semantic_target": "finite_implication",
+        "general_status": "false",
+        "finite_status": "unknown",
+        "certificate_class": "finite_model_or_finite_structure_proof",
+        "source": "ETP Equation 677 chapter",
+        "note": "The unrestricted implication is false; whether E677 implies E255 in every finite magma is open.",
+    },
+}
+
+
+def implication_semantics(problem: dict[str, Any]) -> dict[str, Any]:
+    """Return an explicit finite/general status without guessing missing facts."""
+    try:
+        key = (int(problem.get("eq1_id")), int(problem.get("eq2_id")))
+    except (TypeError, ValueError):
+        key = (-1, -1)
+    known = KNOWN_IMPLICATION_SEMANTICS.get(key)
+    answer = problem.get("answer")
+    general_from_row = "true" if answer is True else "false" if answer is False else "unknown"
+    out: dict[str, Any] = {
+        "eq1_id": None if key[0] < 0 else key[0],
+        "eq2_id": None if key[1] < 0 else key[1],
+        "semantic_class": "unclassified",
+        "semantic_target": "general_implication",
+        "general_status": general_from_row,
+        "finite_status": "unknown",
+        "certificate_class": "finite_model",
+        "competition_policy": "prose_finite_vs_judge_general",
+        "current_solver_false_artifacts": ["finite_table"],
+        "research_solver_false_artifacts": ["finite_table", "infinite_model_artifact"],
+        "source": "competition row only",
+    }
+    if known:
+        out.update(known)
+    if out["general_status"] == "false" and out["finite_status"] == "true":
+        out["judge_certificate_status"] = "expressible_as_infinite_lean_model"
+        out["current_solver_certificate_status"] = "unsupported_infinite_model"
+        out["certificate_policy_conflict"] = (
+            "The Stage 2 prose requests a finite false witness, while the executable Lean "
+            "goal permits an infinite Type-level countermodel. The default competition solver "
+            "adapter only renders finite tables; the broader whole-artifact adapter is research-only."
+        )
+    else:
+        out["judge_certificate_status"] = "potentially_expressible"
+        out["current_solver_certificate_status"] = "potentially_supported"
+    return out
+
+
+def finite_countermodel_search_allowed(semantic_context: dict[str, Any] | None) -> bool:
+    """A proved finite implication is a hard stop for every finite-model route."""
+    return not semantic_context or semantic_context.get("finite_status") != "true"
+
+
+def semantic_status_state(semantic_context: dict[str, Any]) -> dict[str, Any]:
+    finite_status = semantic_context.get("finite_status", "unknown")
+    general_status = semantic_context.get("general_status", "unknown")
+    if finite_status == "true" and general_status == "false":
+        status = "finite_search_prohibited"
+        need_hint = (
+            "Do not spend more compute on finite countermodels. For unrestricted research, "
+            "seek an infinite model or a structural description of one. The Lean judge goal and "
+            "the explicit research adapter can express it, but the default competition solve path "
+            "keeps that research-only artifact lane disabled."
+        )
+        actions = [{
+            "kind": "research_task",
+            "task": "construct_infinite_countermodel",
+            "certificate_class": "infinite_model",
+        }]
+    elif finite_status == "unknown" and general_status == "false":
+        status = "finite_implication_open"
+        need_hint = (
+            "General non-implication is known, but finite status is open. Search for finite "
+            "countermodels and structural finite consequences as separate branches."
+        )
+        actions = [
+            {"kind": "research_task", "task": "search_finite_countermodel"},
+            {"kind": "research_task", "task": "derive_finite_structure_theorem"},
+        ]
+    else:
+        status = "classified" if semantic_context.get("semantic_class") != "unclassified" else "unclassified"
+        need_hint = "Treat finite and unrestricted status as unknown unless an audited registry entry says otherwise."
+        actions = []
+    return protocol_state(
+        "SemanticStatus",
+        status,
+        "semantic_registry",
+        semantics=semantic_context,
+        need_hint=need_hint,
+        suggested_next_actions=actions or None,
+    )
+
+
+# A capability mask is an experimental intervention, not a performance flag.
+# Each tool has its own switch; composite tools also name the primitive they
+# depend on so negative controls can remove both a shortcut and its substitute.
+CAPABILITY_DEPENDENCIES: dict[str, list[str]] = {
+    "lemma_hint": ["primitive:generic_midpoint_prover"],
+    "lemma_chain": ["primitive:generic_midpoint_prover"],
+    "goal_superposition": ["primitive:proof_carrying_superposition"],
+    "standard_aux_superposition": ["primitive:proof_carrying_superposition"],
+    "false_model_search": ["primitive:finite_model_search"],
+    "infinite_model_artifact": ["artifact:infinite_model", "primitive:lean_verifier"],
+}
+
+PRIMITIVE_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "primitive:generic_midpoint_prover": {
+        "kind": "primitive",
+        "description": "Prove proposed universal bridge equations and consume them toward the goal.",
+    },
+    "primitive:proof_carrying_superposition": {
+        "kind": "primitive",
+        "description": "Bounded superposition that preserves a renderable proof trace.",
+    },
+    "primitive:finite_model_search": {
+        "kind": "primitive",
+        "description": "Finite-table countermodel routes and validation.",
+    },
+    "primitive:lean_verifier": {
+        "kind": "verifier",
+        "description": "Trusted Lean verification; never withheld in curriculum experiments.",
+    },
+    "artifact:infinite_model": {
+        "kind": "artifact",
+        "description": "Complete Lean code defining an infinite magma and proving H plus failure of the goal.",
+    },
+}
+
+
+def normalize_capability_mask(mask: Any = None) -> dict[str, list[str]]:
+    if mask is None:
+        disabled: list[str] = []
+    elif isinstance(mask, dict):
+        disabled = [str(item) for item in mask.get("disabled", [])]
+    elif isinstance(mask, (list, tuple, set)):
+        disabled = [str(item) for item in mask]
+    else:
+        disabled = [str(mask)]
+    return {"disabled": sorted(set(disabled))}
+
+
+def required_capabilities_for_tool(tool: Any) -> list[str]:
+    name = TOOL_ALIASES.get(str(tool or "").strip(), str(tool or "").strip())
+    return [f"tool:{name}", *CAPABILITY_DEPENDENCIES.get(name, [])]
+
+
+def capability_tool_for_action(action: dict[str, Any]) -> str:
+    raw = str(action.get("tool") or action.get("kind") or "").strip()
+    if raw in {"midpoint_chain", "lemma_chain"}:
+        return "lemma_chain"
+    if raw in {"midpoint", "lemma_hint"}:
+        return "lemma_hint"
+    return TOOL_ALIASES.get(raw, raw)
+
+
+def capability_gate_state(tool: Any, mask: Any = None) -> dict[str, Any] | None:
+    normalized = normalize_capability_mask(mask)
+    required = required_capabilities_for_tool(tool)
+    blocked = [capability for capability in required if capability in normalized["disabled"]]
+    if not blocked:
+        return None
+    name = TOOL_ALIASES.get(str(tool or "").strip(), str(tool or "").strip())
+    return protocol_state(
+        "CapabilityWithheldState",
+        "withheld_for_curriculum",
+        "capability_mask",
+        tool=name,
+        required_capabilities=required,
+        blocked_capabilities=blocked,
+        capability_mask=normalized,
+        need_hint="Choose a route whose required capabilities remain available; the withheld route is an experimental intervention.",
+    )
+
+
+def capability_manifest(mask: Any = None) -> dict[str, Any]:
+    normalized = normalize_capability_mask(mask)
+    disabled = set(normalized["disabled"])
+    tools = []
+    for name, spec in TOOL_REGISTRY.items():
+        required = required_capabilities_for_tool(name)
+        tools.append({
+            "capability": f"tool:{name}",
+            "tool": name,
+            "kind": "tool",
+            "domain": spec.get("domain"),
+            "required_capabilities": required,
+            "available": not any(capability in disabled for capability in required),
+            "description": spec.get("description"),
+        })
+    primitives = [
+        {"capability": name, **spec, "available": name not in disabled}
+        for name, spec in PRIMITIVE_CAPABILITIES.items()
+    ]
+    return {"mask": normalized, "tools": tools, "primitives": primitives}
+
+
+def tool_contract(tool: Any) -> dict[str, Any] | None:
+    """Return the protocol-visible contract for a tool registry entry."""
+    name = TOOL_ALIASES.get(str(tool or "").strip(), str(tool or "").strip())
+    spec = TOOL_REGISTRY.get(name)
+    if not spec:
+        return None
+    return {
+        "tool": name,
+        "capability": f"tool:{name}",
+        "required_capabilities": required_capabilities_for_tool(name),
+        **{field: spec[field] for field in TOOL_CONTRACT_FIELDS if field in spec},
+    }
+
+
+def normalize(text: str) -> str:
+    return text.replace("*", "◇") if isinstance(text, str) else text
+
+
+def variables_of(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in re.findall(r"\b([a-z][a-z0-9_]*)\b", text):
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def strip_outer(s: str) -> str:
+    s = s.strip()
+    while len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+        depth = 0
+        wraps = True
+        for i, c in enumerate(s):
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            if depth == 0 and i < len(s) - 1:
+                wraps = False
+                break
+        if not wraps:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def parse_term(text: str, variables: set[str]) -> Term:
+    s = strip_outer(normalize(text))
+    depth = 0
+    last_op = -1
+    for i, c in enumerate(s):
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "◇" and depth == 0:
+            last_op = i
+    if last_op >= 0:
+        return ("op", parse_term(s[:last_op], variables), parse_term(s[last_op + 1 :], variables))
+    if s in variables:
+        return ("var", s)
+    raise ValueError(f"cannot parse term: {text!r}")
+
+
+def parse_equation(text: str) -> dict[str, Any]:
+    text = normalize(text)
+    lhs_s, rhs_s = [p.strip() for p in text.split("=", 1)]
+    vs = variables_of(text)
+    vset = set(vs)
+    lhs = parse_term(lhs_s, vset)
+    rhs = parse_term(rhs_s, vset)
+    return {
+        "text": f"{term_to_str(lhs)} = {term_to_str(rhs)}",
+        "variables": vs,
+        "lhs": lhs,
+        "rhs": rhs,
+    }
+
+
+def term_to_str(t: Term) -> str:
+    if t[0] == "var":
+        return t[1]
+    return f"({term_to_str(t[1])} ◇ {term_to_str(t[2])})"
+
+
+def term_to_str_subst(t: Term, subst: dict[str, str]) -> str:
+    if t[0] == "var":
+        return subst.get(t[1], t[1])
+    return f"({term_to_str_subst(t[1], subst)} ◇ {term_to_str_subst(t[2], subst)})"
+
+
+def subterms(t: Term) -> list[Term]:
+    if t[0] == "var":
+        return [t]
+    return [t] + subterms(t[1]) + subterms(t[2])
+
+
+def term_variables(t: Term) -> list[str]:
+    if t[0] == "var":
+        return [t[1]]
+    return unique(term_variables(t[1]) + term_variables(t[2]))
+
+
+def one_sided_variables(eq: dict[str, Any]) -> list[str]:
+    lhs_vars = set(term_variables(eq["lhs"]))
+    rhs_vars = set(term_variables(eq["rhs"]))
+    return [v for v in eq["variables"] if (v in lhs_vars) != (v in rhs_vars)]
+
+
+def unique(items: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    seen: set[Any] = set()
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def unique_arg_rows(rows: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    out: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for row in rows:
+        tup = tuple(row)
+        if tup not in seen:
+            seen.add(tup)
+            out.append(tup)
+    return out
+
+
+def lean_arg(text: str) -> str:
+    text = text.strip()
+    if ("◇" in text or " " in text) and not (text.startswith("(") and text.endswith(")")):
+        return f"({text})"
+    return text
+
+
+# Lean wrappers
+
+
+def indent(body: str, spaces: int = 2) -> str:
+    prefix = " " * spaces
+    return "\n".join(prefix + ln if ln.strip() else ln for ln in body.splitlines())
+
+
+def make_true_code(body: str) -> str:
+    return (
+        "import JudgeProblem\n\n"
+        "set_option maxHeartbeats 12800000 in\n"
+        "def submission : Goal := by\n"
+        "  intro G _ h\n"
+        f"{indent(clean_body(body), 2)}\n"
+    )
+
+
+def table_expr_formula(table: list[list[int]]) -> str:
+    n = len(table)
+
+    def row_expr(i: int) -> str:
+        expr = str(table[i][-1])
+        for j in range(n - 2, -1, -1):
+            expr = f"if j.val = {j} then {table[i][j]} else ({expr})"
+        return expr
+
+    expr = row_expr(n - 1)
+    for i in range(n - 2, -1, -1):
+        expr = f"if i.val = {i} then ({row_expr(i)}) else ({expr})"
+    return f"Nat.mod ({expr}) {n}"
+
+
+def make_false_code(n: int, table: list[list[int]]) -> str:
+    if n <= 10 and all(0 <= int(value) <= 9 for row in table for value in row):
+        return (
+            "import JudgeProblem\n"
+            "import JudgeDecide.DecideBang\n"
+            "import JudgeFinOp.MemoFinOp\n"
+            "open MemoFinOp\n\n"
+            "set_option maxRecDepth 40000\n"
+            "set_option maxHeartbeats 1000000000\n"
+            + "def submission : Goal := by\n"
+            f"  let m : Magma (Fin {n}) := {{\n"
+            f"    op := finOpTable \"{json.dumps(table)}\"\n"
+            "  }\n"
+            f"  refine ⟨Fin {n}, m, ?_⟩\n"
+            "  decideFin!\n"
+        )
+    op_formula = table_expr_formula(table)
+    return make_false_formula_code(n, op_formula)
+
+
+def make_false_formula_code(n: int, op_formula: str) -> str:
+    return (
+        "import JudgeProblem\n"
+        "import JudgeDecide.DecideBang\n"
+        "set_option maxRecDepth 40000\n"
+        "set_option maxHeartbeats 1000000000\n"
+        "def submission : Goal := by\n"
+        f"  let m : Magma (Fin {n}) := {{ op := fun i j =>\n"
+        f"    ⟨{op_formula}, Nat.mod_lt _ (Nat.lt_of_le_of_lt (Nat.zero_le i.val) i.isLt)⟩ }}\n"
+        f"  refine ⟨Fin {n}, m, ?_⟩\n"
+        "  decideFin!\n"
+    )
+
+
+def clean_body(raw: str) -> str:
+    body = raw.strip()
+    body = re.sub(r"<think>[\s\S]*?</think>", "", body).strip()
+    body = re.sub(r"^```(?:lean)?\s*\n?", "", body)
+    body = re.sub(r"\n?```\s*$", "", body)
+    body = re.sub(r"^\s*import .*$", "", body, flags=re.MULTILINE)
+    body = re.sub(r"^.*def\s+submission\s*:.*?:=\s*by\s*", "", body, flags=re.DOTALL)
+    body = re.sub(r"^\s*intro\s+G\s+_\s+h\s*\n?", "", body)
+    return normalize(body).strip()
+
+
+# Countermodel checking/search
+
+
+def eval_term(t: Term, env: dict[str, int], table: list[list[int]]) -> int:
+    if t[0] == "var":
+        return env[t[1]]
+    return table[eval_term(t[1], env, table)][eval_term(t[2], env, table)]
+
+
+def eq_holds(eq: dict[str, Any], table: list[list[int]]) -> bool:
+    n = len(table)
+    for vals in product(range(n), repeat=len(eq["variables"])):
+        env = dict(zip(eq["variables"], vals))
+        if eval_term(eq["lhs"], env, table) != eval_term(eq["rhs"], env, table):
+            return False
+    return True
+
+
+def is_counterexample(h_eq: dict[str, Any], g_eq: dict[str, Any], table: list[list[int]]) -> bool:
+    return bool(table) and eq_holds(h_eq, table) and not eq_holds(g_eq, table)
+
+
+def witness_tables() -> list[list[list[int]]]:
+    """Small deterministic witnesses retained independently of any reference solver."""
+    return [
+        [[0, 0], [1, 1]],
+        [[0, 1], [0, 1]],
+        [[0, 0], [0, 0]],
+        [[0, 1], [1, 0]],
+        [[0, 0], [0, 1]],
+        [[0, 1], [1, 1]],
+        [[1, 0], [0, 1]],
+        [[1, 1], [1, 0]],
+        [[1, 0], [0, 0]],
+        [[1, 0], [1, 1]],
+        [[0, 1], [0, 0]],
+        [[0, 0], [1, 0]],
+        [[0, 1, 2], [1, 2, 0], [2, 0, 1]],
+        [[0, 2, 1], [2, 1, 0], [1, 0, 2]],
+        [[0, 0, 0], [0, 0, 0], [0, 1, 0]],
+        [[0, 0, 0], [0, 0, 0], [0, 0, 1]],
+        [[3, 1, 1, 3], [0, 3, 2, 3], [3, 1, 3, 3], [0, 1, 2, 3]],
+        [[1, 2, 3, 4, 0], [0, 4, 3, 4, 1], [4, 2, 2, 1, 0], [2, 0, 2, 3, 2], [3, 1, 3, 0, 4]],
+        [[0, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        [[4, 3, 2, 2, 2], [2, 3, 2, 2, 3], [2, 2, 2, 2, 2], [2, 2, 2, 2, 2], [2, 2, 2, 2, 2]],
+        [[0, 0, 0, 2, 2], [4, 1, 1, 4, 1], [1, 2, 2, 1, 2], [2, 3, 3, 3, 2], [2, 4, 4, 2, 4]],
+        [[3, 3, 2, 2], [1, 1, 0, 0], [3, 3, 2, 2], [1, 1, 0, 0]],
+        [[3, 2, 3, 3], [3, 3, 3, 3], [2, 3, 3, 3], [1, 2, 3, 3]],
+        [[2, 2, 2, 3], [3, 3, 2, 3], [2, 2, 2, 3], [3, 3, 2, 3]],
+        [[0, 2, 3, 1], [3, 1, 0, 2], [1, 3, 2, 0], [2, 0, 1, 3]],
+        [[3, 3, 2, 2, 3], [4, 4, 2, 4, 2], [2, 2, 2, 2, 2], [2, 2, 2, 2, 2], [2, 2, 2, 2, 2]],
+    ]
+
+
+def structured_tables(max_n: int = 6):
+    """Source-independent algebraic witness families, with duplicate suppression."""
+    seen: set[tuple[tuple[int, ...], ...]] = set()
+
+    def emit(table: list[list[int]]):
+        key = tuple(tuple(row) for row in table)
+        if key in seen:
+            return None
+        seen.add(key)
+        return table
+
+    for n in range(2, max_n + 1):
+        candidates = [
+            [[min(i, j) for j in range(n)] for i in range(n)],
+            [[max(i, j) for j in range(n)] for i in range(n)],
+            [[i for _ in range(n)] for i in range(n)],
+            [[j for j in range(n)] for _ in range(n)],
+            [[(i + j) % n for j in range(n)] for i in range(n)],
+            [[(i - j) % n for j in range(n)] for i in range(n)],
+            [[(-i - j) % n for j in range(n)] for i in range(n)],
+            [[(1 - i - j) % n for j in range(n)] for i in range(n)],
+            [[(i + 1) % n for _ in range(n)] for i in range(n)],
+            [[(j + 1) % n for j in range(n)] for _ in range(n)],
+            [[j if i == 0 else i for j in range(n)] for i in range(n)],
+            [[i if j == 0 else j for j in range(n)] for i in range(n)],
+        ]
+        for c in range(n):
+            candidates.append([[c] * n for _ in range(n)])
+            candidates.append([[i if i == j else c for j in range(n)] for i in range(n)])
+        for table in candidates:
+            item = emit(table)
+            if item is not None:
+                yield item
+    for rows in range(2, max_n + 1):
+        for cols in range(2, max_n + 1):
+            n = rows * cols
+            if n > max_n:
+                continue
+            table = []
+            for left in range(n):
+                left_row, _ = divmod(left, cols)
+                table.append([(left_row * cols) + (right % cols) for right in range(n)])
+            item = emit(table)
+            if item is not None:
+                yield item
+
+
+def small_false_search(h_eq: dict[str, Any], g_eq: dict[str, Any], budget: float = 4.0):
+    deadline = time.monotonic() + budget
+    for table in witness_tables():
+        if is_counterexample(h_eq, g_eq, table):
+            return len(table), table
+    for table in structured_tables(6):
+        if time.monotonic() > deadline:
+            return None
+        if is_counterexample(h_eq, g_eq, table):
+            return len(table), table
+    # Exhaustive Fin 2 only: cheap and deterministic.
+    n = 2
+    for enc in range(n ** (n * n)):
+        table = [[(enc // (n ** (i * n + j))) % n for j in range(n)] for i in range(n)]
+        if is_counterexample(h_eq, g_eq, table):
+            return n, table
+    return None
+
+
+def trace_eval(t: Term, env: dict[str, int], table: list[list[int]], touched: list[tuple[int, int]]) -> int:
+    if t[0] == "var":
+        return env[t[1]]
+    a = trace_eval(t[1], env, table, touched)
+    b = trace_eval(t[2], env, table, touched)
+    touched.append((a, b))
+    return table[a][b]
+
+
+def local_search_route(h_eq: dict[str, Any], g_eq: dict[str, Any], n: int, seed: int, budget: float):
+    rng = random.Random(seed)
+    deadline = time.monotonic() + budget
+    h_assignments = list(product(range(n), repeat=len(h_eq["variables"])))
+    while time.monotonic() < deadline:
+        table = [[rng.randrange(n) for _ in range(n)] for _ in range(n)]
+        for _ in range(3000):
+            if time.monotonic() >= deadline:
+                break
+            violated: list[list[tuple[int, int]]] = []
+            for vals in h_assignments:
+                env = dict(zip(h_eq["variables"], vals))
+                touched: list[tuple[int, int]] = []
+                if trace_eval(h_eq["lhs"], env, table, touched) != trace_eval(h_eq["rhs"], env, table, touched):
+                    violated.append(touched)
+            if not violated:
+                if is_counterexample(h_eq, g_eq, table):
+                    return table
+                break
+            cells = list(set(rng.choice(violated))) or [(rng.randrange(n), rng.randrange(n))]
+            if rng.random() < 0.35:
+                a, b = rng.choice(cells)
+                table[a][b] = rng.randrange(n)
+                continue
+            best = None
+            sample = cells[:]
+            rng.shuffle(sample)
+            for a, b in sample[:6]:
+                old = table[a][b]
+                for val in range(n):
+                    if val == old:
+                        continue
+                    table[a][b] = val
+                    count = 0
+                    for vals in h_assignments:
+                        env = dict(zip(h_eq["variables"], vals))
+                        if eval_term(h_eq["lhs"], env, table) != eval_term(h_eq["rhs"], env, table):
+                            count += 1
+                    if best is None or count < best[0]:
+                        best = (count, a, b, val)
+                table[a][b] = old
+            if best is not None:
+                _, a, b, val = best
+                table[a][b] = val
+    return None
+
+
+def mf_eval(term: Term, env: dict[str, int], table: list[list[int | None]]) -> tuple[int | None, tuple[int, int] | None]:
+    if term[0] == "var":
+        return env[term[1]], None
+    left, left_block = mf_eval(term[1], env, table)
+    if left_block is not None:
+        return None, left_block
+    right, right_block = mf_eval(term[2], env, table)
+    if right_block is not None:
+        return None, right_block
+    value = table[left][right]  # type: ignore[index]
+    if value is None:
+        return None, (left, right)  # type: ignore[arg-type]
+    return value, None
+
+
+def mf_force_top(side: Term, env: dict[str, int], table: list[list[int | None]], val: int) -> bool:
+    if side[0] != "op":
+        return False
+    left, left_block = mf_eval(side[1], env, table)
+    if left_block is not None:
+        return False
+    right, right_block = mf_eval(side[2], env, table)
+    if right_block is not None:
+        return False
+    if table[left][right] is None:  # type: ignore[index]
+        table[left][right] = val  # type: ignore[index]
+        return True
+    return False
+
+
+def mf_propagate(
+    table: list[list[int | None]],
+    envs: list[dict[str, int]],
+    lhs: Term,
+    rhs: Term,
+    stats: dict[str, Any] | None = None,
+) -> bool:
+    changed = True
+    while changed:
+        changed = False
+        for env in envs:
+            av, ab = mf_eval(lhs, env, table)
+            bv, bb = mf_eval(rhs, env, table)
+            if stats is not None:
+                stats["propagation_checks"] = stats.get("propagation_checks", 0) + 1
+                for block in (ab, bb):
+                    if block is not None:
+                        stats.setdefault("blocked_cells", Counter())[block] += 1
+            if ab is None and bb is None:
+                if av != bv:
+                    if stats is not None:
+                        stats["contradictions"] = stats.get("contradictions", 0) + 1
+                    return False
+            elif ab is None and av is not None:
+                if mf_force_top(rhs, env, table, av):
+                    if stats is not None:
+                        stats["forced_assignments"] = stats.get("forced_assignments", 0) + 1
+                    changed = True
+            elif bb is None and bv is not None:
+                if mf_force_top(lhs, env, table, bv):
+                    if stats is not None:
+                        stats["forced_assignments"] = stats.get("forced_assignments", 0) + 1
+                    changed = True
+    return True
+
+
+def partial_table_profile(table: list[list[int | None]]) -> dict[str, Any]:
+    n = len(table)
+    assigned = sum(1 for row in table for x in row if x is not None)
+    rows = []
+    for i, row in enumerate(table):
+        values = [x for x in row if x is not None]
+        rows.append({
+            "row": i,
+            "assigned": len(values),
+            "unique_values": len(set(values)),
+        })
+    return {
+        "size": n,
+        "assigned_cells": assigned,
+        "unknown_cells": n * n - assigned,
+        "row_profiles": rows,
+    }
+
+
+def top_counter(counter: Counter, limit: int = 8) -> list[dict[str, Any]]:
+    return [
+        {"cell": [int(cell[0]), int(cell[1])], "count": int(count)}
+        for cell, count in counter.most_common(limit)
+    ]
+
+
+def propagation_model_finder(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    n: int,
+    time_budget: float = 8.0,
+    node_cap: int = 1_000_000,
+) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+    envs_h = [dict(zip(h_eq["variables"], vals)) for vals in product(range(n), repeat=len(h_eq["variables"]))]
+    envs_g = [dict(zip(g_eq["variables"], vals)) for vals in product(range(n), repeat=len(g_eq["variables"]))]
+    deadline = time.monotonic() + time_budget
+    nodes = 0
+    status = "none"
+    stats: dict[str, Any] = {
+        "forced_assignments": 0,
+        "contradictions": 0,
+        "propagation_checks": 0,
+        "blocked_cells": Counter(),
+        "branch_cells": Counter(),
+    }
+    best_partial: dict[str, Any] | None = None
+    best_assigned = -1
+
+    def violates_goal(table: list[list[int | None]]) -> bool:
+        for env in envs_g:
+            av, ab = mf_eval(g_eq["lhs"], env, table)
+            bv, bb = mf_eval(g_eq["rhs"], env, table)
+            if ab is None and bb is None and av != bv:
+                return True
+        return False
+
+    def pick_cell(table: list[list[int | None]]) -> tuple[int, int] | None:
+        for env in envs_h:
+            for side in (h_eq["lhs"], h_eq["rhs"]):
+                _, block = mf_eval(side, env, table)
+                if block is not None and table[block[0]][block[1]] is None:
+                    return block
+        for i in range(n):
+            for j in range(n):
+                if table[i][j] is None:
+                    return (i, j)
+        return None
+
+    def search(table: list[list[int | None]]) -> list[list[int | None]] | None:
+        nonlocal nodes, status, best_partial, best_assigned
+        if time.monotonic() > deadline or nodes > node_cap:
+            status = "budget"
+            return None
+        nodes += 1
+        trial = [row[:] for row in table]
+        if not mf_propagate(trial, envs_h, h_eq["lhs"], h_eq["rhs"], stats):
+            return None
+        assigned = sum(1 for row in trial for x in row if x is not None)
+        if assigned > best_assigned:
+            best_assigned = assigned
+            best_partial = partial_table_profile(trial)
+        cell = pick_cell(trial)
+        if cell is None:
+            return trial if violates_goal(trial) else None
+        i, j = cell
+        stats["branch_cells"][(i, j)] += 1
+        for value in range(n):
+            trial[i][j] = value
+            found = search(trial)
+            if found is not None:
+                return found
+            if status == "budget":
+                return None
+            trial[i][j] = None
+        return None
+
+    found = search([[None] * n for _ in range(n)])
+    meta = {
+        "nodes": nodes,
+        "n": n,
+        "time_budget": time_budget,
+        "node_cap": node_cap,
+        "forced_assignments": stats["forced_assignments"],
+        "contradictions": stats["contradictions"],
+        "propagation_checks": stats["propagation_checks"],
+        "top_blocked_cells": top_counter(stats["blocked_cells"]),
+        "top_branch_cells": top_counter(stats["branch_cells"]),
+        "best_partial_table_profile": best_partial,
+    }
+    if found is not None:
+        return "found", [[int(x) for x in row] for row in found], meta
+    return status, None, meta
+
+
+def canonical_skolem_assignments(k: int, n: int) -> list[tuple[int, ...]]:
+    """Canonical assignments of k goal variables, up to relabeling."""
+    out: list[tuple[int, ...]] = []
+
+    def go(prefix: list[int], max_seen: int) -> None:
+        if len(prefix) == k:
+            out.append(tuple(prefix))
+            return
+        for value in range(min(max_seen + 1, n - 1) + 1):
+            go(prefix + [value], max(max_seen, value))
+
+    go([], -1)
+    return out
+
+
+def goal_directed_model_finder(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    n: int,
+    time_budget: float = 8.0,
+    node_cap: int = 3_000_000,
+    seed: int = 0xC0FFEE,
+) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+    """Goal-directed finite-model search with native structured telemetry.
+
+    Instead of finding any H-model and hoping it violates G, fix a canonical
+    Skolem assignment where G is required to fail. Propagation can then prune
+    branches where G is already forced true at that point.
+    """
+    envs_h = [dict(zip(h_eq["variables"], vals)) for vals in product(range(n), repeat=len(h_eq["variables"]))]
+    gvars = g_eq["variables"]
+    skolems = canonical_skolem_assignments(len(gvars), n) if gvars else [()]
+    deadline = time.monotonic() + time_budget
+    rng = random.Random(seed)
+    trials: list[dict[str, Any]] = []
+    totals = {
+        "nodes": 0,
+        "goal_prunes": 0,
+        "time_cuts": 0,
+        "cap_cuts": 0,
+        "forced_assignments": 0,
+        "contradictions": 0,
+        "propagation_checks": 0,
+        "blocked_cells": Counter(),
+        "branch_cells": Counter(),
+    }
+    best_partial: dict[str, Any] | None = None
+    best_assigned = -1
+    final_status = "none"
+
+    def pick_cell(table: list[list[int | None]], sviol: dict[str, int]) -> tuple[int, int] | None:
+        for side in (g_eq["lhs"], g_eq["rhs"]):
+            _, block = mf_eval(side, sviol, table)
+            if block is not None and table[block[0]][block[1]] is None:
+                return block
+        for env in envs_h:
+            for side in (h_eq["lhs"], h_eq["rhs"]):
+                _, block = mf_eval(side, env, table)
+                if block is not None and table[block[0]][block[1]] is None:
+                    return block
+        for i in range(n):
+            for j in range(n):
+                if table[i][j] is None:
+                    return (i, j)
+        return None
+
+    def one_pass(sviol: dict[str, int], cap: int, sub_deadline: float) -> tuple[str, list[list[int | None]] | None, dict[str, Any]]:
+        nonlocal best_partial, best_assigned
+        local_nodes = 0
+        local_goal_prunes = 0
+        outcome = "none"
+        base = max(sviol.values()) if sviol else -1
+
+        def search(table: list[list[int | None]]) -> list[list[int | None]] | None:
+            nonlocal local_nodes, local_goal_prunes, outcome, best_partial, best_assigned
+            if time.monotonic() > sub_deadline:
+                outcome = "time"
+                return None
+            if local_nodes > cap:
+                outcome = "cap"
+                return None
+            local_nodes += 1
+            totals["nodes"] += 1
+            trial = [row[:] for row in table]
+            if not mf_propagate(trial, envs_h, h_eq["lhs"], h_eq["rhs"], totals):
+                return None
+            assigned = sum(1 for row in trial for x in row if x is not None)
+            if assigned > best_assigned:
+                best_assigned = assigned
+                best_partial = partial_table_profile(trial)
+            glv, glb = mf_eval(g_eq["lhs"], sviol, trial)
+            grv, grb = mf_eval(g_eq["rhs"], sviol, trial)
+            if glb is None and grb is None and glv == grv:
+                local_goal_prunes += 1
+                totals["goal_prunes"] += 1
+                return None
+            cell = pick_cell(trial, sviol)
+            if cell is None:
+                return trial
+            i, j = cell
+            totals["branch_cells"][(i, j)] += 1
+            max_value = base
+            for row in trial:
+                for value in row:
+                    if value is not None and value > max_value:
+                        max_value = value
+            hi = max_value + 1 if max_value + 1 < n else n - 1
+            candidates = list(range(hi + 1))
+            rng.shuffle(candidates)
+            for value in candidates:
+                trial[i][j] = value
+                found = search(trial)
+                if found is not None:
+                    return found
+                if outcome in {"cap", "time"}:
+                    return None
+                trial[i][j] = None
+            return None
+
+        found = search([[None] * n for _ in range(n)])
+        meta = {
+            "skolem": dict(sviol),
+            "cap": cap,
+            "nodes": local_nodes,
+            "goal_prunes": local_goal_prunes,
+            "outcome": "found" if found is not None else outcome,
+        }
+        if found is not None:
+            return "found", found, meta
+        if outcome == "time":
+            totals["time_cuts"] += 1
+        elif outcome == "cap":
+            totals["cap_cuts"] += 1
+        return outcome, None, meta
+
+    for idx, skolem_tuple in enumerate(skolems):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            final_status = "budget"
+            break
+        sviol = dict(zip(gvars, skolem_tuple))
+        sub_deadline = time.monotonic() + remaining / max(1, len(skolems) - idx)
+        cap = 30_000
+        resolved = False
+        while time.monotonic() < sub_deadline:
+            status, table, meta = one_pass(sviol, cap, sub_deadline)
+            trials.append(meta)
+            if status == "found" and table is not None:
+                complete = [[int(x) for x in row] for row in table]
+                return "found", complete, {
+                    "n": n,
+                    "time_budget": time_budget,
+                    "node_cap": node_cap,
+                    "skolem_count": len(skolems),
+                    "trials": trials[-8:],
+                    "nodes": totals["nodes"],
+                    "goal_prunes": totals["goal_prunes"],
+                    "forced_assignments": totals["forced_assignments"],
+                    "contradictions": totals["contradictions"],
+                    "propagation_checks": totals["propagation_checks"],
+                    "top_blocked_cells": top_counter(totals["blocked_cells"]),
+                    "top_branch_cells": top_counter(totals["branch_cells"]),
+                    "best_partial_table_profile": best_partial,
+                }
+            if status == "none":
+                resolved = True
+                break
+            if status == "time":
+                break
+            cap = min(cap * 2, node_cap)
+        if not resolved:
+            final_status = "budget"
+    return final_status, None, {
+        "n": n,
+        "time_budget": time_budget,
+        "node_cap": node_cap,
+        "skolem_count": len(skolems),
+        "trials": trials[-8:],
+        "nodes": totals["nodes"],
+        "goal_prunes": totals["goal_prunes"],
+        "time_cuts": totals["time_cuts"],
+        "cap_cuts": totals["cap_cuts"],
+        "forced_assignments": totals["forced_assignments"],
+        "contradictions": totals["contradictions"],
+        "propagation_checks": totals["propagation_checks"],
+        "top_blocked_cells": top_counter(totals["blocked_cells"]),
+        "top_branch_cells": top_counter(totals["branch_cells"]),
+        "best_partial_table_profile": best_partial,
+    }
+
+
+_CP_SAT_AVAILABLE: bool | None = None
+
+
+def cp_sat_available() -> bool:
+    global _CP_SAT_AVAILABLE
+    if _CP_SAT_AVAILABLE is not None:
+        return _CP_SAT_AVAILABLE
+    try:
+        from ortools.sat.python import cp_model  # noqa: F401
+
+        _CP_SAT_AVAILABLE = True
+    except Exception:
+        _CP_SAT_AVAILABLE = False
+    return _CP_SAT_AVAILABLE
+
+
+def cp_sat_counterexample_search(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    n: int,
+    time_budget: float = 8.0,
+    workers: int = 8,
+) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+    """Optional exact finite-model route using OR-Tools when available.
+
+    This is deliberately wrapped as a false_model_search route. Environments
+    without OR-Tools simply return `unavailable`, preserving the single-file
+    submission behavior while letting richer local environments exercise a
+    stronger finite-domain consumer.
+    """
+    if not cp_sat_available():
+        return "unavailable", None, {
+            "n": n,
+            "reason": "ortools.sat.python.cp_model is not available",
+        }
+    from ortools.sat.python import cp_model
+
+    gvars = g_eq["variables"]
+    skolems = canonical_skolem_assignments(len(gvars), n) if gvars else [()]
+    deadline = time.monotonic() + max(0.2, time_budget)
+    trials: list[dict[str, Any]] = []
+
+    def build_and_solve(skolem: tuple[int, ...], sub_budget: float) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+        model = cp_model.CpModel()
+        op = {
+            (i, j): model.NewIntVar(0, n - 1, f"op_{i}_{j}")
+            for i in range(n)
+            for j in range(n)
+        }
+        flat = [op[(i, j)] for i in range(n) for j in range(n)]
+        aux_id = 0
+
+        def cp_eval(term: Term, env: dict[str, int]) -> Any:
+            nonlocal aux_id
+            if term[0] == "var":
+                return env[term[1]]
+            left = cp_eval(term[1], env)
+            right = cp_eval(term[2], env)
+            if isinstance(left, int) and isinstance(right, int):
+                return op[(left, right)]
+            idx = model.NewIntVar(0, n * n - 1, f"idx_{aux_id}")
+            out = model.NewIntVar(0, n - 1, f"val_{aux_id}")
+            aux_id += 1
+            model.Add(idx == left * n + right)
+            model.AddElement(idx, flat, out)
+            return out
+
+        for vals in product(range(n), repeat=len(h_eq["variables"])):
+            env = dict(zip(h_eq["variables"], vals))
+            model.Add(cp_eval(h_eq["lhs"], env) == cp_eval(h_eq["rhs"], env))
+
+        goal_env = dict(zip(gvars, skolem))
+        model.Add(cp_eval(g_eq["lhs"], goal_env) != cp_eval(g_eq["rhs"], goal_env))
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(0.1, sub_budget)
+        solver.parameters.num_search_workers = max(1, min(int(workers), 16))
+        status = solver.Solve(model)
+        name = solver.StatusName(status)
+        meta = {
+            "skolem": dict(goal_env),
+            "status": name,
+            "wall_time": round(float(solver.WallTime()), 3),
+            "branches": int(solver.NumBranches()),
+            "conflicts": int(solver.NumConflicts()),
+            "aux_terms": aux_id,
+        }
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            table = [[int(solver.Value(op[(i, j)])) for j in range(n)] for i in range(n)]
+            return "found", table, meta
+        if status == cp_model.INFEASIBLE:
+            return "infeasible", None, meta
+        return "unknown", None, meta
+
+    final_status = "none"
+    for idx, skolem in enumerate(skolems):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            final_status = "budget"
+            break
+        sub_budget = remaining / max(1, len(skolems) - idx)
+        status, table, meta = build_and_solve(skolem, sub_budget)
+        trials.append(meta)
+        if status == "found" and table is not None:
+            return "found", table, {
+                "n": n,
+                "time_budget": time_budget,
+                "skolem_count": len(skolems),
+                "trials": trials,
+            }
+        if status in {"unknown", "budget"}:
+            final_status = "budget"
+        elif final_status == "none":
+            final_status = "infeasible"
+    return final_status, None, {
+        "n": n,
+        "time_budget": time_budget,
+        "skolem_count": len(skolems),
+        "trials": trials,
+        "cp_sat_infeasible_skolems": sum(1 for t in trials if t.get("status") == "INFEASIBLE"),
+        "cp_sat_unknown_skolems": sum(1 for t in trials if t.get("status") not in {"INFEASIBLE", "OPTIMAL", "FEASIBLE"}),
+    }
+
+
+PCE_AFFINE = [(0, 0), (1, 0), (0, 1)]
+PCE_BILINEAR = [(0, 0), (1, 0), (0, 1), (1, 1)]
+PCE_QUADRATIC = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
+PCE_TIERS = [
+    ("affine", PCE_AFFINE, 18),
+    ("bilinear", PCE_BILINEAR, 13),
+    ("quadratic", PCE_QUADRATIC, 10),
+]
+
+
+def polynomial_table(coeffs: tuple[int, ...], basis: list[tuple[int, int]], n: int) -> list[list[int]]:
+    table = [[0] * n for _ in range(n)]
+    for a in range(n):
+        for b in range(n):
+            total = 0
+            for coeff, (ea, eb) in zip(coeffs, basis):
+                if coeff:
+                    total += coeff * (a ** ea) * (b ** eb)
+            table[a][b] = total % n
+    return table
+
+
+def polynomial_formula(coeffs: tuple[int, ...], basis: list[tuple[int, int]], n: int) -> str:
+    def mul(factors: list[str]) -> str:
+        if not factors:
+            return "1"
+        expr = factors[0]
+        for factor in factors[1:]:
+            expr = f"Nat.mul ({expr}) {factor}"
+        return expr
+
+    terms: list[str] = []
+    for coeff, (ea, eb) in zip(coeffs, basis):
+        if coeff == 0:
+            continue
+        factors = ["i.val"] * ea + ["j.val"] * eb
+        if coeff != 1 or not factors:
+            factors.insert(0, str(coeff))
+        terms.append(mul(factors))
+    if not terms:
+        total = "0"
+    else:
+        total = terms[0]
+        for term in terms[1:]:
+            total = f"Nat.add ({total}) ({term})"
+    return f"Nat.mod ({total}) {n}"
+
+
+def pce_eval(term: Term, env: dict[str, int], table: list[list[int]]) -> int:
+    if term[0] == "var":
+        return env[term[1]]
+    return table[pce_eval(term[1], env, table)][pce_eval(term[2], env, table)]
+
+
+def pce_holds(eq: dict[str, Any], n: int, table: list[list[int]], deadline: float, check_every: int = 4096) -> bool | None:
+    for idx, vals in enumerate(product(range(n), repeat=len(eq["variables"]))):
+        if idx % check_every == 0 and time.monotonic() > deadline:
+            return None
+        env = dict(zip(eq["variables"], vals))
+        if pce_eval(eq["lhs"], env, table) != pce_eval(eq["rhs"], env, table):
+            return False
+    return True
+
+
+def pce_fails(eq: dict[str, Any], n: int, table: list[list[int]], deadline: float, check_every: int = 4096) -> bool | None:
+    for idx, vals in enumerate(product(range(n), repeat=len(eq["variables"]))):
+        if idx % check_every == 0 and time.monotonic() > deadline:
+            return None
+        env = dict(zip(eq["variables"], vals))
+        if pce_eval(eq["lhs"], env, table) != pce_eval(eq["rhs"], env, table):
+            return True
+    return False
+
+
+def find_poly_counterexample(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    *,
+    nmax: int = 18,
+    time_budget: float = 12.0,
+    max_tier: int | None = None,
+) -> tuple[int, list[list[int]], str, dict[str, Any]] | None:
+    deadline = time.monotonic() + time_budget
+    tiers = PCE_TIERS if max_tier is None else PCE_TIERS[:max_tier]
+    checked = 0
+    tier_stats: list[dict[str, Any]] = []
+    for tier_index, (tier_name, basis, tier_nmax) in enumerate(tiers, start=1):
+        tier_checked = 0
+        for n in range(2, min(nmax, tier_nmax) + 1):
+            if time.monotonic() > deadline:
+                tier_stats.append({"tier": tier_name, "checked": tier_checked, "status": "budget"})
+                return None
+            for coeffs in product(range(n), repeat=len(basis)):
+                table = polynomial_table(tuple(int(c) for c in coeffs), basis, n)
+                checked += 1
+                tier_checked += 1
+                h_ok = pce_holds(h_eq, n, table, deadline)
+                if h_ok is None:
+                    tier_stats.append({"tier": tier_name, "checked": tier_checked, "status": "budget"})
+                    return None
+                if not h_ok:
+                    continue
+                g_bad = pce_fails(g_eq, n, table, deadline)
+                if g_bad is None:
+                    tier_stats.append({"tier": tier_name, "checked": tier_checked, "status": "budget"})
+                    return None
+                if g_bad:
+                    meta = {
+                        "tier": tier_name,
+                        "tier_index": tier_index,
+                        "basis": basis,
+                        "coefficients": list(coeffs),
+                        "checked_candidates": checked,
+                        "tier_stats": tier_stats + [{"tier": tier_name, "checked": tier_checked, "status": "found"}],
+                    }
+                    return n, table, polynomial_formula(tuple(int(c) for c in coeffs), basis, n), meta
+        tier_stats.append({"tier": tier_name, "checked": tier_checked, "status": "exhausted"})
+    return None
+
+
+def false_route_continuations(trials: list[dict[str, Any]]) -> list[str]:
+    tried = {str(t.get("route")) for t in trials if t.get("route") is not None}
+    local_ns = sorted({int(t["n"]) for t in trials if "seed" in t and isinstance(t.get("n"), int)})
+    model_ns = sorted({
+        int(t["n"])
+        for t in trials
+        if "seed" not in t and t.get("template") != "cp_sat" and isinstance(t.get("n"), int)
+    })
+    cp_ns = sorted({int(t["n"]) for t in trials if t.get("template") == "cp_sat" and isinstance(t.get("n"), int)})
+    candidate_ns = unique(local_ns + [6] + [min(8, n + 1) for n in local_ns])
+    out: list[str] = []
+
+    def add(route: str) -> None:
+        if route not in tried and route not in out:
+            out.append(route)
+
+    if cp_sat_available() and cp_ns:
+        cp_next = [min(9, n + 1) for n in cp_ns[-2:]]
+        base_ns = [5, 6] if max(cp_ns) <= 6 else []
+        for n in unique(cp_next + base_ns):
+            if 2 <= n <= 9:
+                add(f"cp_sat:n={n}")
+    # Prefer concrete local-search continuations at known promising sizes before
+    # jumping to broader complete searches at larger carriers.
+    for n in candidate_ns:
+        if 2 <= n <= 8:
+            for seed in (0, 1, 2, 3, 4):
+                add(f"local_search:n={n}:seed={seed}")
+    for n in unique(model_ns + [4, 5, 6, 7]):
+        if 2 <= n <= 8:
+            add(f"model_finder_v2:n={n}")
+    for n in unique(model_ns + [4, 5, 6]):
+        if 2 <= n <= 7:
+            add(f"model_finder:n={n}")
+    add("poly_ce:tier=2:nmax=13")
+    add("structured_ce:max_n=7")
+    return out[:8]
+
+
+def false_route_budget(routes: list[Any], requested_budget: float) -> float:
+    """Normalize displayed route budgets to the executor's minimums."""
+    budget = float(requested_budget or 0)
+    cp_ns: list[int] = []
+    for route in routes:
+        route_l = str(route).lower()
+        if "cp_sat" not in route_l and "cpsat" not in route_l and "constraint_sat" not in route_l:
+            continue
+        m_model = re.search(r"n=?(\d+)", route_l)
+        if m_model:
+            cp_ns.append(int(m_model.group(1)))
+    if cp_ns:
+        if max(cp_ns) >= 8:
+            budget = max(budget, 24.0)
+        elif max(cp_ns) >= 7:
+            budget = max(budget, 16.0)
+    return max(3.0, budget)
+
+
+def assigned_ratio(profile: dict[str, Any] | None) -> float | None:
+    if not isinstance(profile, dict):
+        return None
+    size = profile.get("size")
+    assigned = profile.get("assigned_cells")
+    try:
+        denom = int(size) * int(size)
+        return round(float(assigned) / float(denom), 3) if denom > 0 else None
+    except Exception:
+        return None
+
+
+def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str]) -> dict[str, Any]:
+    """Compress false-search telemetry into feedback an LLM can act on."""
+    status_counts: Counter[str] = Counter()
+    template_counts: Counter[str] = Counter()
+    tried_routes: list[str] = []
+    blocked: Counter[tuple[int, int]] = Counter()
+    branched: Counter[tuple[int, int]] = Counter()
+    best_progress: dict[str, Any] | None = None
+    best_progress_score = -1.0
+    propagation_routes: list[dict[str, Any]] = []
+    cp_sat_routes: list[dict[str, Any]] = []
+
+    for trial in trials:
+        if not isinstance(trial, dict):
+            continue
+        route = str(trial.get("route") or "")
+        if route:
+            tried_routes.append(route)
+        status_counts[str(trial.get("status") or "unknown")] += 1
+        template = str(trial.get("template") or ("local_search" if "seed" in trial else "model_finder"))
+        template_counts[template] += 1
+
+        has_propagation_diag = any(
+            key in trial
+            for key in (
+                "nodes",
+                "forced_assignments",
+                "contradictions",
+                "propagation_checks",
+                "top_blocked_cells",
+                "top_branch_cells",
+                "best_partial_table_profile",
+            )
+        )
+        if has_propagation_diag:
+            propagation_routes.append({
+                "route": route,
+                "status": trial.get("status"),
+                "n": trial.get("n"),
+                "nodes": trial.get("nodes"),
+                "forced_assignments": trial.get("forced_assignments"),
+                "contradictions": trial.get("contradictions"),
+                "propagation_checks": trial.get("propagation_checks"),
+            })
+        if template == "cp_sat":
+            cp_sat_routes.append({
+                "route": route,
+                "status": trial.get("status"),
+                "n": trial.get("n"),
+                "skolem_count": trial.get("skolem_count"),
+                "infeasible_skolems": trial.get("cp_sat_infeasible_skolems"),
+                "unknown_skolems": trial.get("cp_sat_unknown_skolems"),
+                "trials": trial.get("trials"),
+            })
+
+        for item in trial.get("top_blocked_cells") or []:
+            cell = item.get("cell") if isinstance(item, dict) else None
+            if isinstance(cell, list) and len(cell) == 2:
+                blocked[(int(cell[0]), int(cell[1]))] += int(item.get("count") or 0)
+        for item in trial.get("top_branch_cells") or []:
+            cell = item.get("cell") if isinstance(item, dict) else None
+            if isinstance(cell, list) and len(cell) == 2:
+                branched[(int(cell[0]), int(cell[1]))] += int(item.get("count") or 0)
+
+        profile = trial.get("best_partial_table_profile")
+        ratio = assigned_ratio(profile)
+        if ratio is not None and ratio > best_progress_score:
+            best_progress_score = ratio
+            best_progress = {
+                "route": route,
+                "status": trial.get("status"),
+                "assigned_ratio": ratio,
+                "profile": profile,
+            }
+
+    policy: list[str] = []
+    if continuations:
+        policy.append("Try recommended_next_call first; it is the first untried concrete route.")
+    if blocked or branched:
+        policy.append("Do not repeat exhausted routes; use hot blocked/branch cells as evidence that the next response should change route family, carrier size, seed, or provide a full table.")
+    if best_progress and best_progress.get("assigned_ratio", 0) >= 0.8:
+        policy.append("A propagation route reached a nearly complete partial table; a complete counterexample table or one nearby local_search continuation is especially useful.")
+    if any((row.get("unknown_skolems") or 0) for row in cp_sat_routes):
+        policy.append("An exact cp_sat route reached UNKNOWN rather than infeasible; retry the same carrier with more budget, then move carrier size if it remains unknown.")
+    if not policy:
+        policy.append("Return one untried false_model_search route or switch to a true-side midpoint/lemma_chain.")
+
+    return {
+        "tried_routes": tried_routes[-8:],
+        "status_counts": dict(status_counts),
+        "template_counts": dict(template_counts),
+        "propagation_route_summaries": propagation_routes[-4:],
+        "cp_sat_route_summaries": cp_sat_routes[-3:],
+        "hot_blocked_cells": top_counter(blocked, limit=5),
+        "hot_branch_cells": top_counter(branched, limit=5),
+        "best_partial_progress": best_progress,
+        "next_action_policy": policy,
+    }
+
+
+def dual_term(term: Term) -> Term:
+    if term[0] == "var":
+        return term
+    return ("op", dual_term(term[2]), dual_term(term[1]))
+
+
+def dual_equation(eq: dict[str, Any]) -> dict[str, Any]:
+    lhs = dual_term(eq["lhs"])
+    rhs = dual_term(eq["rhs"])
+    return {
+        "text": f"{term_to_str(lhs)} = {term_to_str(rhs)}",
+        "variables": list(eq["variables"]),
+        "lhs": lhs,
+        "rhs": rhs,
+    }
+
+
+def transpose_table(table: list[list[int]]) -> list[list[int]]:
+    return [[table[j][i] for j in range(len(table))] for i in range(len(table))]
+
+
+def structured_counterexample_search(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    *,
+    max_n: int = 7,
+    time_budget: float = 8.0,
+    allow_dual: bool = True,
+) -> tuple[int, list[list[int]], str] | None:
+    """Deterministic native witness portfolio, including explicit dual closure.
+
+    This replaces the former embedded-reference route. Polynomial/affine and
+    exact/stochastic searches remain separate protocol routes so the scheduler
+    can attribute their costs and feedback independently.
+    """
+    deadline = time.monotonic() + max(0.5, time_budget)
+    limit = max(2, min(int(max_n), 9))
+    for index, table in enumerate(witness_tables()):
+        if len(table) <= limit and is_counterexample(h_eq, g_eq, table):
+            return len(table), table, f"named_witness:{index}"
+    for index, table in enumerate(structured_tables(limit)):
+        if time.monotonic() >= deadline:
+            return None
+        if is_counterexample(h_eq, g_eq, table):
+            return len(table), table, f"structured_family:{index}"
+    if allow_dual:
+        remaining = deadline - time.monotonic()
+        if remaining > 0.25:
+            found = structured_counterexample_search(
+                dual_equation(h_eq),
+                dual_equation(g_eq),
+                max_n=limit,
+                time_budget=remaining,
+                allow_dual=False,
+            )
+            if found is not None:
+                n, table, route = found
+                transposed = transpose_table(table)
+                if is_counterexample(h_eq, g_eq, transposed):
+                    return n, transposed, f"dual:{route}"
+    return None
+
+
+def false_model_search_detailed(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any],
+    default_budget: float = 8.0,
+    *,
+    semantic_context: dict[str, Any] | None = None,
+):
+    if not finite_countermodel_search_allowed(semantic_context):
+        state = semantic_status_state(semantic_context or {})
+        return None, protocol_state(
+            "FalseModelSearchState",
+            "finite_search_prohibited",
+            "false_model_search",
+            tool="false_model_search",
+            trials=[],
+            semantic_status=state,
+            need_hint=state.get("need_hint"),
+            suggested_next_actions=state.get("suggested_next_actions"),
+        )
+    routes = call.get("routes") or []
+    budget = float(call.get("budget") or call.get("time_budget") or default_budget)
+    if not routes:
+        sizes = call.get("sizes") or [5, 6]
+        seeds = call.get("seeds") or [0, 1, 2]
+        template = str(call.get("template") or "").lower()
+        if template in {"model_finder_v2", "goal_directed", "goal_directed_model_finder"}:
+            routes = [f"model_finder_v2:n={int(n)}" for n in sizes]
+        elif template in {"poly", "poly_ce", "polynomial"}:
+            routes = ["poly_ce:tier=2:nmax=13"]
+        elif template in {"cp_sat", "cpsat", "constraint_sat"}:
+            routes = [f"cp_sat:n={int(n)}" for n in sizes]
+        elif template in {"structured_ce", "ce_engine", "witness_families"}:
+            routes = ["structured_ce:max_n=7"]
+        elif template in {"model_finder", "propagation", "constraint_propagation"}:
+            routes = [f"model_finder:n={int(n)}" for n in sizes]
+        else:
+            routes = [f"local_search:n={int(n)}:seed={int(s)}" for n in sizes for s in seeds]
+    route_limit = max(1, int(call.get("max_routes") or 8))
+    active_routes = list(routes[:route_limit])
+    skipped_routes = [str(route) for route in routes[route_limit:]]
+    cp_sat_ns = []
+    for route in active_routes:
+        route_l = str(route).lower()
+        if "cp_sat" not in route_l and "cpsat" not in route_l and "constraint_sat" not in route_l:
+            continue
+        m_model = re.search(r"n=?(\d+)", route_l)
+        if m_model:
+            cp_sat_ns.append(int(m_model.group(1)))
+    if cp_sat_ns:
+        # CP-SAT UNKNOWN states are budget-sensitive. Treat too-small LLM
+        # budgets as a syntax/contract weakness, not as mathematical evidence.
+        if max(cp_sat_ns) >= 8:
+            budget = max(budget, 24.0)
+        elif max(cp_sat_ns) >= 7:
+            budget = max(budget, 16.0)
+    per = max(0.5, budget / max(1, len(active_routes)))
+    trials: list[dict[str, Any]] = []
+    for route in active_routes:
+        route_s = str(route)
+        route_l = route_s.lower()
+        if "structured_ce" in route_l or "ce_engine" in route_l or "witness_families" in route_l:
+            m_nmax = re.search(r"(?:max_n|nmax)=?(\d+)", route_l)
+            max_n = int(m_nmax.group(1)) if m_nmax else 7
+            found = structured_counterexample_search(h_eq, g_eq, max_n=max_n, time_budget=per)
+            if found is None:
+                trials.append({"route": route_s, "status": "no_model", "template": "structured_ce", "max_n": max_n})
+                continue
+            n, table, source = found
+            trials.append({"route": route_s, "status": "found", "template": "structured_ce", "n": n, "source": source})
+            return (n, table), protocolize_state({
+                "kind": "FalseModelSearchState",
+                "status": "found",
+                "trials": trials,
+                "counterexample_size": n,
+                "source": f"{route_s}:{source}",
+                "witness_style": "native_structured_family",
+            }, "false_model_search")
+        if "poly" in route_l:
+            m_tier = re.search(r"tier=?(\d+)", route_l)
+            m_nmax = re.search(r"nmax=?(\d+)", route_l)
+            max_tier = int(m_tier.group(1)) if m_tier else 2
+            nmax = int(m_nmax.group(1)) if m_nmax else 13
+            result = find_poly_counterexample(h_eq, g_eq, nmax=nmax, time_budget=per, max_tier=max_tier)
+            if result is None:
+                trials.append({"route": route_s, "status": "no_model", "template": "poly_ce", "nmax": nmax, "max_tier": max_tier})
+                continue
+            n, table, formula, meta = result
+            trials.append({"route": route_s, "status": "found", "template": "poly_ce", "n": n, **meta})
+            if is_counterexample(h_eq, g_eq, table):
+                return (n, table, formula), protocolize_state({
+                    "kind": "FalseModelSearchState",
+                    "status": "found",
+                    "trials": trials,
+                    "counterexample_size": n,
+                    "source": route_s,
+                    "witness_style": "polynomial_magma",
+                    "op_formula": formula,
+                }, "false_model_search")
+            continue
+        if "cp_sat" in route_l or "cpsat" in route_l or "constraint_sat" in route_l:
+            m_model = re.search(r"n=?(\d+)", route_l)
+            if not m_model:
+                continue
+            n = int(m_model.group(1))
+            if n < 2 or n > 9:
+                continue
+            status, table, meta = cp_sat_counterexample_search(h_eq, g_eq, n, per)
+            trials.append({"route": route_s, "status": status, "template": "cp_sat", **meta})
+            if table is not None and is_counterexample(h_eq, g_eq, table):
+                return (n, table), protocolize_state({
+                    "kind": "FalseModelSearchState",
+                    "status": "found",
+                    "trials": trials,
+                    "counterexample_size": n,
+                    "source": route_s,
+                    "witness_style": "cp_sat_table",
+                }, "false_model_search")
+            continue
+        if "model_finder_v2" in route_l or "goal_directed" in route_l:
+            m_model = re.search(r"n=?(\d+)", route_l)
+            if not m_model:
+                continue
+            n = int(m_model.group(1))
+            if n < 2 or n > 8:
+                continue
+            m_seed = re.search(r"seed=?(\d+)", route_l)
+            seed = int(m_seed.group(1)) if m_seed else 0xC0FFEE
+            status, table, meta = goal_directed_model_finder(h_eq, g_eq, n, per, seed=seed)
+            trials.append({"route": route_s, "status": status, "template": "model_finder_v2", **meta})
+            if table is not None and is_counterexample(h_eq, g_eq, table):
+                return (n, table), protocolize_state({
+                    "kind": "FalseModelSearchState",
+                    "status": "found",
+                    "trials": trials,
+                    "counterexample_size": n,
+                    "source": route_s,
+                    "witness_style": "goal_directed_table",
+                }, "false_model_search")
+            continue
+        if "model_finder" in route_l or "propagation" in route_l:
+            m_model = re.search(r"n=?(\d+)", route_l)
+            if not m_model:
+                continue
+            n = int(m_model.group(1))
+            if n < 2 or n > 7:
+                continue
+            status, table, meta = propagation_model_finder(h_eq, g_eq, n, per)
+            trials.append({"route": route_s, "status": status, **meta})
+            if table is not None and is_counterexample(h_eq, g_eq, table):
+                return (n, table), protocolize_state({
+                    "kind": "FalseModelSearchState",
+                    "status": "found",
+                    "trials": trials,
+                    "counterexample_size": n,
+                    "source": route_s,
+                }, "false_model_search")
+            continue
+        m = re.search(r"n=?(\d+).*seed=?(\d+)", route_l)
+        if not m:
+            continue
+        n, seed = int(m.group(1)), int(m.group(2))
+        if n < 2 or n > 8:
+            continue
+        table = local_search_route(h_eq, g_eq, n, seed, per)
+        trials.append({"route": route_s, "status": "found" if table is not None else "no_model", "n": n, "seed": seed})
+        if table is not None and is_counterexample(h_eq, g_eq, table):
+            return (n, table), protocolize_state({
+                "kind": "FalseModelSearchState",
+                "status": "found",
+                "trials": trials,
+                "counterexample_size": n,
+                "source": route_s,
+            }, "false_model_search")
+    continuations = unique(skipped_routes + false_route_continuations(trials))
+    highlights = false_trial_highlights(trials, continuations)
+    next_call = {
+        "kind": "tool_call",
+        "tool": "false_model_search",
+        "target": "goal",
+        "routes": continuations[:1],
+        "budget": false_route_budget(continuations[:1], min(8.0, budget)),
+    } if continuations else None
+    return None, protocolize_state({
+        "kind": "FalseModelSearchState",
+        "status": "no_countermodel_found",
+        "budget_seconds": budget,
+        "route_limit": route_limit,
+        "trials": trials,
+        "skipped_routes_due_limit": skipped_routes,
+        "diagnostic_highlights": highlights,
+        "untried_requested_routes": continuations,
+        "recommended_next_call": next_call,
+        "route_policy": "Prefer one concrete untried route. Use diagnostic_highlights to avoid repeats and decide whether to change seed, carrier size, or route family.",
+        "need_hint": "Use diagnostic_highlights. Try recommended_next_call first if present; otherwise change route family/size/seed, provide a complete counterexample_table, or switch to a true-side midpoint/lemma_chain.",
+    }, "false_model_search", suggested_next_actions=[next_call] if next_call else None)
+
+
+def false_model_search(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any],
+    default_budget: float = 8.0,
+    *,
+    semantic_context: dict[str, Any] | None = None,
+):
+    found, _state = false_model_search_detailed(
+        h_eq,
+        g_eq,
+        call,
+        default_budget,
+        semantic_context=semantic_context,
+    )
+    return found
+
+
+# H-fact graph
+
+
+def goal_terms(g_eq: dict[str, Any], limit: int = 12) -> list[str]:
+    terms = sorted({term_to_str(t) for t in subterms(g_eq["lhs"]) + subterms(g_eq["rhs"])}, key=lambda s: (-len(s), s))
+    return terms[:limit]
+
+
+def unary_terms(v: str) -> list[str]:
+    return [v, f"({v} ◇ {v})", f"(({v} ◇ {v}) ◇ {v})", f"({v} ◇ ({v} ◇ {v}))"]
+
+
+def candidate_h_args(h_eq: dict[str, Any], g_eq: dict[str, Any], limit: int, extra_terms: list[str] | None = None):
+    nargs = len(h_eq["variables"])
+    if nargs == 0:
+        return []
+    vars_ = g_eq["variables"] or ["x"]
+    terms = unique((extra_terms or []) + goal_terms(g_eq, 14) + [t for v in vars_ for t in unary_terms(v)] + vars_)
+    rows: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add(row: tuple[str, ...]):
+        if len(row) == nargs and row not in seen:
+            seen.add(row)
+            rows.append(row)
+
+    if nargs == 1:
+        for a in terms:
+            add((a,))
+            if len(rows) >= limit:
+                break
+    else:
+        for fill in vars_:
+            for a in terms:
+                for b in terms[:10]:
+                    row = [fill] * nargs
+                    row[0] = a
+                    row[1] = b
+                    add(tuple(row))
+                    if len(rows) >= limit:
+                        return rows
+    return rows[:limit]
+
+
+def render_h_type(h_eq: dict[str, Any], args: tuple[str, ...]) -> tuple[str, str]:
+    sub = {v: args[i] for i, v in enumerate(h_eq["variables"])}
+    return term_to_str_subst(h_eq["lhs"], sub), term_to_str_subst(h_eq["rhs"], sub)
+
+
+def match_pattern_term(pattern: Term, target: Term, pattern_vars: set[str], subst: dict[str, str]) -> bool:
+    if pattern[0] == "var" and pattern[1] in pattern_vars:
+        value = term_to_str(target)
+        old = subst.get(pattern[1])
+        if old is None:
+            subst[pattern[1]] = value
+            return True
+        return old == value
+    if pattern[0] != target[0]:
+        return False
+    if pattern[0] == "var":
+        return pattern[1] == target[1]
+    return (
+        match_pattern_term(pattern[1], target[1], pattern_vars, subst)
+        and match_pattern_term(pattern[2], target[2], pattern_vars, subst)
+    )
+
+
+def direct_lemma_goal_args(lemma_eq: dict[str, Any], g_eq: dict[str, Any]) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    pattern_vars = set(lemma_eq["variables"])
+
+    def try_add(left_pattern: Term, right_pattern: Term, left_target: Term, right_target: Term) -> None:
+        subst: dict[str, str] = {}
+        if not match_pattern_term(left_pattern, left_target, pattern_vars, subst):
+            return
+        if not match_pattern_term(right_pattern, right_target, pattern_vars, subst):
+            return
+        if all(var in subst for var in lemma_eq["variables"]):
+            rows.append(tuple(subst[var] for var in lemma_eq["variables"]))
+
+    try_add(lemma_eq["lhs"], lemma_eq["rhs"], g_eq["lhs"], g_eq["rhs"])
+    try_add(lemma_eq["lhs"], lemma_eq["rhs"], g_eq["rhs"], g_eq["lhs"])
+    try_add(lemma_eq["rhs"], lemma_eq["lhs"], g_eq["lhs"], g_eq["rhs"])
+    try_add(lemma_eq["rhs"], lemma_eq["lhs"], g_eq["rhs"], g_eq["lhs"])
+    return unique_arg_rows(rows)
+
+
+def candidate_lemma_args(lemma_eq: dict[str, Any], g_eq: dict[str, Any], limit: int):
+    pool = unique(g_eq["variables"] + goal_terms(g_eq, 12))
+    rows: list[tuple[str, ...]] = []
+
+    for row in direct_lemma_goal_args(lemma_eq, g_eq):
+        rows.append(row)
+        if len(rows) >= limit:
+            return unique_arg_rows(rows)
+
+    for row in product(pool, repeat=len(lemma_eq["variables"])):
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return unique_arg_rows(rows)
+
+
+def safe_lean_name(raw: Any, fallback: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9_']", "_", str(raw or "").strip())
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base or not re.match(r"^[A-Za-z_]", base):
+        base = fallback
+    if base in {"G", "h", "inst", "by", "calc", "have", "intro", "grind"}:
+        base = fallback
+    return base
+
+
+def unique_lean_name(raw: Any, fallback: str, used: set[str]) -> str:
+    base = safe_lean_name(raw, fallback)
+    name = base
+    idx = 2
+    while name in used:
+        name = f"{base}_{idx}"
+        idx += 1
+    used.add(name)
+    return name
+
+
+def equation_size(eq: dict[str, Any]) -> int:
+    def size(t: Term) -> int:
+        return 1 if t[0] == "var" else 1 + size(t[1]) + size(t[2])
+
+    return size(eq["lhs"]) + size(eq["rhs"])
+
+
+def all_tables_2() -> list[list[list[int]]]:
+    out = []
+    for values in product(range(2), repeat=4):
+        out.append([list(values[:2]), list(values[2:])])
+    return out
+
+
+def hint_refutation(h_eq: dict[str, Any], hint_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Find a tiny model of H that refutes the proposed lemma, if obvious."""
+    for table in all_tables_2() + witness_tables() + list(structured_tables(3))[:6]:
+        if eq_holds(h_eq, table) and not eq_holds(hint_eq, table):
+            return {
+                "kind": "small_model_refutation",
+                "n": len(table),
+                "table": table,
+                "reason": "table satisfies H but violates the proposed midpoint",
+            }
+    return None
+
+
+def hint_score(hint: UniversalEquation, g_eq: dict[str, Any]) -> tuple[int, int, int]:
+    goal_subterms = set(goal_terms(g_eq, 24))
+    lhs = term_to_str(hint.eq["lhs"])
+    rhs = term_to_str(hint.eq["rhs"])
+    score = 0
+    if lhs in goal_subterms:
+        score += 8
+    if rhs in goal_subterms:
+        score += 8
+    if helper_kind(hint.eq["text"]):
+        score += 4
+    score += len(set(hint.eq["variables"]) & set(g_eq["variables"]))
+    return (-score, equation_size(hint.eq), len(hint.eq["variables"]))
+
+
+def ordered_hints_for_payload(payload: dict[str, Any], hints: list[UniversalEquation], g_eq: dict[str, Any]) -> list[UniversalEquation]:
+    kind = payload.get("kind") or payload.get("tool")
+    if kind in {"midpoint_chain", "lemma_chain"}:
+        return hints
+    return sorted(hints, key=lambda hint: hint_score(hint, g_eq))
+
+
+def hint_rows(value: Any) -> list[tuple[str, ...]]:
+    return [
+        tuple(str(cell) for cell in row)
+        for row in (value or [])
+        if isinstance(row, list) and all(isinstance(cell, str) for cell in row)
+    ]
+
+
+def clean_equation_hint_text(raw: str) -> str:
+    """Normalize common LLM/Lean wrappers around an equation hint."""
+    text = normalize(str(raw)).strip().strip("`")
+    text = re.sub(r"^```(?:lean|json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text)
+    text = re.sub(r"--.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"/-.*?-/", "", text, flags=re.DOTALL)
+    text = text.split(":=", 1)[0].strip()
+    text = re.sub(r"^\s*(?:lemma|theorem|have)\s+[A-Za-z0-9_']+\s*:\s*", "", text)
+    if text.startswith("∀") or text.lower().startswith("forall"):
+        parts = re.split(r",", text, maxsplit=1)
+        if len(parts) == 2:
+            text = parts[1].strip()
+    if ":" in text and "=" in text and text.index(":") < text.index("="):
+        text = text.split(":", 1)[1].strip()
+    text = text.splitlines()[0].strip().rstrip(".;")
+    return text
+
+
+def parse_universal_equations(payload: dict[str, Any]) -> list[UniversalEquation]:
+    """Extract LLM-proposed equations. Parsing is triage, not trust."""
+    items: list[Any] = []
+    payload_seed_rows = hint_rows(payload.get("seed_h_args") or payload.get("seed_args"))
+    payload_use_rows = hint_rows(payload.get("use_args") or payload.get("lemma_args"))
+    for key in ("lemma", "midpoint", "equation"):
+        if isinstance(payload.get(key), str):
+            items.append({"equation": payload[key], "name": key})
+    for key in ("lemmas", "midpoints", "lemma_chain", "chain", "steps", "equations", "lemma_hints", "hints", "candidates"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            items.append({"equation": value, "name": key})
+        elif isinstance(value, list):
+            items.extend(value)
+
+    out: list[UniversalEquation] = []
+    used: set[str] = set()
+    for idx, item in enumerate(items, start=1):
+        if isinstance(item, str):
+            eq_text = item
+            raw_name = f"m{idx}"
+            seed_rows: list[tuple[str, ...]] = []
+            use_rows: list[tuple[str, ...]] = []
+        elif isinstance(item, dict):
+            eq_text = item.get("equation") or item.get("lemma") or item.get("claim") or item.get("text")
+            raw_name = item.get("name") or item.get("kind") or f"m{idx}"
+            seed_rows = hint_rows(item.get("seed_h_args") or item.get("seed_args"))
+            if not seed_rows:
+                seed_rows = payload_seed_rows
+            use_rows = hint_rows(item.get("use_args") or item.get("lemma_args"))
+            if not use_rows:
+                use_rows = payload_use_rows
+        else:
+            continue
+        if not isinstance(eq_text, str) or "=" not in eq_text:
+            continue
+        try:
+            eq = parse_equation(clean_equation_hint_text(eq_text))
+        except Exception:
+            continue
+        if eq["lhs"] == eq["rhs"] or len(eq["variables"]) > 6 or equation_size(eq) > 40:
+            continue
+        name = unique_lean_name(raw_name, f"m{idx}", used)
+        out.append(UniversalEquation(
+            name=name,
+            eq=eq,
+            extra_args=seed_rows or use_rows,
+            seed_args=seed_rows or None,
+            use_args=use_rows or None,
+        ))
+    return out
+
+
+def render_lemma_type(lemma_eq: dict[str, Any], args: tuple[str, ...]) -> tuple[str, str]:
+    sub = {v: args[i] for i, v in enumerate(lemma_eq["variables"])}
+    return term_to_str_subst(lemma_eq["lhs"], sub), term_to_str_subst(lemma_eq["rhs"], sub)
+
+
+def lemma_statement(lemma_eq: dict[str, Any]) -> str:
+    lhs, rhs = term_to_str(lemma_eq["lhs"]), term_to_str(lemma_eq["rhs"])
+    if not lemma_eq["variables"]:
+        return f"{lhs} = {rhs}"
+    return f"∀ {' '.join(lemma_eq['variables'])} : G, {lhs} = {rhs}"
+
+
+def build_graph_facts(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    limit: int = 48,
+    lemmas: list[dict[str, Any]] | None = None,
+    lemma_limit: int = 96,
+    congruence_cap: int = 0,
+    extra_terms: list[str] | None = None,
+    extra_args: list[tuple[str, ...]] | None = None,
+):
+    facts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(fact: dict[str, Any]):
+        edge = (fact["lhs"], fact["rhs"])
+        if edge in seen or (edge[1], edge[0]) in seen:
+            return
+        seen.add(edge)
+        facts.append(fact)
+
+    h_rows = unique_arg_rows(
+        list(extra_args or []) + candidate_h_args(h_eq, g_eq, limit, extra_terms=extra_terms)
+    )
+    for args in h_rows:
+        lhs, rhs = render_h_type(h_eq, args)
+        add({"name": f"f{len(facts)+1}", "kind": "base", "call": "h " + " ".join(map(lean_arg, args)), "lhs": lhs, "rhs": rhs, "deps": []})
+
+    for lemma in lemmas or []:
+        lemma_args = unique_arg_rows(
+            list(lemma.get("extra_args") or [])
+            + candidate_lemma_args(lemma["eq"], g_eq, lemma_limit)
+        )
+        for args in lemma_args:
+            lhs, rhs = render_lemma_type(lemma["eq"], args)
+            add({"name": f"f{len(facts)+1}", "kind": "base", "call": lemma["name"] + " " + " ".join(map(lean_arg, args)), "lhs": lhs, "rhs": rhs, "deps": []})
+
+    if congruence_cap <= 0:
+        return facts
+    contexts = unique(goal_terms(g_eq, 12) + g_eq["variables"])
+    snapshot = list(facts)
+    made = 0
+    for fact in snapshot:
+        for term in contexts:
+            if made >= congruence_cap:
+                return facts
+            if term in (fact["lhs"], fact["rhs"]):
+                continue
+            add({
+                "name": f"f{len(facts)+1}",
+                "kind": "congruence",
+                "lhs": f"({fact['lhs']} ◇ {term})",
+                "rhs": f"({fact['rhs']} ◇ {term})",
+                "deps": [fact["name"]],
+                "proof": f"by simpa using congrArg (fun __baby_arg => __baby_arg ◇ {term}) {fact['name']}",
+            })
+            made += 1
+            if made >= congruence_cap:
+                return facts
+            add({
+                "name": f"f{len(facts)+1}",
+                "kind": "congruence",
+                "lhs": f"({term} ◇ {fact['lhs']})",
+                "rhs": f"({term} ◇ {fact['rhs']})",
+                "deps": [fact["name"]],
+                "proof": f"by simpa using congrArg (fun __baby_arg => {term} ◇ __baby_arg) {fact['name']}",
+            })
+            made += 1
+    return facts
+
+
+def fact_deps(facts_by_name: dict[str, dict[str, Any]], fact: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def visit(name: str):
+        if name in seen:
+            return
+        seen.add(name)
+        f = facts_by_name[name]
+        for dep in f.get("deps", []):
+            visit(dep)
+        out.append(f)
+
+    visit(fact["name"])
+    return out
+
+
+def h_graph_body(h_eq: dict[str, Any], g_eq: dict[str, Any], limit: int = 48, lemmas=None, lemma_limit=96, congruence_cap=0, extra_terms=None, extra_args=None):
+    facts = build_graph_facts(
+        h_eq,
+        g_eq,
+        limit,
+        lemmas=lemmas,
+        lemma_limit=lemma_limit,
+        congruence_cap=congruence_cap,
+        extra_terms=extra_terms,
+        extra_args=extra_args,
+    )
+    facts_by_name = {f["name"]: f for f in facts}
+    start = term_to_str(g_eq["lhs"])
+    target = term_to_str(g_eq["rhs"])
+    adj: dict[str, list[tuple[str, dict[str, Any], bool]]] = {}
+    for f in facts:
+        adj.setdefault(f["lhs"], []).append((f["rhs"], f, False))
+        adj.setdefault(f["rhs"], []).append((f["lhs"], f, True))
+    parent: dict[str, tuple[str, dict[str, Any], bool] | None] = {start: None}
+    queue = [start]
+    while queue and target not in parent:
+        cur = queue.pop(0)
+        for nxt, fact, rev in adj.get(cur, []):
+            if nxt not in parent:
+                parent[nxt] = (cur, fact, rev)
+                queue.append(nxt)
+    if target not in parent:
+        return None
+    path = []
+    node = target
+    while parent[node] is not None:
+        prev, fact, rev = parent[node]  # type: ignore[misc]
+        path.append((prev, node, fact, rev))
+        node = prev
+    path.reverse()
+    intro = "intro " + " ".join(g_eq["variables"]) if g_eq["variables"] else ""
+    if not path:
+        return intro + "\nrfl"
+    used: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for _, _, fact, _ in path:
+        for f in fact_deps(facts_by_name, fact):
+            if f["name"] not in seen_names:
+                seen_names.add(f["name"])
+                used.append(f)
+    lines = [intro] if intro else []
+    for f in used:
+        if f["kind"] == "base":
+            lines.append(f"have {f['name']} := {f['call']}")
+        else:
+            lines.append(f"have {f['name']} : {f['lhs']} = {f['rhs']} := {f['proof']}")
+    lines.append("calc")
+    for i, (prev, nxt, fact, rev) in enumerate(path):
+        lhs = prev if i == 0 else "_"
+        suffix = ".symm" if rev else ""
+        lines.append(f"  {lhs} = {nxt} := by simpa using {fact['name']}{suffix}")
+    return "\n".join(lines)
+
+
+def short_text(text: str, limit: int = 120) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def right_context_contraction_actions(h_eq: dict[str, Any], target_eq: dict[str, Any]) -> list[dict[str, Any]]:
+    """Suggest reusable helper lemmas for goals differing under one left context."""
+    actions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_action(lemma: str, left_ctx: Term, simple_right: Term, complex_right: Term, orientation: str) -> None:
+        if lemma in seen:
+            return
+        try:
+            lemma_eq = parse_equation(lemma)
+        except Exception:
+            return
+        refutation = hint_refutation(h_eq, lemma_eq)
+        if refutation is not None:
+            return
+        seen.add(lemma)
+        actions.append({
+            "kind": "midpoint",
+            "lemma": lemma,
+            "why": (
+                "goal differs only in a right argument under the same left prefix; "
+                "this reusable contraction can be proved once and then instantiated to the goal"
+            ),
+            "target_match": {
+                "orientation": orientation,
+                "left_context": term_to_str(left_ctx),
+                "simple_right": term_to_str(simple_right),
+                "complex_right": term_to_str(complex_right),
+            },
+            "refutation_checked": "no_small_countermodel_found",
+        })
+
+    def inspect(left_ctx: Term, simple_right: Term, complex_right: Term, orientation: str) -> None:
+        # Matches a◇b = a◇((b◇c)◇d), the reusable contraction needed by
+        # several row-context goals.
+        if (
+            simple_right[0] == "var"
+            and complex_right[0] == "op"
+            and complex_right[1][0] == "op"
+            and complex_right[1][1] == simple_right
+        ):
+            add_action("a ◇ ((b ◇ c) ◇ d) = a ◇ b", left_ctx, simple_right, complex_right, orientation)
+        # Also expose the other common bracketing; it is only a suggestion and
+        # remains mechanically proved/refuted before use.
+        if (
+            simple_right[0] == "var"
+            and complex_right[0] == "op"
+            and complex_right[1] == simple_right
+            and complex_right[2][0] == "op"
+        ):
+            add_action("a ◇ (b ◇ (c ◇ d)) = a ◇ b", left_ctx, simple_right, complex_right, orientation)
+
+    lhs, rhs = target_eq["lhs"], target_eq["rhs"]
+    if lhs[0] == "op" and rhs[0] == "op" and lhs[1] == rhs[1]:
+        inspect(lhs[1], lhs[2], rhs[2], "lhs_simple_rhs_complex")
+        inspect(rhs[1], rhs[2], lhs[2], "rhs_simple_lhs_complex")
+    return actions
+
+
+def goal_generalization_actions(h_eq: dict[str, Any], target_eq: dict[str, Any]) -> list[dict[str, Any]]:
+    """Suggest stronger universal lemmas of which the current goal is an instance.
+
+    This is the prompt-side counterpart to the midpoint architecture: the LLM
+    should often propose a reusable law rather than the exact goal bridge. The
+    suggestions stay untrusted; every returned lemma is still proved from H and
+    consumed mechanically before it can affect the answer.
+    """
+    lhs, rhs = target_eq["lhs"], target_eq["rhs"]
+    actions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def left_spine(t: Term) -> Term:
+        while t[0] == "op":
+            t = t[1]
+        return t
+
+    def right_spine(t: Term) -> Term:
+        while t[0] == "op":
+            t = t[2]
+        return t
+
+    def add(card: str, lemma: str, reason: str, *, action_kind: str = "midpoint") -> None:
+        if lemma in seen:
+            return
+        try:
+            lemma_eq = parse_equation(lemma)
+        except Exception:
+            return
+        refutation = hint_refutation(h_eq, lemma_eq)
+        if refutation is not None:
+            return
+        seen.add(lemma)
+        action: dict[str, Any]
+        if action_kind == "standard_aux":
+            aux = []
+            if lemma == "a ◇ b = a":
+                aux = ["proj_l"]
+            elif lemma == "a ◇ b = b":
+                aux = ["proj_r"]
+            elif lemma == "a ◇ b = a ◇ c":
+                aux = ["rowconst"]
+            elif lemma == "a ◇ b = c ◇ b":
+                aux = ["colconst"]
+            elif lemma == "a = b":
+                aux = ["const"]
+            action = {
+                "kind": "tool_call",
+                "tool": "standard_aux_superposition",
+                "target": "goal",
+                "lemmas": aux or ["const", "proj_l", "proj_r", "rowconst"],
+                "budget": 10,
+                "why": reason,
+            }
+        else:
+            action = {"kind": "midpoint", "lemma": lemma, "why": reason}
+        actions.append({
+            "card": card,
+            "lemma": lemma,
+            "reason": reason,
+            "action": action,
+        })
+
+    # Goal is T = A◇T or A◇T = T: right projection is the reusable abstraction.
+    if rhs[0] == "op" and rhs[2] == lhs:
+        add(
+            "generalize_goal_to_right_projection",
+            "a ◇ b = b",
+            "Goal is a special case of right projection: replace the compound goal term by a fresh variable.",
+            action_kind="standard_aux",
+        )
+    if lhs[0] == "op" and lhs[2] == rhs:
+        add(
+            "generalize_goal_to_right_projection",
+            "a ◇ b = b",
+            "Goal is a special case of right projection: prove a reusable projection law, then instantiate it.",
+            action_kind="standard_aux",
+        )
+
+    # Goal is T = T◇A or T◇A = T: left projection is the reusable abstraction.
+    if rhs[0] == "op" and rhs[1] == lhs:
+        add(
+            "generalize_goal_to_left_projection",
+            "a ◇ b = a",
+            "Goal is a special case of left projection: replace the repeated outer term by a fresh variable.",
+            action_kind="standard_aux",
+        )
+    if lhs[0] == "op" and lhs[1] == rhs:
+        add(
+            "generalize_goal_to_left_projection",
+            "a ◇ b = a",
+            "Goal is a special case of left projection: prove a reusable projection law, then instantiate it.",
+            action_kind="standard_aux",
+        )
+
+    # Nested projection collapse: under a◇b=a, a whole left-spine tree
+    # collapses to its leftmost leaf; under a◇b=b, it collapses to the
+    # rightmost leaf. This is often much easier to communicate as a universal
+    # lemma than as the exact nested target.
+    if rhs[0] == "op" and left_spine(rhs) == lhs:
+        add(
+            "generalize_nested_goal_to_left_projection",
+            "a ◇ b = a",
+            "Goal right side has left spine equal to the left side; left projection would collapse the whole tree.",
+            action_kind="standard_aux",
+        )
+    if lhs[0] == "op" and left_spine(lhs) == rhs:
+        add(
+            "generalize_nested_goal_to_left_projection",
+            "a ◇ b = a",
+            "Goal left side has left spine equal to the right side; left projection would collapse the whole tree.",
+            action_kind="standard_aux",
+        )
+    if rhs[0] == "op" and right_spine(rhs) == lhs:
+        add(
+            "generalize_nested_goal_to_right_projection",
+            "a ◇ b = b",
+            "Goal right side has right spine equal to the left side; right projection would collapse the whole tree.",
+            action_kind="standard_aux",
+        )
+    if lhs[0] == "op" and right_spine(lhs) == rhs:
+        add(
+            "generalize_nested_goal_to_right_projection",
+            "a ◇ b = b",
+            "Goal left side has right spine equal to the right side; right projection would collapse the whole tree.",
+            action_kind="standard_aux",
+        )
+
+    if lhs[0] == "op" and rhs[0] == "op":
+        if lhs[1] == rhs[1] and lhs[2] != rhs[2]:
+            add(
+                "generalize_same_left_to_rowconst",
+                "a ◇ b = a ◇ c",
+                "Goal has the same left argument on both sides; row-constancy is a stronger reusable bridge.",
+                action_kind="standard_aux",
+            )
+        if lhs[2] == rhs[2] and lhs[1] != rhs[1]:
+            add(
+                "generalize_same_right_to_colconst",
+                "a ◇ b = c ◇ b",
+                "Goal has the same right argument on both sides; column-constancy is a stronger reusable bridge.",
+            )
+
+    # Sometimes the target does not visibly have same-left shape until H is
+    # applied once to the goal's left side. This card lets the LLM ask for a
+    # reusable row-constant helper instead of guessing the full superposition
+    # derivation.
+    if (
+        h_eq["lhs"][0] == "op"
+        and lhs == h_eq["lhs"]
+        and rhs[0] == "op"
+    ):
+        add(
+            "rewrite_with_h_then_rowconst",
+            "a ◇ b = a ◇ c",
+            "Goal left side matches H's left side; after one H rewrite, row-constancy may bridge the remaining right-argument mismatch.",
+            action_kind="standard_aux",
+        )
+
+    goal_subs = set(subterms(lhs) + subterms(rhs))
+    if any(is_square(t) is not None for t in goal_subs):
+        add(
+            "square_terms_suggest_square_laws",
+            "a ◇ a = b ◇ b",
+            "Goal contains square terms; square-constancy is a common reusable midpoint.",
+        )
+
+    return actions
+
+
+def false_feedback_states(mechanical_feedback: list[dict[str, Any]] | None, limit: int | None = 4) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get("source") == "false_model_search" or value.get("kind") == "FalseModelSearchState":
+                states.append(value)
+            for key in ("tool_state", "state", "native_false_failed_attempts"):
+                if key in value:
+                    visit(value.get(key))
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(mechanical_feedback or [])
+    return states[-limit:] if limit is not None else states
+
+
+def false_tried_routes_from_states(states: list[dict[str, Any]]) -> set[str]:
+    routes: set[str] = set()
+    for state in states:
+        for trial in state.get("trials") or []:
+            if isinstance(trial, dict) and trial.get("route") is not None:
+                routes.add(str(trial.get("route")))
+    return routes
+
+
+def false_strategy_cards(mechanical_feedback: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    seen_actions: set[str] = set()
+    all_states = false_feedback_states(mechanical_feedback, limit=None)
+    states = all_states[-4:]
+    tried_routes = false_tried_routes_from_states(all_states)
+
+    def add_card(card: dict[str, Any]) -> None:
+        cards.append(card)
+
+    def routes_already_tried(action: dict[str, Any]) -> bool:
+        routes = [str(route) for route in action.get("routes") or []]
+        return bool(routes) and all(route in tried_routes for route in routes)
+
+    for state in reversed(states):
+        next_call = state.get("recommended_next_call")
+        if isinstance(next_call, dict):
+            action = dict(next_call)
+            action_routes = [str(route) for route in action.get("routes") or []]
+            if routes_already_tried(action):
+                continue
+            highlights_for_budget = state.get("diagnostic_highlights") or {}
+            cp_unknown_seen = any(
+                isinstance(row, dict) and (row.get("unknown_skolems") or 0)
+                for row in highlights_for_budget.get("cp_sat_route_summaries") or []
+            )
+            if cp_unknown_seen and any("cp_sat" in route.lower() for route in action_routes):
+                action["budget"] = false_route_budget(action_routes, float(action.get("budget") or 0))
+                action["why"] = (
+                    "follow false-search recommended_next_call; previous CP-SAT "
+                    "route reached UNKNOWN, so give the continuation more budget"
+                )
+            sig = compact_tool_signature(action)
+            if sig not in seen_actions:
+                seen_actions.add(sig)
+                add_card({
+                    "name": "follow_false_recommended_next_call",
+                    "principle": "When false-search telemetry gives a concrete untried continuation, try that exact route before inventing another one.",
+                    "trigger": "A previous false_model_search route failed but emitted recommended_next_call.",
+                    "recommended_action": action,
+                })
+        highlights = state.get("diagnostic_highlights") or {}
+        for row in highlights.get("cp_sat_route_summaries") or []:
+            if not isinstance(row, dict) or not (row.get("unknown_skolems") or 0):
+                continue
+            route = str(row.get("route") or "")
+            m = re.search(r"n=?(\d+)", route)
+            n = int(m.group(1)) if m else int(row.get("n") or 0)
+            retry = {
+                "kind": "tool_call",
+                "tool": "false_model_search",
+                "target": "goal",
+                "routes": [f"cp_sat:n={n}"],
+                "budget": false_route_budget([f"cp_sat:n={n}"], 16.0),
+                "why": "exact CP-SAT reached UNKNOWN; retry same carrier with more budget before changing route family",
+            }
+            nxt = {
+                "kind": "tool_call",
+                "tool": "false_model_search",
+                "target": "goal",
+                "routes": [f"cp_sat:n={min(9, n + 1)}"],
+                "budget": false_route_budget([f"cp_sat:n={min(9, n + 1)}"], 16.0),
+                "why": "exact CP-SAT reached UNKNOWN; try the next carrier size if the same size remains unknown",
+            }
+            for action in (retry, nxt):
+                if routes_already_tried(action):
+                    continue
+                sig = compact_tool_signature(action)
+                if sig not in seen_actions:
+                    seen_actions.add(sig)
+                    add_card({
+                        "name": "cp_sat_unknown_continuation",
+                        "principle": "UNKNOWN is not failure: continue exact finite-domain search with more budget or the next carrier size.",
+                        "trigger": f"{route or 'cp_sat'} reached UNKNOWN on {row.get('unknown_skolems')} Skolem branches.",
+                        "recommended_action": action,
+                    })
+        progress = highlights.get("best_partial_progress")
+        if isinstance(progress, dict) and (progress.get("assigned_ratio") or 0) >= 0.8:
+            route = str(progress.get("route") or "")
+            m = re.search(r"n=?(\d+)", route)
+            n = int(m.group(1)) if m else None
+            if n:
+                action = {
+                    "kind": "tool_call",
+                    "tool": "false_model_search",
+                    "target": "goal",
+                    "routes": [f"local_search:n={n}:seed=0"],
+                    "budget": 10,
+                    "why": "propagation reached a nearly complete partial table; try nearby stochastic completions at the same carrier",
+                }
+                if routes_already_tried(action):
+                    continue
+                sig = compact_tool_signature(action)
+                if sig not in seen_actions:
+                    seen_actions.add(sig)
+                    add_card({
+                        "name": "complete_near_partial_table",
+                        "principle": "When propagation nearly fills a table but times out, switch to nearby local_search completions at the same carrier.",
+                        "trigger": f"{route} reached assigned_ratio={progress.get('assigned_ratio')}.",
+                        "recommended_action": action,
+                    })
+    def priority(card: dict[str, Any]) -> tuple[int, str]:
+        action = card.get("recommended_action") or {}
+        routes = [str(route).lower() for route in action.get("routes") or []] if isinstance(action, dict) else []
+        if card.get("name") == "follow_false_recommended_next_call" and any("cp_sat" in route or "cpsat" in route for route in routes):
+            return (0, str(card.get("name") or ""))
+        if any("cp_sat" in route or "cpsat" in route for route in routes):
+            return (1, str(card.get("name") or ""))
+        if card.get("name") == "complete_near_partial_table":
+            return (2, str(card.get("name") or ""))
+        if card.get("name") == "follow_false_recommended_next_call":
+            return (3, str(card.get("name") or ""))
+        return (4, str(card.get("name") or ""))
+
+    return sorted(cards, key=priority)[:6]
+
+
+def top_false_recommended_action(mechanical_feedback: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    for card in false_strategy_cards(mechanical_feedback):
+        action = card.get("recommended_action")
+        if isinstance(action, dict) and action.get("tool") == "false_model_search":
+            return action
+    return None
+
+
+def strategy_cards(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    mechanical_feedback: list[dict[str, Any]] | None = None,
+    *,
+    prefer_false: bool | str = False,
+) -> list[dict[str, Any]]:
+    """LLM-facing strategy cards with triggers and concrete protocol actions."""
+    cards: list[dict[str, Any]] = []
+    for item in goal_generalization_actions(h_eq, g_eq):
+        cards.append({
+            "name": item["card"],
+            "principle": "If G is a special instance of a simpler universal law, try the universal law first.",
+            "trigger": item["reason"],
+            "recommended_action": item["action"],
+        })
+    cards.extend([
+        {
+            "name": "prefer_reusable_over_goal_specific",
+            "principle": "A direct closest-pair bridge may be too specific; prefer a reusable projection, rowconst, opconst, square_const, or contraction law when it would imply G.",
+            "recommended_actions": [
+                {"kind": "midpoint", "lemma": "a ◇ b = a", "why": "left projection candidate"},
+                {"kind": "midpoint", "lemma": "a ◇ b = b", "why": "right projection candidate"},
+                {"kind": "midpoint", "lemma": "a ◇ b = a ◇ c", "why": "row-constant candidate"},
+                {"kind": "midpoint", "lemma": "a ◇ b = c ◇ d", "why": "operation collapses to a constant product"},
+            ],
+        },
+        {
+            "name": "repair_failed_specific_hint",
+            "principle": "If a hinted bridge proves but does not close G, strengthen or generalize it; if it is refuted, change family instead of repeating it.",
+            "recommended_action": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [{"name": "proj_l", "equation": "a ◇ b = a"}, {"name": "proj_r", "equation": "a ◇ b = b"}]},
+        },
+        {
+            "name": "use_feedback_not_transcript",
+            "principle": "Use SearchState closest_pairs, proved_not_consumed helpers, and refuted_by_small_model results to choose the next action.",
+            "recommended_action": {"kind": "tool_call", "tool": "lemma_hint", "target": "goal", "lemmas": [{"equation": "<non-refuted reusable bridge suggested by feedback>"}]},
+        },
+    ])
+    if prefer_false is True or prefer_false == "balanced":
+        cards = false_strategy_cards(mechanical_feedback) + cards
+    return cards[:6]
+
+
+def strategy_cards_text(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    mechanical_feedback: list[dict[str, Any]] | None = None,
+    *,
+    prefer_false: bool | str = False,
+) -> str:
+    return json.dumps(strategy_cards(h_eq, g_eq, mechanical_feedback, prefer_false=prefer_false), ensure_ascii=False)
+
+
+def graph_search_state(
+    h_eq: dict[str, Any],
+    target_eq: dict[str, Any],
+    assumptions: list[UniversalEquation] | None = None,
+    *,
+    h_limit: int = 80,
+    lemma_limit: int = 180,
+    congruence_cap: int = 1600,
+    status: str = "stuck",
+    failed_hints: list[dict[str, Any]] | None = None,
+    extra_terms: list[str] | None = None,
+    extra_args: list[tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
+    lemmas = [assumption.as_lemma() for assumption in assumptions or []]
+    facts = build_graph_facts(
+        h_eq,
+        target_eq,
+        h_limit,
+        lemmas=lemmas,
+        lemma_limit=lemma_limit,
+        congruence_cap=congruence_cap,
+        extra_terms=extra_terms,
+        extra_args=extra_args,
+    )
+    start = term_to_str(target_eq["lhs"])
+    target = term_to_str(target_eq["rhs"])
+    adj: dict[str, set[str]] = {}
+    for fact in facts:
+        adj.setdefault(fact["lhs"], set()).add(fact["rhs"])
+        adj.setdefault(fact["rhs"], set()).add(fact["lhs"])
+
+    def component(seed: str) -> set[str]:
+        seen = {seed}
+        queue = [seed]
+        while queue:
+            cur = queue.pop(0)
+            for nxt in adj.get(cur, set()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return seen
+
+    def sample_terms(terms: set[str], n: int = 6) -> list[str]:
+        return [short_text(t) for t in sorted(terms, key=lambda s: (len(s), s))[:n]]
+
+    left_comp = component(start)
+    right_comp = component(target)
+    left_sample = sample_terms(left_comp)
+    right_sample = sample_terms(right_comp)
+    pairs: list[dict[str, Any]] = []
+    for left in left_sample[:6]:
+        for right in right_sample[:6]:
+            pairs.append({
+                "left": left,
+                "right": right,
+                "similarity": round(difflib.SequenceMatcher(None, left, right).ratio(), 3),
+            })
+    pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    contraction_actions = right_context_contraction_actions(h_eq, target_eq)
+    closest_action = {
+        "kind": "midpoint",
+        "lemma": f"{pairs[0]['left']} = {pairs[0]['right']}" if pairs else f"{short_text(start)} = {short_text(target)}",
+        "why": "candidate bridge between current equality components",
+    }
+    suggested_next_actions = contraction_actions + ([closest_action] if status != "proved" else [])
+    recommended_next_action = suggested_next_actions[0] if suggested_next_actions and status != "proved" else None
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "kind": "SearchState",
+        "status": status,
+        "source": "graph_search",
+        "target": target_eq["text"],
+        "goal_left": short_text(start),
+        "goal_right": short_text(target),
+        "attempt": {
+            "h_limit": h_limit,
+            "lemma_limit": lemma_limit,
+            "congruence_cap": congruence_cap,
+            "extra_terms": [short_text(t) for t in extra_terms or []][:8],
+        },
+        "facts_generated": len(facts),
+        "assumptions": [
+            {"name": assumption.name, "equation": assumption.eq["text"]}
+            for assumption in assumptions or []
+        ],
+        "seed_h_args_used": [list(row) for row in extra_args or []][:8],
+        "left_component_size": len(left_comp),
+        "right_component_size": len(right_comp),
+        "left_frontier": left_sample,
+        "right_frontier": right_sample,
+        "closest_pairs": pairs[:4],
+        "need_hint": {
+            "kind": "bridge_terms",
+            "left_term": pairs[0]["left"] if pairs else short_text(start),
+            "right_term": pairs[0]["right"] if pairs else short_text(target),
+            "reason": "would connect the target equality components",
+            "recommended_next_action": recommended_next_action,
+        },
+        "suggested_next_actions": suggested_next_actions if status != "proved" else [],
+        "failed_hints": failed_hints or [],
+    }
+
+
+# Proof-carrying superposition core.  This implementation is maintained here
+# and has no runtime dependency on another solver.
+
+
+def term_size(t: Term) -> int:
+    return 1 if t[0] == "var" else 1 + term_size(t[1]) + term_size(t[2])
+
+
+def term_key(t: Term) -> str:
+    return t[1] if t[0] == "var" else "(" + term_key(t[1]) + term_key(t[2]) + ")"
+
+
+NATIVE_SATURATION_CONFIGS: tuple[tuple[int, int, int, int], ...] = (
+    (2, 10, 1, 16),
+    (2, 10, 2, 24),
+    (3, 14, 2, 40),
+    (3, 14, 3, 48),
+)
+
+
+def instantiate_term(t: Term, subst: dict[str, Term]) -> Term:
+    if t[0] == "var":
+        return subst.get(t[1], t)
+    return ("op", instantiate_term(t[1], subst), instantiate_term(t[2], subst))
+
+
+def native_saturation_combos(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    *,
+    depth: int,
+    pool_cap: int,
+    slots: int,
+) -> list[tuple[Term, ...]]:
+    """Grow H-instantiations from goal subterms with a small bounded closure."""
+    h_vars = list(h_eq["variables"])
+    if not h_vars:
+        return []
+    goal_vars = list(g_eq["variables"])
+    if not goal_vars:
+        return []
+    pad: Term = ("var", goal_vars[0])
+    pool = sorted(
+        set(subterms(g_eq["lhs"]) + subterms(g_eq["rhs"])),
+        key=lambda term: (term_size(term), term_key(term)),
+    )[:max(1, pool_cap)]
+    rows: list[tuple[Term, ...]] = []
+    seen_rows: set[tuple[Term, ...]] = set()
+
+    def add_row(row: tuple[Term, ...]) -> None:
+        if row not in seen_rows:
+            seen_rows.add(row)
+            rows.append(row)
+
+    for _round in range(max(1, depth)):
+        current = list(pool)
+        for position in range(min(max(1, slots), len(h_vars))):
+            for term in current:
+                row = [pad for _ in h_vars]
+                row[position] = term
+                add_row(tuple(row))
+        for diagonal in current:
+            add_row(tuple(diagonal for _ in h_vars))
+
+        new_terms = set(current)
+        for row in rows:
+            subst = dict(zip(h_vars, row))
+            new_terms.update(subterms(instantiate_term(h_eq["rhs"], subst)))
+        pool = sorted(new_terms, key=lambda term: (term_size(term), term_key(term)))[:max(1, pool_cap)]
+    return rows
+
+
+def native_saturation_bodies(h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    """Yield progressively stronger, judgeable saturation certificates."""
+    goal_vars = list(g_eq["variables"])
+    if not goal_vars or not h_eq["variables"]:
+        return
+    intro = "intro " + " ".join(goal_vars)
+    seen: set[str] = set()
+    for depth, pool_cap, slots, have_cap in NATIVE_SATURATION_CONFIGS:
+        rows = native_saturation_combos(
+            h_eq,
+            g_eq,
+            depth=depth,
+            pool_cap=pool_cap,
+            slots=slots,
+        )[:have_cap]
+        if not rows:
+            continue
+        haves = [
+            f"have sat{i} := h " + " ".join(lean_arg(term_to_str(term)) for term in row)
+            for i, row in enumerate(rows, start=1)
+        ]
+        body = "\n".join([intro, *haves, "grind"])
+        if body in seen:
+            continue
+        seen.add(body)
+        yield f"deep_saturation:d={depth}:slots={slots}:haves={len(rows)}", body
+
+
+def grounding_h_certificate_bodies(h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    """Ground both exclusive sides of a non-orientable H, then flood lightly.
+
+    This is the minimal native form of the former generic grounding/collapse
+    certificate family.  Every emitted body is still accepted only after the
+    Lean judge checks it.
+    """
+    lhs_vars = set(term_variables(h_eq["lhs"]))
+    rhs_vars = set(term_variables(h_eq["rhs"]))
+    only_l = lhs_vars - rhs_vars
+    only_r = rhs_vars - lhs_vars
+    goal_vars = list(g_eq["variables"])
+    if not only_l or not only_r or not goal_vars:
+        return
+
+    witness = goal_vars[0]
+    lhs_binders = [v for v in h_eq["variables"] if v in lhs_vars]
+    rhs_binders = [v for v in h_eq["variables"] if v in rhs_vars]
+    args_a = [witness if v in only_r else v for v in h_eq["variables"]]
+    args_b = [witness if v in only_l else v for v in h_eq["variables"]]
+    lhs_grounded = term_to_str_subst(h_eq["lhs"], {v: witness for v in only_r})
+    rhs_grounded = term_to_str_subst(h_eq["rhs"], {v: witness for v in only_r})
+    lhs_grounded_b = term_to_str_subst(h_eq["lhs"], {v: witness for v in only_l})
+    rhs_grounded_b = term_to_str_subst(h_eq["rhs"], {v: witness for v in only_l})
+
+    prefix = ["intro " + " ".join(goal_vars)]
+    prefix.extend([
+        f"have groundA : ∀ {' '.join(lhs_binders)} : G, {lhs_grounded} = {rhs_grounded} := "
+        f"fun {' '.join(lhs_binders)} => h {' '.join(map(lean_arg, args_a))}",
+        f"have groundB : ∀ {' '.join(rhs_binders)} : G, {rhs_grounded_b} = {lhs_grounded_b} := "
+        f"fun {' '.join(rhs_binders)} => (h {' '.join(map(lean_arg, args_b))}).symm",
+    ])
+    yield "grounding_h:base", "\n".join([*prefix, "grind"])
+
+    flood_terms = list(goal_vars)
+    flood_tiers = [
+        flood_terms + [f"({witness} ◇ {witness})"],
+        flood_terms + [f"({witness} ◇ {witness})", f"({witness} ◇ ({witness} ◇ {witness}))"],
+    ]
+    accumulated: list[str] = []
+    have_index = 0
+    for tier_index, terms in enumerate(flood_tiers, start=1):
+        for lemma_name, binders in (("groundA", lhs_binders), ("groundB", rhs_binders)):
+            emitted = 0
+            for args in product(terms, repeat=len(binders)):
+                have_index += 1
+                emitted += 1
+                accumulated.append(
+                    f"have ground_use{have_index} := {lemma_name} "
+                    + " ".join(map(lean_arg, args))
+                )
+                if emitted >= 128:
+                    break
+        yield f"grounding_h:flood={tier_index}", "\n".join([*prefix, *accumulated, "grind"])
+
+
+def pc_canon(l: Term, r: Term) -> tuple[Term, Term]:
+    if term_size(l) > term_size(r) or (term_size(l) == term_size(r) and term_key(l) > term_key(r)):
+        l, r = r, l
+    ren: dict[str, Term] = {}
+
+    def go(t: Term) -> Term:
+        if t[0] == "var":
+            if str(t[1]).startswith("#"):
+                return t
+            if t[1] not in ren:
+                ren[t[1]] = ("var", f"v{len(ren)}")
+            return ren[t[1]]
+        return ("op", go(t[1]), go(t[2]))
+
+    return go(l), go(r)
+
+
+def pc_walk(t: Term, sub: dict[str, Term]) -> Term:
+    while t[0] == "var" and t[1] in sub:
+        t = sub[t[1]]
+    return t
+
+
+def pc_occurs(v: str, t: Term, sub: dict[str, Term]) -> bool:
+    t = pc_walk(t, sub)
+    if t[0] == "var":
+        return t[1] == v
+    return pc_occurs(v, t[1], sub) or pc_occurs(v, t[2], sub)
+
+
+def pc_unify(s: Term, t: Term, sub: dict[str, Term]) -> dict[str, Term] | None:
+    s = pc_walk(s, sub)
+    t = pc_walk(t, sub)
+    if s[0] == "var" and not str(s[1]).startswith("#"):
+        if s == t:
+            return sub
+        if pc_occurs(s[1], t, sub):
+            return None
+        sub2 = dict(sub)
+        sub2[s[1]] = t
+        return sub2
+    if t[0] == "var" and not str(t[1]).startswith("#"):
+        return pc_unify(t, s, sub)
+    if s[0] == "op" and t[0] == "op":
+        sub2 = pc_unify(s[1], t[1], sub)
+        return None if sub2 is None else pc_unify(s[2], t[2], sub2)
+    return sub if s == t else None
+
+
+def pc_apply(t: Term, sub: dict[str, Term]) -> Term:
+    t = pc_walk(t, sub)
+    if t[0] == "var":
+        return t
+    return ("op", pc_apply(t[1], sub), pc_apply(t[2], sub))
+
+
+def pc_positions(t: Term, p: tuple[int, ...] = ()) -> list[tuple[tuple[int, ...], Term]]:
+    out = [(p, t)]
+    if t[0] == "op":
+        out += pc_positions(t[1], p + (0,))
+        out += pc_positions(t[2], p + (1,))
+    return out
+
+
+def pc_replace_at(t: Term, p: tuple[int, ...], r: Term) -> Term:
+    if not p:
+        return r
+    if p[0] == 0:
+        return ("op", pc_replace_at(t[1], p[1:], r), t[2])
+    return ("op", t[1], pc_replace_at(t[2], p[1:], r))
+
+
+def pc_vars_of(t: Term, acc: list[str] | None = None) -> list[str]:
+    acc = acc if acc is not None else []
+    if t[0] == "var":
+        if not str(t[1]).startswith("#") and t[1] not in acc:
+            acc.append(t[1])
+    else:
+        pc_vars_of(t[1], acc)
+        pc_vars_of(t[2], acc)
+    return acc
+
+
+def pc_apply_names(t: Term, rho: dict[str, str]) -> Term:
+    if t[0] == "var":
+        return ("var", rho.get(t[1], t[1]))
+    return ("op", pc_apply_names(t[1], rho), pc_apply_names(t[2], rho))
+
+
+def pc_rename_tracked(binders: list[str], lhs: Term, rhs: Term, counter: list[int]) -> tuple[list[str], Term, Term]:
+    ren = {v: f"_s{counter[0] + i}" for i, v in enumerate(binders)}
+    counter[0] += len(binders)
+
+    def go(t: Term) -> Term:
+        return ("var", ren[t[1]]) if t[0] == "var" else ("op", go(t[1]), go(t[2]))
+
+    return [ren[v] for v in binders], go(lhs), go(rhs)
+
+
+def pc_paramodulants(rec_a: dict[str, Any], rec_b: dict[str, Any], counter: list[int], max_size: int, allow_var_overlap: bool = False):
+    fb_a, la_a, ra_a = pc_rename_tracked(rec_a["binders"], rec_a["lhs"], rec_a["rhs"], counter)
+    fb_b, la_b, ra_b = pc_rename_tracked(rec_b["binders"], rec_b["lhs"], rec_b["rhs"], counter)
+    out = []
+    for la, ra, a_symm in ((la_a, ra_a, False), (ra_a, la_a, True)):
+        for lb, rb, b_symm in ((la_b, ra_b, False), (ra_b, la_b, True)):
+            for pos, subterm in pc_positions(la):
+                if subterm[0] == "var" and not allow_var_overlap:
+                    continue
+                subst = pc_unify(subterm, lb, {})
+                if subst is None:
+                    continue
+                rl = pc_apply(pc_replace_at(la, pos, rb), subst)
+                rr = pc_apply(ra, subst)
+                if rl == rr or term_size(rl) + term_size(rr) > max_size:
+                    continue
+                args_a = [pc_apply(("var", fb_a[k]), subst) for k in range(len(rec_a["binders"]))]
+                args_b = [pc_apply(("var", fb_b[k]), subst) for k in range(len(rec_b["binders"]))]
+                all_vars: list[str] = []
+                for t in [rl, rr] + args_a + args_b:
+                    for v in pc_vars_of(t):
+                        if v not in all_vars:
+                            all_vars.append(v)
+                rho = {v: f"v{k}" for k, v in enumerate(all_vars)}
+                cl = lambda t: pc_apply_names(t, rho)
+                before = cl(pc_apply(la, subst))
+                source_l = cl(pc_apply(lb, subst))
+                source_r = cl(pc_apply(rb, subst))
+                out.append((
+                    cl(rl),
+                    cl(rr),
+                    [f"v{k}" for k in range(len(all_vars))],
+                    [cl(a) for a in args_a],
+                    [cl(a) for a in args_b],
+                    {
+                        "before": before,
+                        "source_l": source_l,
+                        "source_r": source_r,
+                        "pos": pos,
+                        "a_symm": a_symm,
+                        "b_symm": b_symm,
+                    },
+                ))
+    return out
+
+
+def pc_saturate(
+    start: list[tuple[Term, Term]],
+    target,
+    max_rounds: int = 5,
+    max_eqs: int = 900,
+    max_size: int = 20,
+    time_budget: float | None = None,
+    allow_var_overlap: bool = False,
+) -> tuple[int | None, list[dict[str, Any]], dict[str, Any]]:
+    deadline = (time.monotonic() + time_budget) if time_budget else None
+    counter = [0]
+    recs: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], int] = {}
+    meta = {"rounds": 0, "stop_reason": "saturated", "max_rounds": max_rounds, "max_eqs": max_eqs, "max_size": max_size}
+
+    def add(l: Term, r: Term, binders: list[str], deriv, base=None) -> int | None:
+        cl, cr = pc_canon(l, r)
+        if cl == cr:
+            return None
+        sig = (term_key(cl), term_key(cr))
+        if sig in seen:
+            return seen[sig]
+        rid = len(recs)
+        recs.append({"lhs": l, "rhs": r, "binders": binders, "deriv": deriv, "base": base})
+        seen[sig] = rid
+        return rid
+
+    for i, (l, r) in enumerate(start):
+        binders = pc_vars_of(l) + [v for v in pc_vars_of(r) if v not in pc_vars_of(l)]
+        rid = add(l, r, binders, None, i)
+        if rid is not None and target((recs[rid]["lhs"], recs[rid]["rhs"])):
+            meta["stop_reason"] = "target_found"
+            return rid, recs, meta
+    for round_idx in range(max_rounds):
+        meta["rounds"] = round_idx + 1
+        added = False
+        ids = list(range(len(recs)))
+        for i in ids:
+            if deadline is not None and time.monotonic() > deadline:
+                meta["stop_reason"] = "time_budget"
+                return None, recs, meta
+            for j in ids:
+                for rl, rr, binders, args_a, args_b, proof_info in pc_paramodulants(
+                    recs[i],
+                    recs[j],
+                    counter,
+                    max_size,
+                    allow_var_overlap=allow_var_overlap,
+                ):
+                    before = len(recs)
+                    rid = add(rl, rr, binders, (i, j, args_a, args_b, proof_info))
+                    if rid is not None and rid == before:
+                        added = True
+                        if target((recs[rid]["lhs"], recs[rid]["rhs"])):
+                            meta["stop_reason"] = "target_found"
+                            return rid, recs, meta
+        if not added:
+            meta["stop_reason"] = "saturated"
+            break
+        if len(recs) > max_eqs:
+            meta["stop_reason"] = "max_eqs"
+            break
+    return None, recs, meta
+
+
+def pc_derivation_chain(target_id: int, recs: list[dict[str, Any]]) -> list[int]:
+    need: set[int] = set()
+    order: list[int] = []
+
+    def visit(rid: int) -> None:
+        if rid in need:
+            return
+        deriv = recs[rid]["deriv"]
+        if deriv is not None:
+            visit(deriv[0])
+            visit(deriv[1])
+        need.add(rid)
+        order.append(rid)
+
+    visit(target_id)
+    return order
+
+
+def pc_arg(t: Term) -> str:
+    return t[1] if t[0] == "var" else f"({term_to_str(t)})"
+
+
+def pc_term_with_hole(t: Term, pos: tuple[int, ...], hole: str = "__pc_hole") -> str:
+    if not pos:
+        return hole
+    if t[0] == "var":
+        return term_to_str(t)
+    if pos[0] == 0:
+        return f"({pc_term_with_hole(t[1], pos[1:], hole)} ◇ {term_to_str(t[2])})"
+    return f"({term_to_str(t[1])} ◇ {pc_term_with_hole(t[2], pos[1:], hole)})"
+
+
+def pc_oriented_expr(name: str, symm: bool) -> str:
+    return f"({name}).symm" if symm else name
+
+
+def pc_match_term(pat: Term, val: Term, binders: set[str], sub: dict[str, Term]) -> dict[str, Term] | None:
+    if pat[0] == "var" and pat[1] in binders:
+        old = sub.get(pat[1])
+        if old is None:
+            sub2 = dict(sub)
+            sub2[pat[1]] = val
+            return sub2
+        return sub if old == val else None
+    if pat[0] == "op" and val[0] == "op":
+        s1 = pc_match_term(pat[1], val[1], binders, sub)
+        return None if s1 is None else pc_match_term(pat[2], val[2], binders, s1)
+    return sub if pat == val else None
+
+
+def pc_target_proof_expr(name: str, lhs_pat: Term, rhs_pat: Term, binders: list[str], goal_lhs: Term | None, goal_rhs: Term | None) -> str | None:
+    if goal_lhs is None or goal_rhs is None or not binders:
+        return None
+
+    def try_match(a: Term, b: Term, symm: bool) -> str | None:
+        sub = pc_match_term(lhs_pat, a, set(binders), {})
+        if sub is None:
+            return None
+        sub = pc_match_term(rhs_pat, b, set(binders), sub)
+        if sub is None or any(v not in sub for v in binders):
+            return None
+        args = " ".join(pc_arg(sub[v]) for v in binders)
+        call = f"{name} {args}" if args else name
+        return f"({call}).symm" if symm else call
+
+    return try_match(goal_lhs, goal_rhs, False) or try_match(goal_rhs, goal_lhs, True)
+
+
+def pc_target_exact_line(name: str, lhs_pat: Term, rhs_pat: Term, binders: list[str], goal_lhs: Term | None, goal_rhs: Term | None) -> str | None:
+    expr = pc_target_proof_expr(name, lhs_pat, rhs_pat, binders, goal_lhs, goal_rhs)
+    return None if expr is None else f"exact {expr}"
+
+
+def pc_subst_term(t: Term, sub: dict[str, Term]) -> Term:
+    if t[0] == "var" and t[1] in sub:
+        return sub[t[1]]
+    if t[0] == "op":
+        return ("op", pc_subst_term(t[1], sub), pc_subst_term(t[2], sub))
+    return t
+
+
+def pc_stitch_pool(goal_lhs: Term | None, goal_rhs: Term | None, limit: int = 14) -> list[Term]:
+    out: list[Term] = []
+    seen: set[str] = set()
+    for root in (goal_lhs, goal_rhs):
+        if root is None:
+            continue
+        for t in subterms(root):
+            sig = term_key(t)
+            if sig not in seen:
+                seen.add(sig)
+                out.append(t)
+    out.sort(key=lambda t: (term_size(t), term_key(t)))
+    return out[:limit]
+
+
+def pc_bounded_completions(base: dict[str, Term], binders: list[str], pool: list[Term], max_missing: int = 3, max_total: int = 350):
+    rem = [v for v in binders if v not in base]
+    if len(rem) > max_missing:
+        return
+    seen: set[tuple[str, ...]] = set()
+    total = 0
+    for vals in product(pool, repeat=len(rem)):
+        sub = dict(base)
+        for v, val in zip(rem, vals):
+            sub[v] = val
+        sig = tuple(term_key(sub[v]) for v in binders)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        yield sub
+        total += 1
+        if total >= max_total:
+            return
+
+
+def pc_lemma_edges_from(term: Term, lhs_pat: Term, rhs_pat: Term, binders: list[str], pool: list[Term], name: str, max_missing: int = 3):
+    bset = set(binders)
+    for side in (0, 1):
+        pat = lhs_pat if side == 0 else rhs_pat
+        other = rhs_pat if side == 0 else lhs_pat
+        base = pc_match_term(pat, term, bset, {})
+        if base is None:
+            continue
+        for sub in pc_bounded_completions(base, binders, pool, max_missing=max_missing):
+            out = pc_subst_term(other, sub)
+            if out == term:
+                continue
+            args = " ".join(pc_arg(sub[v]) for v in binders)
+            call = f"{name} {args}" if args else name
+            proof = call if side == 0 else f"({call}).symm"
+            yield out, proof
+
+
+def pc_add_subterms_to_pool(pool: list[Term], seen: set[str], term: Term, limit: int) -> None:
+    for t in subterms(term):
+        sig = term_key(t)
+        if sig not in seen:
+            seen.add(sig)
+            pool.append(t)
+            if len(pool) >= limit:
+                return
+
+
+def pc_one_h_target_calc(
+    hrec: dict[str, Any] | None,
+    target_lhs: Term,
+    target_rhs: Term,
+    target_binders: list[str],
+    goal_lhs: Term | None,
+    goal_rhs: Term | None,
+    h_name: str = "h",
+    target_name: str = "target",
+) -> str | None:
+    if goal_lhs is None or goal_rhs is None or not hrec or not target_binders:
+        return None
+    hvars = hrec.get("binders") or []
+    if not hvars:
+        return None
+    pool = pc_stitch_pool(goal_lhs, goal_rhs)
+    if not pool:
+        return None
+
+    def complete(base: dict[str, Term]):
+        rem = [v for v in hvars if v not in base]
+        if len(rem) > 4:
+            return
+        seen: set[tuple[str, ...]] = set()
+        for vals in product(pool, repeat=len(rem)):
+            sub = dict(base)
+            for v, val in zip(rem, vals):
+                sub[v] = val
+            sig = tuple(term_key(sub[v]) for v in hvars)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            yield sub
+
+    def h_call(sub: dict[str, Term]) -> str:
+        return f"{h_name} " + " ".join(pc_arg(sub[v]) for v in hvars)
+
+    for side, endpoint in ((0, goal_lhs), (1, goal_lhs), (0, goal_rhs), (1, goal_rhs)):
+        hside = hrec["lhs"] if side == 0 else hrec["rhs"]
+        base = pc_match_term(hside, endpoint, set(hvars), {})
+        if base is None:
+            continue
+        for sub in complete(base):
+            hl = pc_subst_term(hrec["lhs"], sub)
+            hr = pc_subst_term(hrec["rhs"], sub)
+            call = h_call(sub)
+            if side == 0 and hl != endpoint:
+                continue
+            if side == 1 and hr != endpoint:
+                continue
+            if endpoint == goal_lhs:
+                mid = hr if side == 0 else hl
+                p1 = call if side == 0 else f"({call}).symm"
+                p2 = pc_target_proof_expr(target_name, target_lhs, target_rhs, target_binders, mid, goal_rhs)
+                if p2 is not None:
+                    return "\n".join([
+                        "calc",
+                        f"  {term_to_str(goal_lhs)} = {term_to_str(mid)} := {p1}",
+                        f"  _ = {term_to_str(goal_rhs)} := {p2}",
+                    ])
+            else:
+                mid = hr if side == 0 else hl
+                p1 = pc_target_proof_expr(target_name, target_lhs, target_rhs, target_binders, goal_lhs, mid)
+                p2 = f"({call}).symm" if side == 0 else call
+                if p1 is not None:
+                    return "\n".join([
+                        "calc",
+                        f"  {term_to_str(goal_lhs)} = {term_to_str(mid)} := {p1}",
+                        f"  _ = {term_to_str(goal_rhs)} := {p2}",
+                    ])
+    return None
+
+
+def pc_path_target_calc(
+    hrec: dict[str, Any] | None,
+    target_lhs: Term,
+    target_rhs: Term,
+    target_binders: list[str],
+    goal_lhs: Term | None,
+    goal_rhs: Term | None,
+    h_name: str = "h",
+    target_name: str = "target",
+) -> str | None:
+    if goal_lhs is None or goal_rhs is None or not target_binders:
+        return None
+    hvars = (hrec or {}).get("binders") or []
+    pool = pc_stitch_pool(goal_lhs, goal_rhs, limit=16)
+    pool_seen = {term_key(t) for t in pool}
+    target_key = term_key(goal_rhs)
+    start_key = term_key(goal_lhs)
+    nodes = {start_key: goal_lhs}
+    parent: dict[str, tuple[str, str] | None] = {start_key: None}
+    queue = [goal_lhs]
+    max_nodes, max_depth, qi = 120, 5, 0
+
+    def depth_of(k: str) -> int:
+        depth = 0
+        while parent.get(k) is not None:
+            k = parent[k][0]  # type: ignore[index]
+            depth += 1
+        return depth
+
+    while qi < len(queue) and len(nodes) < max_nodes:
+        cur = queue[qi]
+        qi += 1
+        ck = term_key(cur)
+        if ck == target_key:
+            break
+        if depth_of(ck) >= max_depth:
+            continue
+        edges = list(pc_lemma_edges_from(cur, target_lhs, target_rhs, target_binders, pool, target_name, max_missing=3))
+        if hrec is not None and hvars:
+            edges.extend(pc_lemma_edges_from(cur, hrec["lhs"], hrec["rhs"], hvars, pool, h_name, max_missing=3))
+        for nxt, proof in edges:
+            nk = term_key(nxt)
+            if nk in nodes or term_size(nxt) > 18:
+                continue
+            nodes[nk] = nxt
+            parent[nk] = (ck, proof)
+            queue.append(nxt)
+            pc_add_subterms_to_pool(pool, pool_seen, nxt, 24)
+            if nk == target_key:
+                qi = len(queue)
+                break
+    if target_key not in parent:
+        return None
+    path = []
+    k = target_key
+    while parent[k] is not None:
+        pk, proof = parent[k]  # type: ignore[misc]
+        path.append((nodes[pk], nodes[k], proof))
+        k = pk
+    path.reverse()
+    if not path:
+        return None
+    lines = ["calc"]
+    for i, (a, b, proof) in enumerate(path):
+        lines.append(f"  {term_to_str(a) if i == 0 else '_'} = {term_to_str(b)} := {proof}")
+    return "\n".join(lines)
+
+
+def pc_render_step_body(rec: dict[str, Any], ia_line: str, ib_line: str) -> str:
+    deriv = rec["deriv"]
+    if deriv is None:
+        raise ValueError("base record has no renderable step")
+    proof_info = deriv[4] if len(deriv) >= 5 else None
+    binders = " ".join(rec["binders"])
+    intro = f"intro {binders}; " if binders else ""
+    if not proof_info:
+        return f"by {intro}{ia_line}; {ib_line}; grind"
+    before = proof_info["before"]
+    pos = tuple(proof_info["pos"])
+    context = pc_term_with_hole(before, pos)
+    ib_expr = pc_oriented_expr("ib", bool(proof_info.get("b_symm")))
+    ia_expr = pc_oriented_expr("ia", bool(proof_info.get("a_symm")))
+    before_s = term_to_str(before)
+    after_s = term_to_str(rec["lhs"])
+    return (
+        f"by {intro}{ia_line}; {ib_line}; "
+        f"have step : {before_s} = {after_s} := "
+        f"congrArg (fun __pc_hole => {context}) ({ib_expr}); "
+        f"exact step.symm.trans ({ia_expr})"
+    )
+
+
+def pc_render(
+    target_id: int,
+    recs: list[dict[str, Any]],
+    goal_vars: list[str],
+    goal_lhs: Term | None = None,
+    goal_rhs: Term | None = None,
+    base_names: list[str] | None = None,
+) -> str:
+    base_names = base_names or ["h"]
+
+    def lemma_name(rid: int) -> str:
+        if recs[rid]["deriv"] is not None:
+            return f"E{rid}"
+        base = recs[rid].get("base")
+        if isinstance(base, int) and 0 <= base < len(base_names):
+            return base_names[base]
+        return "h"
+
+    order = pc_derivation_chain(target_id, recs)
+    lines = ["intro " + " ".join(goal_vars)] if goal_vars else []
+    for rid in order:
+        rec = recs[rid]
+        if rec["deriv"] is None:
+            continue
+        ai, bi, args_a, args_b = rec["deriv"][:4]
+        an = lemma_name(ai)
+        bn = lemma_name(bi)
+        binders = rec["binders"]
+        ia = f"have ia := {an} " + " ".join(pc_arg(x) for x in args_a) if args_a else f"have ia := {an}"
+        ib = f"have ib := {bn} " + " ".join(pc_arg(x) for x in args_b) if args_b else f"have ib := {bn}"
+        lhs = term_to_str(rec["lhs"])
+        rhs = term_to_str(rec["rhs"])
+        binder_chunk = " ".join(binders)
+        lines.append(
+            f"have E{rid} : ∀ ({binder_chunk} : G), {lhs} = {rhs} := "
+            f"{pc_render_step_body(rec, ia, ib)}"
+        )
+    target_rec = recs[target_id]
+    if target_rec["deriv"] is not None:
+        ess = pc_vars_of(target_rec["lhs"])
+        for v in pc_vars_of(target_rec["rhs"]):
+            if v not in ess:
+                ess.append(v)
+        exact_line = pc_target_exact_line("target", target_rec["lhs"], target_rec["rhs"], ess, goal_lhs, goal_rhs)
+        hrec = None
+        for rec in recs:
+            if rec["deriv"] is None:
+                base = rec.get("base")
+                if base is None or (isinstance(base, int) and base < len(base_names) and base_names[base] == "h"):
+                    hrec = rec
+                    break
+        calc_line = pc_one_h_target_calc(hrec, target_rec["lhs"], target_rec["rhs"], ess, goal_lhs, goal_rhs)
+        if calc_line is None:
+            calc_line = pc_path_target_calc(hrec, target_rec["lhs"], target_rec["rhs"], ess, goal_lhs, goal_rhs)
+        if ess and (len(ess) < len(target_rec["binders"]) or exact_line is not None or calc_line is not None):
+            d0 = ess[0]
+            args = " ".join(v if v in ess else d0 for v in target_rec["binders"])
+            lhs = term_to_str(target_rec["lhs"])
+            rhs = term_to_str(target_rec["rhs"])
+            lines.append(
+                f"have target : ∀ ({' '.join(ess)} : G), {lhs} = {rhs} := "
+                f"fun {' '.join(ess)} => E{target_id} {args}"
+            )
+            if exact_line is not None:
+                lines.append(exact_line)
+                return "\n".join(lines)
+            if calc_line is not None:
+                lines.append(calc_line)
+                return "\n".join(lines)
+    lines.append("grind")
+    return "\n".join(lines)
+
+
+def pc_rec_summary(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "lhs": short_text(term_to_str(rec["lhs"]), 120),
+        "rhs": short_text(term_to_str(rec["rhs"]), 120),
+        "binders": rec.get("binders", [])[:6],
+        "derived": rec.get("deriv") is not None,
+    }
+
+
+def equation_shape_tags(lhs: Term, rhs: Term) -> list[str]:
+    tags: list[str] = []
+    for l, r in ((lhs, rhs), (rhs, lhs)):
+        if l[0] == "var" and r[0] == "var" and l != r:
+            tags.append("const")
+        if l[0] == "op" and r[0] == "var":
+            if l[1] == r:
+                tags.append("proj_l")
+            if l[2] == r:
+                tags.append("proj_r")
+        if l[0] == "op" and r[0] == "op":
+            if l[1] == r[1] and l[2] != r[2]:
+                tags.append("rowconst")
+            if l[2] == r[2] and l[1] != r[1]:
+                tags.append("colconst")
+            if l[1] != r[1] and l[2] != r[2]:
+                tags.append("opconst_like")
+            if is_square(l) is not None and is_square(r) is not None and l != r:
+                tags.append("square_const")
+    return unique(tags)
+
+
+def target_aux_shape(target_eq: dict[str, Any]) -> str | None:
+    lhs, rhs = target_eq["lhs"], target_eq["rhs"]
+    tags = equation_shape_tags(lhs, rhs)
+    if "const" in tags and lhs[0] == "var" and rhs[0] == "var":
+        return "const"
+    if "proj_l" in tags:
+        return "proj_l"
+    if "proj_r" in tags:
+        return "proj_r"
+    if "rowconst" in tags:
+        return "rowconst"
+    if "opconst_like" in tags:
+        return "opconst"
+    if "square_const" in tags:
+        return "square_const"
+    return None
+
+
+def superposition_state(
+    h_eq: dict[str, Any],
+    target_eq: dict[str, Any],
+    recs: list[dict[str, Any]],
+    meta: dict[str, Any],
+    status: str,
+    base_names: list[str],
+) -> dict[str, Any]:
+    goal_l = term_to_str(target_eq["lhs"])
+    goal_r = term_to_str(target_eq["rhs"])
+    scored: list[dict[str, Any]] = []
+    derived_scored: list[dict[str, Any]] = []
+    shape_rows: list[dict[str, Any]] = []
+    for rid, rec in enumerate(recs[:2000]):
+        lhs = term_to_str(rec["lhs"])
+        rhs = term_to_str(rec["rhs"])
+        text = f"{lhs} = {rhs}"
+        score = max(
+            difflib.SequenceMatcher(None, lhs, goal_l).ratio(),
+            difflib.SequenceMatcher(None, lhs, goal_r).ratio(),
+            difflib.SequenceMatcher(None, rhs, goal_l).ratio(),
+            difflib.SequenceMatcher(None, rhs, goal_r).ratio(),
+            difflib.SequenceMatcher(None, text, target_eq["text"]).ratio(),
+        )
+        row = {"rid": rid, "similarity": round(score, 3), **pc_rec_summary(rec)}
+        scored.append(row)
+        if rec.get("deriv") is not None:
+            derived_scored.append(row)
+            tags = equation_shape_tags(rec["lhs"], rec["rhs"])
+            if tags:
+                shape_rows.append({**row, "shape_tags": tags})
+    scored.sort(key=lambda item: item["similarity"], reverse=True)
+    derived_scored.sort(key=lambda item: item["similarity"], reverse=True)
+    shape_rows.sort(key=lambda item: (len(item.get("shape_tags", [])), item["similarity"]), reverse=True)
+    target_shape = target_aux_shape(target_eq)
+    state = {
+        "kind": "SuperpositionState",
+        "status": status,
+        "target": target_eq["text"],
+        "target_shape": target_shape,
+        "base_names": base_names,
+        "generated_equations": len(recs),
+        "rounds": meta.get("rounds"),
+        "stop_reason": meta.get("stop_reason"),
+        "limits": {
+            "max_rounds": meta.get("max_rounds"),
+            "max_eqs": meta.get("max_eqs"),
+            "max_size": meta.get("max_size"),
+        },
+        "closest_equations": scored[:5],
+        "derived_closest_equations": derived_scored[:5],
+        "shape_diagnostics": shape_rows[:8],
+        "need_hint": {
+            "kind": "superposition_subgoal",
+            "reason": "proof-carrying superposition did not reach the target; propose a smaller universal midpoint near a closest_equations row",
+            "target": target_eq["text"],
+            "closest_equation": (derived_scored[0] if derived_scored else scored[0]) if scored else None,
+        },
+    }
+    if target_shape == "rowconst":
+        opconst_like = next((row for row in shape_rows if "opconst_like" in row.get("shape_tags", [])), None)
+        recommended_next_action = None
+        rejected_recommendations: list[dict[str, Any]] = []
+        if opconst_like:
+            opconst_eq = parse_equation("a ◇ b = c ◇ d")
+            opconst_refutation = hint_refutation(h_eq, opconst_eq)
+            if opconst_refutation is None:
+                recommended_next_action = {
+                    "kind": "midpoint",
+                    "lemma": "a ◇ b = c ◇ d",
+                    "why": "rowconst target is stuck but superposition derived an opconst-like product bridge",
+                    "source": opconst_like,
+                }
+            else:
+                rejected_recommendations.append({
+                    "kind": "midpoint",
+                    "lemma": "a ◇ b = c ◇ d",
+                    "status": "refuted_by_small_model",
+                    "refutation": opconst_refutation,
+                    "source": opconst_like,
+                })
+        state["rowconst_diagnostics"] = {
+            "kind": "rowconst_superposition_diagnostics",
+            "best_derived_equations": derived_scored[:5],
+            "near_aux_shapes": shape_rows[:8],
+            "recommended_next_action": recommended_next_action,
+            "rejected_recommendations": rejected_recommendations,
+            "secondary_bridge_candidates": [
+                "a ◇ b = c ◇ d",
+                "a ◇ a = b ◇ b",
+                "a ◇ b = a",
+                "a ◇ b = b",
+            ],
+            "reason": "If rowconst itself is hard to prove or insufficient, these derived shapes are useful follow-up bridge candidates.",
+        }
+        if recommended_next_action:
+            state["need_hint"]["recommended_next_action"] = recommended_next_action
+    return state
+
+
+def superposition_prove_detailed(
+    h_eq: dict[str, Any],
+    target_eq: dict[str, Any],
+    assumptions: list[UniversalEquation] | None = None,
+    *,
+    budget: float = 6.0,
+    allow_var_overlap: bool = False,
+) -> tuple[str | None, dict[str, Any]]:
+    assumptions = assumptions or []
+    start = [(h_eq["lhs"], h_eq["rhs"])] + [(a.eq["lhs"], a.eq["rhs"]) for a in assumptions]
+    base_names = ["h"] + [a.name for a in assumptions]
+    target_sig = pc_canon(target_eq["lhs"], target_eq["rhs"])
+    last_state: dict[str, Any] | None = None
+    configs = [(3, 360, 14), (4, 650, 16), (5, 900, 20)]
+    if budget >= 8.0 or assumptions:
+        configs.append((5, 1400, 22))
+    if budget >= 12.0:
+        configs.append((6, 1800, 24))
+    deadline = time.monotonic() + max(1.0, budget)
+    for max_rounds, max_eqs, max_size in configs:
+        rem = deadline - time.monotonic()
+        if rem <= 0.25:
+            break
+        tid, recs, meta = pc_saturate(
+            start,
+            lambda eq: pc_canon(eq[0], eq[1]) == target_sig,
+            max_rounds=max_rounds,
+            max_eqs=max_eqs,
+            max_size=max_size,
+            time_budget=min(rem, max(0.5, budget / 2)),
+            allow_var_overlap=allow_var_overlap,
+        )
+        if tid is not None:
+            body = pc_render(tid, recs, target_eq["variables"], goal_lhs=target_eq["lhs"], goal_rhs=target_eq["rhs"], base_names=base_names)
+            return body, superposition_state(h_eq, target_eq, recs, meta, "proved", base_names)
+        last_state = superposition_state(h_eq, target_eq, recs, meta, "stuck", base_names)
+        if meta.get("stop_reason") == "time_budget":
+            break
+    return None, last_state or {
+        "kind": "SuperpositionState",
+        "status": "stuck",
+        "target": target_eq["text"],
+        "base_names": base_names,
+        "generated_equations": 0,
+        "need_hint": {"kind": "superposition_subgoal", "reason": "no equations generated before budget expired"},
+    }
+
+
+STANDARD_AUX_EQUATIONS = {
+    "const": "a = b",
+    "proj_l": "a ◇ b = a",
+    "proj_r": "a ◇ b = b",
+    "rowconst": "a ◇ b = a ◇ c",
+}
+
+SECONDARY_BRIDGE_EQUATIONS = {
+    "opconst": "a ◇ b = c ◇ d",
+    "square_const": "a ◇ a = b ◇ b",
+    "proj_l": "a ◇ b = a",
+    "proj_r": "a ◇ b = b",
+    "const": "a = b",
+    "colconst": "a ◇ b = c ◇ b",
+}
+
+
+def standard_aux_order(call: dict[str, Any] | None = None) -> list[str]:
+    raw = []
+    if call:
+        for key in ("lemmas", "aux", "kinds", "targets"):
+            val = call.get(key)
+            if isinstance(val, str):
+                raw.extend(part.strip() for part in val.split(","))
+            elif isinstance(val, list):
+                raw.extend(str(part).strip() for part in val)
+    if not raw:
+        raw = ["const", "proj_l", "proj_r", "rowconst"]
+    out: list[str] = []
+    for item in raw:
+        item = item.lower()
+        item = {
+            "projection_left": "proj_l",
+            "left_projection": "proj_l",
+            "projection_right": "proj_r",
+            "right_projection": "proj_r",
+            "row_constant": "rowconst",
+            "row_const": "rowconst",
+        }.get(item, item)
+        if item in STANDARD_AUX_EQUATIONS and item not in out:
+            out.append(item)
+    return out
+
+
+def standard_aux_equation(kind: str) -> dict[str, Any]:
+    return parse_equation(STANDARD_AUX_EQUATIONS[kind])
+
+
+def secondary_bridge_order(aux_kind: str) -> list[str]:
+    if aux_kind == "rowconst":
+        return ["opconst", "square_const", "proj_l", "proj_r", "const"]
+    if aux_kind == "proj_l":
+        return ["proj_r", "const", "opconst", "square_const"]
+    if aux_kind == "proj_r":
+        return ["proj_l", "const", "opconst", "square_const"]
+    if aux_kind == "const":
+        return []
+    return ["opconst", "square_const", "proj_l", "proj_r", "const"]
+
+
+def secondary_bridge_equation(kind: str) -> dict[str, Any]:
+    return parse_equation(SECONDARY_BRIDGE_EQUATIONS[kind])
+
+
+def secondary_bridge_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    aux: UniversalEquation,
+    aux_kind: str,
+    deadline: float,
+) -> tuple[str | None, dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    for bridge_kind in secondary_bridge_order(aux_kind):
+        if time.monotonic() > deadline - 0.5:
+            attempts.append({
+                "kind": bridge_kind,
+                "status": "skipped_budget_exhausted",
+                "equation": SECONDARY_BRIDGE_EQUATIONS[bridge_kind],
+            })
+            continue
+        eq = secondary_bridge_equation(bridge_kind)
+        if pc_canon(eq["lhs"], eq["rhs"]) == pc_canon(aux.eq["lhs"], aux.eq["rhs"]):
+            continue
+        refutation = hint_refutation(h_eq, eq)
+        if refutation is not None:
+            attempts.append({
+                "kind": bridge_kind,
+                "status": "refuted_by_small_model",
+                "equation": eq["text"],
+                "refutation": refutation,
+            })
+            continue
+        bridge = UniversalEquation(name=bridge_kind, eq=eq, extra_args=[])
+        proof_body, proof_state = prove_with_assumptions_detailed(h_eq, eq, [aux])
+        if proof_body is None:
+            attempts.append({
+                "kind": bridge_kind,
+                "status": "not_proved",
+                "equation": eq["text"],
+                "proof_state": proof_state,
+            })
+            continue
+        goal_body, goal_state = prove_with_assumptions_detailed(h_eq, g_eq, [aux, bridge])
+        attempts.append({
+            "kind": bridge_kind,
+            "status": "proved" if goal_body else "proved_not_consumed",
+            "equation": eq["text"],
+            "proof_state": proof_state,
+            "consume_state": goal_state,
+        })
+        if goal_body:
+            return "\n".join([
+                f"have {bridge_kind} : {lemma_statement(eq)} := by",
+                indent(proof_body, 2),
+                goal_body,
+            ]), {
+                "kind": "SecondaryBridgeState",
+                "status": "body_built",
+                "aux": aux_kind,
+                "bridge": bridge_kind,
+                "bridge_equation": eq["text"],
+                "attempts": attempts,
+            }
+    need_hint = None
+    for attempt in attempts:
+        state = attempt.get("consume_state") or attempt.get("proof_state") or {}
+        if isinstance(state, dict) and state.get("need_hint"):
+            need_hint = state.get("need_hint")
+            break
+    return None, {
+        "kind": "SecondaryBridgeState",
+        "status": "stuck",
+        "aux": aux_kind,
+        "attempts": attempts[:5],
+        "need_hint": need_hint or {
+            "kind": "secondary_bridge_failed",
+            "reason": "A proved auxiliary lemma did not close the goal, and bounded secondary bridges did not close either.",
+        },
+    }
+
+
+def standard_aux_tail(kind: str, g_eq: dict[str, Any], h_eq: dict[str, Any], aux: UniversalEquation) -> tuple[str | None, dict[str, Any]]:
+    intro = "intro " + " ".join(g_eq["variables"]) if g_eq["variables"] else ""
+
+    def close_with(proof: str, status: str) -> tuple[str, dict[str, Any]]:
+        return "\n".join([intro, proof] if intro else [proof]), {
+            "kind": "AuxConsumeState",
+            "status": status,
+            "used_aux": aux.name,
+            "need_hint": None,
+        }
+
+    if kind == "const":
+        lhs = lean_arg(term_to_str(g_eq["lhs"]))
+        rhs = lean_arg(term_to_str(g_eq["rhs"]))
+        return close_with(f"exact {aux.name} {lhs} {rhs}", "consumed_by_const")
+
+    aux_eq = aux.eq
+    exact_line = pc_target_exact_line(
+        aux.name,
+        aux_eq["lhs"],
+        aux_eq["rhs"],
+        aux_eq["variables"],
+        g_eq["lhs"],
+        g_eq["rhs"],
+    )
+    if exact_line is not None:
+        return close_with(exact_line, "consumed_directly")
+
+    hrec = {
+        "binders": h_eq["variables"],
+        "lhs": h_eq["lhs"],
+        "rhs": h_eq["rhs"],
+    }
+    calc_line = pc_one_h_target_calc(
+        hrec,
+        aux_eq["lhs"],
+        aux_eq["rhs"],
+        aux_eq["variables"],
+        g_eq["lhs"],
+        g_eq["rhs"],
+        target_name=aux.name,
+    )
+    if calc_line is not None:
+        return close_with(calc_line, "consumed_by_one_h_aux")
+
+    calc_line = pc_path_target_calc(
+        hrec,
+        aux_eq["lhs"],
+        aux_eq["rhs"],
+        aux_eq["variables"],
+        g_eq["lhs"],
+        g_eq["rhs"],
+        target_name=aux.name,
+    )
+    if calc_line is not None:
+        return close_with(calc_line, "consumed_by_h_aux_path")
+
+    goal_body, goal_state = prove_with_assumptions_detailed(h_eq, g_eq, [aux])
+    return goal_body, goal_state
+
+
+def standard_aux_superposition_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    call = call or {}
+    kinds = standard_aux_order(call)
+    total_budget = float(call.get("budget") or call.get("time_budget") or 10.0)
+    deadline = time.monotonic() + max(1.0, total_budget)
+    allow_var_overlap = bool(call.get("allow_var_overlap", True))
+    attempts: list[dict[str, Any]] = []
+    for idx, kind in enumerate(kinds):
+        rem = deadline - time.monotonic()
+        if rem <= 0.25:
+            attempts.append({
+                "kind": kind,
+                "status": "skipped_budget_exhausted",
+                "equation": STANDARD_AUX_EQUATIONS[kind],
+            })
+            continue
+        eq = standard_aux_equation(kind)
+        refutation = hint_refutation(h_eq, eq)
+        if refutation is not None:
+            attempts.append({
+                "kind": kind,
+                "status": "refuted_by_small_model",
+                "equation": eq["text"],
+                "refutation": refutation,
+            })
+            continue
+        remaining = max(1, len(kinds) - idx)
+        attempt_budget = max(1.0, rem / remaining)
+        proof_body, proof_state = superposition_prove_detailed(
+            h_eq,
+            eq,
+            budget=attempt_budget,
+            allow_var_overlap=allow_var_overlap,
+        )
+        if proof_body is None:
+            attempts.append({
+                "kind": kind,
+                "status": "not_proved",
+                "equation": eq["text"],
+                "proof_state": proof_state,
+            })
+            continue
+        aux = UniversalEquation(name=kind, eq=eq, extra_args=[])
+        tail, consume_state = standard_aux_tail(kind, g_eq, h_eq, aux)
+        secondary_tail = None
+        secondary_state = None
+        if tail is None:
+            secondary_tail, secondary_state = secondary_bridge_attempt(h_eq, g_eq, aux, kind, deadline)
+        attempts.append({
+            "kind": kind,
+            "status": "proved" if (tail or secondary_tail) else "proved_not_consumed",
+            "equation": eq["text"],
+            "proof_state": proof_state,
+            "consume_state": consume_state,
+            "secondary_state": secondary_state,
+        })
+        if tail or secondary_tail:
+            body = "\n".join([
+                f"have {kind} : {lemma_statement(eq)} := by",
+                indent(proof_body, 2),
+                tail or secondary_tail or "",
+            ])
+            return body, {
+                "kind": "StandardAuxSuperpositionState",
+                "status": "body_built",
+                "used_aux": kind,
+                "used_secondary_bridge": secondary_state.get("bridge") if isinstance(secondary_state, dict) else None,
+                "attempts": attempts,
+            }
+    need_hint = None
+    for attempt in attempts:
+        states = []
+        if attempt.get("status") == "proved_not_consumed":
+            states = [attempt.get("secondary_state"), attempt.get("consume_state"), attempt.get("proof_state")]
+        else:
+            states = [attempt.get("proof_state"), attempt.get("consume_state")]
+        for state in states:
+            if isinstance(state, dict) and state.get("need_hint"):
+                if attempt.get("status") == "proved_not_consumed":
+                    need_hint = {
+                        "kind": "standard_aux_followup",
+                        "proved_aux": attempt.get("kind"),
+                        "proved_aux_equation": attempt.get("equation"),
+                        "reason": "The auxiliary lemma was proved from H, but the goal did not close with current bounded consumers.",
+                        "next": state.get("need_hint"),
+                    }
+                else:
+                    need_hint = state.get("need_hint")
+                break
+        if need_hint is not None:
+            break
+    return None, {
+        "kind": "StandardAuxSuperpositionState",
+        "status": "stuck",
+        "attempted_aux": kinds,
+        "attempts": attempts[:5],
+        "need_hint": need_hint or {
+            "kind": "standard_aux_failed",
+            "reason": "No standard auxiliary lemma was both proved from H and useful for the goal.",
+            "next_action": "Propose a custom midpoint/lemma_chain or try a different tool.",
+        },
+    }
+
+
+def native_deep_true_candidates(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    budget: float,
+):
+    """Late native portfolio covering every retired true-side mechanism class."""
+    deadline = time.monotonic() + max(1.0, budget)
+
+    for route, body in grounding_h_certificate_bodies(h_eq, g_eq):
+        if time.monotonic() >= deadline:
+            return
+        yield route, body, {"family": "grounding_h"}
+
+    remaining = deadline - time.monotonic()
+    if remaining > 1.0:
+        body, state = standard_aux_superposition_attempt(
+            h_eq,
+            g_eq,
+            {
+                "lemmas": ["const", "proj_l", "proj_r", "rowconst"],
+                "budget": min(12.0, max(1.0, remaining * 0.35)),
+            },
+        )
+        if body:
+            yield "standard_aux_superposition", body, state
+
+    for route, body in native_saturation_bodies(h_eq, g_eq):
+        if time.monotonic() >= deadline:
+            return
+        yield route, body, {"family": "deep_saturation"}
+
+    remaining = deadline - time.monotonic()
+    if remaining > 1.0:
+        body, state = superposition_prove_detailed(
+            h_eq,
+            g_eq,
+            budget=min(12.0, max(1.0, remaining)),
+            allow_var_overlap=True,
+        )
+        if body:
+            yield "goal_superposition:overlap", body, state
+
+
+def prove_with_assumptions_detailed(
+    h_eq: dict[str, Any],
+    target_eq: dict[str, Any],
+    assumptions: list[UniversalEquation] | None = None,
+    *,
+    extra_h_args: list[tuple[str, ...]] | None = None,
+    superposition_budget: float = 5.0,
+) -> tuple[str | None, dict[str, Any]]:
+    last_state: dict[str, Any] | None = None
+    tiers = [
+        (48, 96, 0),
+        (64, 128, 600),
+        (80, 180, 1600),
+    ]
+    if assumptions:
+        tiers.append((140, 320, 4000))
+    for h_limit, lemma_limit, congruence_cap in tiers:
+        body = h_graph_body(
+            h_eq,
+            target_eq,
+            h_limit,
+            lemmas=[assumption.as_lemma() for assumption in assumptions or []],
+            lemma_limit=lemma_limit,
+            congruence_cap=congruence_cap,
+            extra_args=extra_h_args,
+        )
+        state = graph_search_state(
+            h_eq,
+            target_eq,
+            assumptions,
+            h_limit=h_limit,
+            lemma_limit=lemma_limit,
+            congruence_cap=congruence_cap,
+            extra_args=extra_h_args,
+            status="proved" if body else "stuck",
+        )
+        if body:
+            return body, state
+        last_state = state
+    pc_body, pc_state = superposition_prove_detailed(
+        h_eq,
+        target_eq,
+        assumptions,
+        budget=superposition_budget,
+    )
+    if pc_body is None and (assumptions or target_aux_shape(target_eq)):
+        overlap_budget = max(1.0, min(3.0, superposition_budget / 3.0))
+        pc_body, pc_state = superposition_prove_detailed(
+            h_eq,
+            target_eq,
+            assumptions,
+            budget=overlap_budget,
+            allow_var_overlap=True,
+        )
+    if pc_body:
+        return pc_body, pc_state
+    if last_state is not None:
+        last_state = dict(last_state)
+        last_state["superposition_state"] = pc_state
+        last_state["need_hint"] = pc_state.get("need_hint") or last_state.get("need_hint")
+        return None, last_state
+    return None, last_state or {
+        "kind": "SearchState",
+        "status": "stuck",
+        "target": target_eq["text"],
+    }
+
+
+def prove_with_assumptions(
+    h_eq: dict[str, Any],
+    target_eq: dict[str, Any],
+    assumptions: list[UniversalEquation] | None = None,
+) -> str | None:
+    body, _state = prove_with_assumptions_detailed(h_eq, target_eq, assumptions)
+    return body
+
+
+def midpoint_progress_signal(state: dict[str, Any] | None) -> float:
+    """Extract a deliberately coarse, replaceable progress signal."""
+    source = state if isinstance(state, dict) else {}
+    score = 0.0
+    if source.get("closest_pairs"):
+        score += 0.20
+    if source.get("suggested_next_actions") or source.get("need_hint"):
+        score += 0.10
+    superposition = source.get("superposition_state")
+    if isinstance(superposition, dict):
+        if superposition.get("derived_closest_equations"):
+            score += 0.35
+        if superposition.get("shape_diagnostics"):
+            score += 0.20
+        if superposition.get("stop_reason") not in {None, "time_budget"}:
+            score += 0.05
+    return min(1.0, score)
+
+
+def generic_midpoint_chain_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    hints: list[UniversalEquation],
+    *,
+    budget_policy: dict[str, Any] | MidpointBudgetPolicy | None = None,
+    total_budget: float | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    limited_hints = hints[:5]
+    policy = (
+        budget_policy
+        if isinstance(budget_policy, MidpointBudgetPolicy)
+        else MidpointBudgetPolicy.from_mapping(
+            budget_policy,
+            candidate_count=len(limited_hints),
+            requested_total=total_budget,
+        )
+    )
+    broker = RenewableBudgetBroker(policy)
+    proof_lines: list[str] = []
+    proved: list[UniversalEquation] = []
+    proved_indices: set[int] = set()
+    failed: list[dict[str, Any]] = []
+    candidates: dict[int, dict[str, Any]] = {}
+
+    for index, hint in enumerate(limited_hints):
+        same_as_goal = (
+            (hint.eq["lhs"] == g_eq["lhs"] and hint.eq["rhs"] == g_eq["rhs"])
+            or (hint.eq["lhs"] == g_eq["rhs"] and hint.eq["rhs"] == g_eq["lhs"])
+        )
+        if same_as_goal:
+            failed.append({
+                "stage": "goal_as_midpoint",
+                "name": hint.name,
+                "equation": hint.eq["text"],
+                "failure": {
+                    "reason": "The proposed midpoint is the goal itself, so it does not split H=>G into easier subgoals.",
+                    "repair": "Return a smaller reusable helper equation or a false_model_search route instead.",
+                },
+            })
+            continue
+        refutation = hint_refutation(h_eq, hint.eq)
+        if refutation is not None:
+            failed.append({
+                "stage": "plausibility_filter",
+                "name": hint.name,
+                "equation": hint.eq["text"],
+                "failure": refutation,
+            })
+            continue
+
+        relevance = min(1.0, max(0.0, float(-hint_score(hint, g_eq)[0])) / 24.0)
+        reusable = 1.0 if helper_kind(hint.eq["text"]) else 0.0
+        common_score = policy.relevance_weight * relevance + policy.reuse_weight * reusable
+        candidates[index] = {
+            "index": index,
+            "hint": hint,
+            "relevance": relevance,
+            "reusable": reusable,
+            "proof_body": None,
+            "proof_state": None,
+            "consume_body": None,
+            "consume_state": None,
+        }
+        metadata = {
+            "candidate_index": index,
+            "candidate": hint.name,
+            "equation": hint.eq["text"],
+        }
+        broker.register(
+            f"candidate:{index}:consume",
+            base_score=policy.consume_priority + common_score,
+            metadata={**metadata, "leg": "consume"},
+        )
+        broker.register(
+            f"candidate:{index}:attain",
+            base_score=policy.attain_priority + common_score,
+            metadata={**metadata, "leg": "attain"},
+        )
+
+    broker.register(
+        "root:consume",
+        base_score=policy.goal_priority,
+        metadata={"candidate": "root", "leg": "consume_proved_set"},
+        enabled=False,
+    )
+
+    solution_body: str | None = None
+    last_goal_state: dict[str, Any] | None = None
+    while solution_body is None:
+        lease = broker.next_grant()
+        if lease is None:
+            break
+        task, grant = lease
+        started = time.monotonic()
+        leg = task.metadata.get("leg")
+        index = task.metadata.get("candidate_index")
+        candidate = candidates.get(index) if isinstance(index, int) else None
+        body: str | None = None
+        state: dict[str, Any] = {}
+
+        if leg == "attain" and candidate is not None:
+            hint = candidate["hint"]
+            body, state = prove_with_assumptions_detailed(
+                h_eq,
+                hint.eq,
+                list(proved),
+                extra_h_args=hint.proof_extra_args(),
+                superposition_budget=grant,
+            )
+            candidate["proof_state"] = state
+            if body is not None and index not in proved_indices:
+                candidate["proof_body"] = body
+                proof_lines.append(
+                    f"have {hint.name} : {lemma_statement(hint.eq)} := by\n"
+                    f"{indent(body, 2)}"
+                )
+                proved.append(hint)
+                proved_indices.add(index)
+                broker.report(
+                    task.task_id,
+                    "succeeded",
+                    progress=1.0,
+                    elapsed_seconds=time.monotonic() - started,
+                    detail={"proved_lemma": hint.name},
+                )
+                broker.advance_context()
+                broker.update("root:consume", enabled=True)
+                broker.update(f"candidate:{index}:consume", companion_succeeded=True)
+                if candidate.get("consume_body"):
+                    solution_body = "\n".join([*proof_lines, candidate["consume_body"]])
+                continue
+        elif leg == "consume" and candidate is not None:
+            hint = candidate["hint"]
+            assumptions = list(proved)
+            if index not in proved_indices:
+                assumptions.append(hint)
+            body, state = prove_with_assumptions_detailed(
+                h_eq,
+                g_eq,
+                assumptions,
+                superposition_budget=grant,
+            )
+            candidate["consume_state"] = state
+            last_goal_state = state
+            if body is not None:
+                candidate["consume_body"] = body
+                broker.report(
+                    task.task_id,
+                    "succeeded",
+                    progress=1.0,
+                    elapsed_seconds=time.monotonic() - started,
+                    detail={"candidate_is_attained": index in proved_indices},
+                )
+                broker.update(f"candidate:{index}:attain", companion_succeeded=True)
+                if index in proved_indices:
+                    solution_body = "\n".join([*proof_lines, body])
+                continue
+        elif leg == "consume_proved_set" and proved:
+            body, state = prove_with_assumptions_detailed(
+                h_eq,
+                g_eq,
+                list(proved),
+                superposition_budget=grant,
+            )
+            last_goal_state = state
+            if body is not None:
+                broker.report(
+                    task.task_id,
+                    "succeeded",
+                    progress=1.0,
+                    elapsed_seconds=time.monotonic() - started,
+                    detail={"proved_lemma_count": len(proved)},
+                )
+                solution_body = "\n".join([*proof_lines, body])
+                continue
+        else:
+            state = {
+                "kind": "BudgetTaskState",
+                "status": "not_runnable",
+                "leg": leg,
+            }
+
+        broker.report(
+            task.task_id,
+            "retryable",
+            progress=midpoint_progress_signal(state),
+            elapsed_seconds=time.monotonic() - started,
+            detail={
+                "search_status": state.get("status"),
+                "stop_reason": (state.get("superposition_state") or {}).get("stop_reason")
+                if isinstance(state.get("superposition_state"), dict)
+                else None,
+            },
+        )
+
+    for index, candidate in candidates.items():
+        if index in proved_indices:
+            continue
+        hint = candidate["hint"]
+        failed.append({
+            "stage": "prove_midpoint",
+            "name": hint.name,
+            "equation": hint.eq["text"],
+            "search_state": candidate.get("proof_state") or {
+                "kind": "SearchState",
+                "status": "not_started_before_budget_exhausted",
+            },
+        })
+
+    summary: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "kind": "midpoint_chain_attempt",
+        "status": "stuck",
+        "source": "generic_midpoint_chain",
+        "proposed_lemmas": [
+            {
+                "name": hint.name,
+                "equation": hint.eq["text"],
+                "score": -hint_score(hint, g_eq)[0],
+            }
+            for hint in limited_hints
+        ],
+        "proved_lemmas": [
+            {"name": hint.name, "equation": hint.eq["text"]} for hint in proved
+        ],
+        "failed_midpoints": failed[:3],
+        "budget_allocation": broker.snapshot(),
+    }
+    if not hints:
+        summary["status"] = "no_parseable_midpoints"
+        summary["need_hint"] = {
+            "kind": "midpoint",
+            "reason": "return one small universal equation, e.g. a ◇ b = b",
+        }
+        summary["suggested_next_actions"] = [{
+            "kind": "midpoint",
+            "lemma": "a ◇ b = b",
+            "why": "example shape only; replace with a problem-specific bridge",
+        }]
+        return None, summary
+    if not proved:
+        summary["status"] = "no_midpoint_proved"
+        bridge_failures = [item for item in failed if "search_state" in item]
+        goal_as_midpoint_failures = [item for item in failed if item.get("stage") == "goal_as_midpoint"]
+        if goal_as_midpoint_failures:
+            summary["need_hint"] = {
+                "kind": "replace_goal_as_midpoint",
+                "reason": "The proposed midpoint repeated the target goal and did not reduce the proof obligation.",
+                "bad_midpoint": goal_as_midpoint_failures[0].get("equation"),
+                "next_action": "Propose a smaller universal midpoint/lemma_chain that would imply the goal, or switch to a concrete false_model_search route.",
+            }
+        elif bridge_failures:
+            summary["need_hint"] = bridge_failures[0]["search_state"].get("need_hint")
+        elif failed:
+            summary["need_hint"] = {
+                "kind": "replace_midpoint",
+                "reason": "proposed midpoint was refuted by a small model of H",
+            }
+        if summary.get("need_hint"):
+            summary["suggested_next_actions"] = [summary["need_hint"]]
+        return None, summary
+    if solution_body is None:
+        summary["status"] = "proved_midpoints_not_consumed"
+        goal_state = last_goal_state or {
+            "kind": "SearchState",
+            "status": "budget_exhausted",
+            "need_hint": "The shared midpoint budget was exhausted before a proved helper set closed the goal.",
+        }
+        summary["goal_search_state"] = goal_state
+        summary["need_hint"] = goal_state.get("need_hint")
+        if goal_state.get("suggested_next_actions"):
+            summary["suggested_next_actions"] = goal_state.get("suggested_next_actions")
+        return None, summary
+    summary["status"] = "body_built"
+    summary["goal_search_state"] = last_goal_state
+    return solution_body, summary
+
+
+def generic_midpoint_chain_body(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    hints: list[UniversalEquation],
+) -> str | None:
+    """Prove LLM-proposed lemmas in order, then use the proved assumptions."""
+    body, _state = generic_midpoint_chain_attempt(h_eq, g_eq, hints)
+    return body
+
+
+def hint_payload_attempt(
+    payload: dict[str, Any],
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    *,
+    capability_mask: Any = None,
+) -> tuple[str | None, dict[str, Any]]:
+    hints = ordered_hints_for_payload(payload, parse_universal_equations(payload), g_eq)
+    body, state = generic_midpoint_chain_attempt(
+        h_eq,
+        g_eq,
+        hints,
+        budget_policy=payload.get("budget_policy"),
+        total_budget=payload.get("budget") or payload.get("time_budget"),
+    )
+    if body:
+        return body, state
+    kinds = {helper_kind(hint.eq["text"]) for hint in hints}
+    focused_fallbacks_withheld: list[str] = []
+    right_square_gate = capability_gate_state("right_square_chain", capability_mask)
+    if {"square_absorb", "right_square"} <= kinds and right_square_gate is None:
+        body = generic_right_square_chain_body(h_eq, g_eq)
+        if body:
+            state["status"] = "body_built_by_focused_right_square_fallback"
+            return body, state
+    elif {"square_absorb", "right_square"} <= kinds:
+        focused_fallbacks_withheld.append("tool:right_square_chain")
+    square_sandwich_gate = capability_gate_state("square_sandwich_chain", capability_mask)
+    if {"square_const", "right_id_square", "sandwich"} <= kinds and square_sandwich_gate is None:
+        body = square_sandwich_chain_body(h_eq, g_eq)
+        if body:
+            state["status"] = "body_built_by_focused_square_sandwich_fallback"
+            return body, state
+    elif {"square_const", "right_id_square", "sandwich"} <= kinds:
+        focused_fallbacks_withheld.append("tool:square_sandwich_chain")
+    if focused_fallbacks_withheld:
+        state["focused_fallbacks_withheld"] = focused_fallbacks_withheld
+    return None, state
+
+
+def body_from_hint_payload(
+    payload: dict[str, Any],
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    *,
+    capability_mask: Any = None,
+) -> str | None:
+    body, _state = hint_payload_attempt(payload, h_eq, g_eq, capability_mask=capability_mask)
+    return body
+
+
+# Focused true-side tools
+
+
+def op(left: Term, right: Term) -> Term:
+    return ("op", left, right)
+
+
+def sq(t: Term) -> Term:
+    return ("op", t, t)
+
+
+def is_square(t: Term):
+    return t[1] if t[0] == "op" and t[1] == t[2] else None
+
+
+def special_right_square_h(h_eq: dict[str, Any]):
+    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
+    if lhs[0] != "var" or rhs[0] != "op":
+        return None
+    x = lhs[1]
+    if rhs[2] != sq(("var", x)):
+        return None
+    left = rhs[1]
+    if left[0] != "op" or left[1][0] != "var" or left[2][0] != "op":
+        return None
+    y = left[1][1]
+    yz = left[2]
+    if yz[1] != ("var", y) or yz[2][0] != "var":
+        return None
+    z = yz[2][1]
+    return (x, y, z) if len({x, y, z}) == 3 else None
+
+
+def right_square_goal(g_eq: dict[str, Any]):
+    lhs, rhs = g_eq["lhs"], g_eq["rhs"]
+    if lhs[0] != "var" or rhs[0] != "op" or rhs[1] != lhs:
+        return None
+    inner = rhs[2]
+    if inner[0] != "op" or inner[2] != lhs or inner[1][0] != "op":
+        return None
+    b = inner[1][1]
+    if inner[1][2] != op(lhs, b):
+        return None
+    return term_to_str(lhs), term_to_str(b)
+
+
+def right_square_helper_lines(h_eq: dict[str, Any]) -> list[str] | None:
+    m = special_right_square_h(h_eq)
+    if m is None:
+        return None
+    hx, hy, hz = m
+
+    def h_call(x: str, y: str, z: str) -> str:
+        mp = {hx: x, hy: y, hz: z}
+        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+
+    return [
+        "have E4 : ∀ (v0 v1 v2 v3 v4 : G), ((v0 ◇ (v0 ◇ v1)) ◇ ((v2 ◇ (v2 ◇ v3)) ◇ ((v4 ◇ v4) ◇ (v4 ◇ v4)))) = v4 := by",
+        "  intro v0 v1 v2 v3 v4",
+        f"  have ia : v4 = ((v0 ◇ (v0 ◇ v1)) ◇ (v4 ◇ v4)) := {h_call('v4', 'v0', 'v1')}",
+        f"  have ib : (v4 ◇ v4) = ((v2 ◇ (v2 ◇ v3)) ◇ ((v4 ◇ v4) ◇ (v4 ◇ v4))) := {h_call('(v4 ◇ v4)', 'v2', 'v3')}",
+        "  have ic : ((v0 ◇ (v0 ◇ v1)) ◇ (v4 ◇ v4)) = ((v0 ◇ (v0 ◇ v1)) ◇ ((v2 ◇ (v2 ◇ v3)) ◇ ((v4 ◇ v4) ◇ (v4 ◇ v4)))) := congrArg (fun t => ((v0 ◇ (v0 ◇ v1)) ◇ t)) ib",
+        "  exact (ia.trans ic).symm",
+        "have raw_square_absorb : ∀ (v0 v1 v2 v3 : G), (v0 ◇ (v1 ◇ v1)) = v1 := by",
+        "  intro v0 v1 v2 v3",
+        f"  have ia : v1 = (((v2 ◇ (v2 ◇ v3)) ◇ ((v2 ◇ (v2 ◇ v3)) ◇ ((v0 ◇ v0) ◇ (v0 ◇ v0)))) ◇ (v1 ◇ v1)) := {h_call('v1', '(v2 ◇ (v2 ◇ v3))', '((v0 ◇ v0) ◇ (v0 ◇ v0))')}",
+        "  have ib : ((v2 ◇ (v2 ◇ v3)) ◇ ((v2 ◇ (v2 ◇ v3)) ◇ ((v0 ◇ v0) ◇ (v0 ◇ v0)))) = v0 := E4 v2 v3 v2 v3 v0",
+        "  have ic : (((v2 ◇ (v2 ◇ v3)) ◇ ((v2 ◇ (v2 ◇ v3)) ◇ ((v0 ◇ v0) ◇ (v0 ◇ v0)))) ◇ (v1 ◇ v1)) = (v0 ◇ (v1 ◇ v1)) := congrArg (fun t => t ◇ (v1 ◇ v1)) ib",
+        "  exact (ia.trans ic).symm",
+        "have square_absorb : ∀ (v0 v1 : G), (v0 ◇ (v1 ◇ v1)) = v1 := by",
+        "  intro v0 v1",
+        "  exact raw_square_absorb v0 v1 v0 v0",
+        "have raw_right_square : ∀ (v0 v1 v2 v3 v4 v5 : G), (v0 ◇ v1) = (v1 ◇ v1) := by",
+        "  intro v0 v1 v2 v3 v4 v5",
+        "  have ia : v0 ◇ ((v1 ◇ v1) ◇ (v1 ◇ v1)) = (v1 ◇ v1) := square_absorb v0 (v1 ◇ v1)",
+        "  have ib : ((v1 ◇ v1) ◇ (v1 ◇ v1)) = v1 := square_absorb (v1 ◇ v1) v1",
+        "  have ic : v0 ◇ ((v1 ◇ v1) ◇ (v1 ◇ v1)) = v0 ◇ v1 := congrArg (fun t => v0 ◇ t) ib",
+        "  exact ic.symm.trans ia",
+        "have right_square : ∀ (v0 v1 : G), (v0 ◇ v1) = (v1 ◇ v1) := by",
+        "  intro v0 v1",
+        "  exact raw_right_square v0 v1 v0 v0 v0 v0",
+    ]
+
+
+def right_square_chain_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    helper = right_square_helper_lines(h_eq)
+    goal = right_square_goal(g_eq)
+    if helper is None or goal is None:
+        return None
+    x, y = goal
+    xy = f"({x} ◇ {y})"
+    yxy = f"({y} ◇ {xy})"
+    inner = f"({yxy} ◇ {x})"
+    lines = ["intro " + " ".join(g_eq["variables"])] + helper + [
+        f"have t1 : {yxy} = ({xy} ◇ {xy}) := right_square {y} {xy}",
+        f"have t2 : {inner} = ({x} ◇ {x}) := by",
+        f"  have a : {inner} = (({xy} ◇ {xy}) ◇ {x}) := congrArg (fun t => t ◇ {x}) t1",
+        f"  have b : (({xy} ◇ {xy}) ◇ {x}) = ({x} ◇ {x}) := right_square ({xy} ◇ {xy}) {x}",
+        "  exact a.trans b",
+        f"have t3 : {x} ◇ {inner} = {x} ◇ ({x} ◇ {x}) := congrArg (fun u => {x} ◇ u) t2",
+        f"have t4 : {x} ◇ ({x} ◇ {x}) = {x} := square_absorb {x} {x}",
+        "exact (t3.trans t4).symm",
+    ]
+    return "\n".join(lines)
+
+
+def generic_right_square_chain_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    helper = right_square_helper_lines(h_eq)
+    if helper is None:
+        return None
+    lemmas = [
+        {"name": "square_absorb", "eq": parse_equation("u ◇ (v ◇ v) = v")},
+        {"name": "right_square", "eq": parse_equation("u ◇ v = v ◇ v")},
+    ]
+    goal_body = h_graph_body(h_eq, g_eq, 64, lemmas=lemmas, lemma_limit=160, congruence_cap=1600)
+    if goal_body is None:
+        return None
+    parts = goal_body.splitlines()
+    if parts and parts[0].startswith("intro "):
+        return "\n".join([parts[0], *helper, *parts[1:]])
+    return "\n".join(helper + [goal_body])
+
+
+def square_sandwich_h(h_eq: dict[str, Any]):
+    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
+    if lhs[0] != "var" or rhs[0] != "op":
+        return None
+    x = lhs[1]
+    left, square = rhs[1], rhs[2]
+    if left[0] != "op" or square[0] != "op":
+        return None
+    yx, y2 = left[1], left[2]
+    if yx[0] != "op" or yx[1][0] != "var" or yx[2] != ("var", x) or y2[0] != "var":
+        return None
+    y = yx[1][1]
+    if y2[1] != y or square[1][0] != "var" or square[2] != square[1]:
+        return None
+    z = square[1][1]
+    return (x, y, z) if len({x, y, z}) == 3 else None
+
+
+def square_sandwich_helper_lines(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> list[str] | None:
+    m = square_sandwich_h(h_eq)
+    if m is None or not g_eq["variables"]:
+        return None
+    hx, hy, hz = m
+
+    def h_call(x: str, y: str, z: str) -> str:
+        mp = {hx: x, hy: y, hz: z}
+        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+
+    return [
+        "intro " + " ".join(g_eq["variables"]),
+        "have square_const : ∀ v w : G, v ◇ v = w ◇ w := by",
+        "  intro v w",
+        "  let A : G := (v ◇ (v ◇ v)) ◇ v",
+        "  have hvA : v ◇ v = A ◇ (v ◇ v) := by",
+        f"    simpa [A] using {h_call('v ◇ v', 'v', 'v')}",
+        "  have hwA : v ◇ v = A ◇ (w ◇ w) := by",
+        f"    simpa [A] using {h_call('v ◇ v', 'v', 'w')}",
+        "  have ev : v ◇ v = ((v ◇ v) ◇ A) ◇ (v ◇ v) := by",
+        "    calc",
+        f"      v ◇ v = ((A ◇ (v ◇ v)) ◇ A) ◇ (v ◇ v) := {h_call('v ◇ v', 'A', 'v')}",
+        "      _ = ((v ◇ v) ◇ A) ◇ (v ◇ v) := by rw [← hvA]",
+        "  have ew : w ◇ w = ((v ◇ v) ◇ A) ◇ (v ◇ v) := by",
+        "    calc",
+        f"      w ◇ w = ((A ◇ (w ◇ w)) ◇ A) ◇ (v ◇ v) := {h_call('w ◇ w', 'A', 'v')}",
+        "      _ = ((v ◇ v) ◇ A) ◇ (v ◇ v) := by rw [← hwA]",
+        "  exact ev.trans ew.symm",
+        "have right_id_square : ∀ a b : G, a ◇ (b ◇ b) = a := by",
+        "  intro a b",
+        "  have sqv : a ◇ a = b ◇ b := square_const a b",
+        "  have step1 : ((b ◇ b) ◇ a) ◇ (b ◇ b) = a := by",
+        "    calc",
+        "      ((b ◇ b) ◇ a) ◇ (b ◇ b) = ((a ◇ a) ◇ a) ◇ (b ◇ b) := by rw [← sqv]",
+        f"      _ = a := ({h_call('a', 'a', 'b')}).symm",
+        "  have step2 : a = a ◇ (b ◇ b) := by",
+        "    calc",
+        f"      a = (((b ◇ b) ◇ a) ◇ (b ◇ b)) ◇ (b ◇ b) := {h_call('a', 'b ◇ b', 'b')}",
+        "      _ = a ◇ (b ◇ b) := by rw [step1]",
+        "  exact step2.symm",
+        "have sandwich : ∀ a b : G, (b ◇ a) ◇ b = a := by",
+        "  intro a b",
+        "  calc",
+        "    (b ◇ a) ◇ b = ((b ◇ a) ◇ b) ◇ (a ◇ a) := (right_id_square ((b ◇ a) ◇ b) a).symm",
+        f"    _ = a := ({h_call('a', 'b', 'a')}).symm",
+        "have left_sandwich : ∀ a b : G, b ◇ (a ◇ b) = a := by",
+        "  intro a b",
+        "  have d_eq_a : (((a ◇ b) ◇ a) ◇ (a ◇ b)) = a := by",
+        "    calc",
+        "      (((a ◇ b) ◇ a) ◇ (a ◇ b)) = (((a ◇ b) ◇ a) ◇ (a ◇ b)) ◇ (a ◇ a) := (right_id_square (((a ◇ b) ◇ a) ◇ (a ◇ b)) a).symm",
+        f"      _ = a := ({h_call('a', 'a ◇ b', 'a')}).symm",
+        "  calc",
+        "    b ◇ (a ◇ b) = (((a ◇ b) ◇ a) ◇ (a ◇ b)) := congrArg (fun u => u ◇ (a ◇ b)) (sandwich b a).symm",
+        "    _ = a := d_eq_a",
+    ]
+
+
+class SquareReducer:
+    def __init__(self, witness: str):
+        self.witness_var = witness
+        self.witness = sq(("var", witness))
+        self.lines: list[str] = []
+        self.count = 0
+
+    def fresh(self) -> str:
+        self.count += 1
+        return f"sq_chain_{self.count}"
+
+    def add_calc(self, start: Term, steps: list[tuple[Term, str]]) -> str:
+        name = self.fresh()
+        self.lines.append(f"have {name} : {term_to_str(start)} = {term_to_str(steps[-1][0])} := by")
+        if len(steps) == 1:
+            self.lines.append(f"  exact {steps[0][1]}")
+        else:
+            self.lines.append("  calc")
+            for i, (to_term, proof) in enumerate(steps):
+                self.lines.append(f"    {term_to_str(start) if i == 0 else '_'} = {term_to_str(to_term)} := {proof}")
+        return name
+
+    def reduce(self, t: Term) -> tuple[Term, str | None]:
+        if t[0] == "var":
+            return t, None
+        ln, lp = self.reduce(t[1])
+        rn, rp = self.reduce(t[2])
+        cur = op(ln, rn)
+        steps: list[tuple[Term, str]] = []
+        if lp:
+            steps.append((op(ln, t[2]), f"congrArg (fun u => u ◇ {term_to_str(t[2])}) {lp}"))
+        if rp:
+            steps.append((cur, f"congrArg (fun u => {term_to_str(ln)} ◇ u) {rp}"))
+        while cur[0] == "op":
+            l, r = cur[1], cur[2]
+            if r[0] == "op" and r[1] == r[2]:
+                cur = l
+                steps.append((cur, f"right_id_square {term_to_str(l)} {term_to_str(r[1])}"))
+            elif l[0] == "op" and l[1] == r:
+                cur = l[2]
+                steps.append((cur, f"sandwich {term_to_str(cur)} {term_to_str(r)}"))
+            elif r[0] == "op" and r[2] == l:
+                cur = r[1]
+                steps.append((cur, f"left_sandwich {term_to_str(cur)} {term_to_str(l)}"))
+            else:
+                base = is_square(cur)
+                if base is not None and cur != self.witness:
+                    cur = self.witness
+                    steps.append((cur, f"square_const {term_to_str(base)} {self.witness_var}"))
+                else:
+                    break
+        if not steps:
+            return t, None
+        return cur, self.add_calc(t, steps)
+
+
+def square_sandwich_chain_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    helper = square_sandwich_helper_lines(h_eq, g_eq)
+    if helper is None:
+        return None
+    reducer = SquareReducer(g_eq["variables"][0])
+    lhs_norm, lhs_pf = reducer.reduce(g_eq["lhs"])
+    rhs_norm, rhs_pf = reducer.reduce(g_eq["rhs"])
+    if lhs_norm != rhs_norm:
+        return None
+    lines = helper + reducer.lines
+    if lhs_pf is None and rhs_pf is None:
+        lines.append("rfl")
+    elif lhs_pf is None:
+        lines.append(f"exact {rhs_pf}.symm")
+    elif rhs_pf is None:
+        lines.append(f"exact {lhs_pf}")
+    else:
+        lines.append(f"exact {lhs_pf}.trans {rhs_pf}.symm")
+    return "\n".join(lines)
+
+
+def rowconst_h(h_eq: dict[str, Any]):
+    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
+    if lhs[0] != "op" or rhs[0] != "op":
+        return None
+    if lhs[1][0] != "var" or lhs[2][0] != "var" or rhs[1][0] != "var":
+        return None
+    x, y = lhs[1][1], lhs[2][1]
+    if rhs[1][1] != y or rhs[2][0] != "op" or rhs[2][1][0] != "var" or rhs[2][2][0] != "op":
+        return None
+    z = rhs[2][1][1]
+    if rhs[2][2] != op(("var", y), ("var", z)):
+        return None
+    return (x, y, z) if len({x, y, z}) == 3 else None
+
+
+def rowconst_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    m = rowconst_h(h_eq)
+    if m is None or g_eq["lhs"][0] != "op" or g_eq["rhs"][0] != "op":
+        return None
+    hx, hy, hz = m
+
+    def h_call(x: str, y: str, z: str) -> str:
+        mp = {hx: x, hy: y, hz: z}
+        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+
+    lhs_l, lhs_r = term_to_str(g_eq["lhs"][1]), term_to_str(g_eq["lhs"][2])
+    rhs_l, rhs_r = term_to_str(g_eq["rhs"][1]), term_to_str(g_eq["rhs"][2])
+    return "\n".join([
+        "intro " + " ".join(g_eq["variables"]),
+        "have col : ∀ p q r : G, p ◇ q = r ◇ q := by",
+        "  intro p q r",
+        "  calc",
+        f"    p ◇ q = q ◇ (q ◇ (q ◇ q)) := {h_call('p', 'q', 'q')}",
+        f"    _ = r ◇ q := ({h_call('r', 'q', 'q')}).symm",
+        "have rowconst : ∀ a b c : G, a ◇ b = a ◇ c := by",
+        "  intro a b c",
+        "  have hbcc : b ◇ c = c ◇ c := col b c c",
+        "  calc",
+        f"    a ◇ b = b ◇ (c ◇ (b ◇ c)) := {h_call('a', 'b', 'c')}",
+        "    _ = c ◇ (c ◇ (b ◇ c)) := col b (c ◇ (b ◇ c)) c",
+        "    _ = c ◇ (c ◇ (c ◇ c)) := by exact congrArg (fun u => c ◇ (c ◇ u)) hbcc",
+        f"    _ = a ◇ c := ({h_call('a', 'c', 'c')}).symm",
+        "calc",
+        f"  {term_to_str(g_eq['lhs'])} = {rhs_l} ◇ {lhs_r} := col {lhs_l} {lhs_r} {rhs_l}",
+        f"  _ = {term_to_str(g_eq['rhs'])} := rowconst {rhs_l} {lhs_r} {rhs_r}",
+    ])
+
+
+def square_rowconst_h(h_eq: dict[str, Any]) -> tuple[str, str, str] | None:
+    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
+    if lhs[0] != "var" or rhs[0] != "op":
+        return None
+    x = lhs[1]
+    left, right = rhs[1], rhs[2]
+    if left != sq(("var", x)):
+        return None
+    if right[0] != "op" or right[2][0] != "var":
+        return None
+    yz = right[1]
+    z = right[2][1]
+    if yz[0] != "op" or yz[1][0] != "var" or yz[2] != ("var", z):
+        return None
+    y = yz[1][1]
+    return (x, y, z) if len({x, y, z}) == 3 else None
+
+
+def grounding_derived_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    """Explicit square-rowconst close harvested from the grounding-derived sidecar.
+
+    The old grounding-derived renderer can derive `∀ a b, a◇b = a◇a` on this
+    shape but used to fail at a trailing `grind`. This packed version emits the
+    final `calc` explicitly.
+    """
+    m = square_rowconst_h(h_eq)
+    if m is None:
+        return None
+    hx, hy, hz = m
+    lhs, rhs = g_eq["lhs"], g_eq["rhs"]
+    if lhs[0] != "var" or rhs[0] != "op" or rhs[1] != sq(lhs):
+        return None
+    goal_x = term_to_str(lhs)
+    rhs_inner = term_to_str(rhs[2])
+    rhs_s = term_to_str(rhs)
+    xx = f"({goal_x} ◇ {goal_x})"
+    xxx = f"(({goal_x} ◇ {goal_x}) ◇ {goal_x})"
+
+    def h_call(x: str, y: str, z: str) -> str:
+        mp = {hx: x, hy: y, hz: z}
+        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+
+    lines = []
+    if g_eq["variables"]:
+        lines.append("intro " + " ".join(g_eq["variables"]))
+    lines.extend([
+        "have E1 : ∀ v0 v1 v2 v3 : G, (v0 ◇ v0) ◇ (v1 ◇ ((v2 ◇ v3) ◇ v3)) = v0 := by",
+        "  intro v0 v1 v2 v3",
+        f"  have ia := {h_call('v0', '(v1 ◇ v1)', '((v2 ◇ v3) ◇ v3)')}",
+        f"  have ib := {h_call('v1', 'v2', 'v3')}",
+        "  calc",
+        "    (v0 ◇ v0) ◇ (v1 ◇ ((v2 ◇ v3) ◇ v3)) = (v0 ◇ v0) ◇ (((v1 ◇ v1) ◇ ((v2 ◇ v3) ◇ v3)) ◇ ((v2 ◇ v3) ◇ v3)) := by",
+        "      exact congrArg (fun u => (v0 ◇ v0) ◇ (u ◇ ((v2 ◇ v3) ◇ v3))) ib",
+        "    _ = v0 := ia.symm",
+        "have E3 : ∀ v0 v1 v2 v3 : G, (v0 ◇ v0) ◇ v1 = v0 := by",
+        "  intro v0 v1 v2 v3",
+        "  have ia := E1 v0 (v1 ◇ v1) v2 v3",
+        f"  have ib := {h_call('v1', 'v2', 'v3')}",
+        "  calc",
+        "    (v0 ◇ v0) ◇ v1 = (v0 ◇ v0) ◇ ((v1 ◇ v1) ◇ ((v2 ◇ v3) ◇ v3)) := by",
+        "      exact congrArg (fun u => (v0 ◇ v0) ◇ u) ib",
+        "    _ = v0 := ia",
+        "have target : ∀ a b : G, a ◇ b = a ◇ a := by",
+        "  intro a b",
+        "  have ia := E3 (a ◇ a) b a a",
+        "  have ib := E3 a (a ◇ a) a a",
+        "  have bridge : ((a ◇ a) ◇ (a ◇ a)) ◇ b = a ◇ b := by",
+        "    exact congrArg (fun u => u ◇ b) ib",
+        "  exact bridge.symm.trans ia",
+        "calc",
+        f"  {goal_x} = {xx} ◇ {xxx} := {h_call(goal_x, goal_x, goal_x)}",
+        f"  _ = {xx} ◇ {xx} := target {xx} {xxx}",
+        f"  _ = {rhs_s} := (target {xx} {rhs_inner}).symm",
+    ])
+    return "\n".join(lines)
+
+
+def battery_arg_layers(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> list[dict[str, Any]]:
+    nargs = len(h_eq["variables"])
+    if nargs == 0:
+        return []
+    pad = (g_eq["variables"] or ["x"])[0]
+    terms = goal_terms(g_eq, 12)
+    compounds = [term for term in terms if "◇" in term]
+    diag = tuple([pad] * nargs)
+
+    def slot(i: int, term_list: list[str]) -> list[tuple[str, ...]]:
+        rows = []
+        for term in term_list:
+            args = [pad] * nargs
+            if i < nargs:
+                args[i] = term
+            rows.append(tuple(args))
+        return rows
+
+    layers: list[dict[str, Any]] = [{"name": "diag", "args": [diag]}]
+    slot0 = unique_arg_rows([diag] + slot(0, terms))
+    layers.append({"name": "slot0_terms", "args": slot0})
+    slot1 = unique_arg_rows(slot0 + slot(1, compounds))
+    layers.append({"name": "slot1_compounds", "args": slot1})
+    if nargs >= 3:
+        slot2 = unique_arg_rows(slot1 + slot(2, compounds))
+        layers.append({"name": "slot2_compounds", "args": slot2})
+    return layers
+
+
+def proof_battery_graph_body(h_eq: dict[str, Any], g_eq: dict[str, Any], max_layers: int = 3) -> tuple[str | None, dict[str, Any]]:
+    considered = []
+    for layer in battery_arg_layers(h_eq, g_eq)[:max_layers]:
+        rows = list(layer["args"])
+        considered.append({"name": layer["name"], "arg_count": len(rows)})
+        body = h_graph_body(h_eq, g_eq, limit=0, extra_args=rows)
+        if body:
+            return body, {
+                "kind": "proof_battery_state",
+                "status": "body_built",
+                "winning_consumer": "battery_h_fact_graph",
+                "graph_layers_considered": considered,
+            }
+    return None, {
+        "kind": "proof_battery_state",
+        "status": "no_graph_path",
+        "graph_layers_considered": considered,
+        "need_hint": "Old battery h-instance layers did not connect the goal; try forward_saturation, goal_superposition, or a midpoint.",
+    }
+
+
+def proof_candidates_with_sources(h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    if g_eq["lhs"] == g_eq["rhs"]:
+        yield "rfl_goal", "intro " + " ".join(g_eq["variables"]) + "\nrfl"
+    for maker in (right_square_chain_body, generic_right_square_chain_body, square_sandwich_chain_body, rowconst_body, grounding_derived_body):
+        try:
+            body = maker(h_eq, g_eq)
+        except Exception:
+            body = None
+        if body:
+            yield maker.__name__.removesuffix("_body"), body
+    body, _state = proof_battery_graph_body(h_eq, g_eq)
+    if body:
+        yield "proof_battery_graph", body
+    for cfg in [(48, 0), (64, 0), (64, 600)]:
+        body = h_graph_body(h_eq, g_eq, cfg[0], congruence_cap=cfg[1])
+        if body:
+            yield f"h_graph_limit_{cfg[0]}_cong_{cfg[1]}", body
+    intro = "intro " + " ".join(g_eq["variables"]) if g_eq["variables"] else ""
+    haves = []
+    for i, args in enumerate(candidate_h_args(h_eq, g_eq, 24), start=1):
+        haves.append(f"have h{i} := h " + " ".join(map(lean_arg, args)))
+    if intro and haves:
+        yield "old_haves_grind", "\n".join([intro, *haves, "grind"])
+
+
+def proof_candidates(h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    for _source, body in proof_candidates_with_sources(h_eq, g_eq):
+        yield body
+
+
+# LLM/tool-call fallback
+
+
+def extract_json(text: str) -> dict[str, Any] | None:
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text)
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            data = json.loads(m.group())
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def helper_kind(eq_text: str) -> str | None:
+    try:
+        eq = parse_equation(eq_text)
+    except Exception:
+        return None
+    lhs, rhs = eq["lhs"], eq["rhs"]
+    pairs = [(lhs, rhs), (rhs, lhs)]
+    for l, r in pairs:
+        if l[0] == "op" and r[0] == "var" and l[2] == sq(r):
+            return "square_absorb"
+        if l[0] == "op" and r[0] == "op" and r[1] == r[2] and l[2] == r[1]:
+            return "right_square"
+        if l[0] == "op" and r[0] == "op" and is_square(l) is not None and is_square(r) is not None and l != r:
+            return "square_const"
+        if l[0] == "op" and r[0] == "var":
+            if l[2][0] == "op" and l[2][1] == l[2][2] and l[1] == r:
+                return "right_id_square"
+            if l[1][0] == "op" and l[1][2] == r and l[1][1] == l[2]:
+                return "sandwich"
+            if l[2][0] == "op" and l[2][1] == r and l[2][2] == l[1]:
+                return "left_sandwich"
+    return None
+
+
+def run_tool_call_detailed(
+    call: dict[str, Any],
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    *,
+    capability_mask: Any = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    raw_tool = str(call.get("tool") or "").strip()
+    tool = TOOL_ALIASES.get(raw_tool, raw_tool)
+    gate_state = capability_gate_state(tool, capability_mask)
+    if gate_state is not None:
+        return None, gate_state
+    if tool == "forward_saturation":
+        seed_terms = [normalize(str(t)) for t in call.get("seed_terms", []) if isinstance(t, str)]
+        body = h_graph_body(
+            h_eq,
+            g_eq,
+            limit=80,
+            congruence_cap=1200,
+            extra_terms=seed_terms[:12],
+        )
+        state = graph_search_state(
+            h_eq,
+            g_eq,
+            status="proved" if body else "stuck",
+            extra_terms=seed_terms[:12],
+        )
+        return body, protocolize_state(state, "forward_saturation", status="proved" if body else "stuck")
+    if tool == "right_square_chain":
+        body = right_square_chain_body(h_eq, g_eq)
+        return body, protocol_state(
+            "MechanicalResponse",
+            "proved" if body else "not_applicable",
+            "right_square_chain",
+            tool=tool,
+            need_hint=None if body else "Right-square focused renderer did not match; try lemma_chain or goal_superposition.",
+        )
+    if tool == "square_sandwich_chain":
+        body = square_sandwich_chain_body(h_eq, g_eq)
+        return body, protocol_state(
+            "MechanicalResponse",
+            "proved" if body else "not_applicable",
+            "square_sandwich_chain",
+            tool=tool,
+            need_hint=None if body else "Square-sandwich renderer did not match; try lemma_chain with square_const/right_id/sandwich helpers.",
+        )
+    if tool == "rowconst_certificates":
+        body = rowconst_body(h_eq, g_eq)
+        return body, protocol_state(
+            "MechanicalResponse",
+            "proved" if body else "not_applicable",
+            "rowconst_certificates",
+            tool=tool,
+            need_hint=None if body else "Row-constant certificates did not apply; try standard_aux_superposition or a non-refuted midpoint from closest-equation feedback.",
+        )
+    if tool == "grounding_derived":
+        body = grounding_derived_body(h_eq, g_eq)
+        return body, protocolize_state({
+            "kind": "grounding_derived_state",
+            "status": "body_built" if body else "not_applicable",
+            "derived_helper": "target : ∀ a b : G, a ◇ b = a ◇ a" if body else None,
+            "need_hint": None if body else "Square-rowconst grounding closer did not apply; try certificates/rowconst/standard_aux or a midpoint.",
+        }, "grounding_derived")
+    if tool == "grounding_h":
+        bodies = list(grounding_h_certificate_bodies(h_eq, g_eq))
+        body = bodies[-1][1] if bodies else None
+        return body, protocol_state(
+            "MechanicalResponse",
+            "proved" if body else "not_applicable",
+            "grounding_h",
+            tool=tool,
+            candidate_count=len(bodies),
+            need_hint=None if body else "H is not non-orientable, or the goal has no variables; try standard_aux_superposition or a midpoint.",
+        )
+    if tool == "deep_saturation":
+        bodies = list(native_saturation_bodies(h_eq, g_eq))
+        body = bodies[-1][1] if bodies else None
+        return body, protocol_state(
+            "MechanicalResponse",
+            "proved" if body else "not_applicable",
+            "deep_saturation",
+            tool=tool,
+            candidate_count=len(bodies),
+            need_hint=None if body else "No bounded saturation body was generated; try goal_superposition or a midpoint.",
+        )
+    if tool == "proof_battery":
+        max_layers = int(call.get("max_graph_candidates") or call.get("graph_candidates") or 3)
+        body, state = proof_battery_graph_body(h_eq, g_eq, max_layers=max(1, min(max_layers, 8)))
+        state = state or {}
+        return body, protocolize_state(state, "proof_battery", status="proved" if body else state.get("status", "stuck"))
+    if tool == "goal_superposition":
+        body, state = superposition_prove_detailed(
+            h_eq,
+            g_eq,
+            budget=float(call.get("budget") or call.get("time_budget") or 8.0),
+            allow_var_overlap=bool(call.get("allow_var_overlap", False)),
+        )
+        state = state or {}
+        return body, protocolize_state(state, "goal_superposition", status="proved" if body else state.get("status", "stuck"))
+    if tool == "standard_aux_superposition":
+        body, state = standard_aux_superposition_attempt(h_eq, g_eq, call)
+        state = state or {}
+        return body, protocolize_state(state, "standard_aux_superposition", status="proved" if body else state.get("status", "stuck"))
+    if tool in {"lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
+        body, state = hint_payload_attempt(call, h_eq, g_eq, capability_mask=capability_mask)
+        state = state or {}
+        return body, protocolize_state(state, "generic_midpoint_chain", status="proved" if body else state.get("status", "stuck"))
+    if tool == "infinite_model_artifact":
+        _code, state = validate_infinite_model_payload(call)
+        return None, state
+    return None, protocol_state(
+        "MechanicalResponse",
+        "unsupported_tool",
+        "tool_registry",
+        tool=raw_tool,
+        need_hint="Choose one supported tool from the registry, or return a midpoint/lemma_chain/false_model_search action.",
+    )
+
+
+def run_tool_call(call: dict[str, Any], h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    body, _state = run_tool_call_detailed(call, h_eq, g_eq)
+    return body
+
+
+def standard_aux_plausible_h(h_eq: dict[str, Any]) -> bool:
+    return bool(one_sided_variables(h_eq))
+
+
+def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
+    advice = []
+    advice.append("General midpoint engine is available: propose one small equation M or a short chain; each must be proved from H before use.")
+    advice.append("Broad true-side consumer available: goal_superposition runs bounded proof-carrying paramodulation and reports a frontier if it gets stuck.")
+    advice.append("Standard auxiliary consumer available: standard_aux_superposition tries const/projection/rowconst lemmas as explicit proved helpers.")
+    if goal_generalization_actions(h_eq, g_eq):
+        advice.append("Goal-generalization cards are active: G appears to be a special case of a stronger reusable law, so try proving the reusable law first.")
+    one_sided = one_sided_variables(h_eq)
+    if one_sided:
+        advice.append(f"H has variables on only one side {one_sided}; standard_aux_superposition is a strong next tool because these often imply collapse/projection/rowconst helpers.")
+    if special_right_square_h(h_eq):
+        advice.append("H matches right_square_chain: try helpers u ◇ (v ◇ v)=v and u ◇ v=v ◇ v.")
+    if square_sandwich_h(h_eq):
+        advice.append("H matches square_sandwich_chain: try square_const/right_id_square/sandwich helpers.")
+    if rowconst_h(h_eq):
+        advice.append("H matches rowconst_certificates.")
+    if square_rowconst_h(h_eq):
+        advice.append("H matches grounding_derived square-rowconst: derive a ◇ b = a ◇ a and close explicitly.")
+    advice.append("If false, use false_model_search. Strong routes: structured_ce:max_n=7 for deterministic named/structured/dual families, model_finder_v2:n=k for goal-directed constraint search, optional cp_sat:n=k for exact finite-domain search when available, poly_ce:tier=2:nmax=13 for polynomial magmas, then local_search/model_finder fallbacks.")
+    return "\n".join(advice)
+
+
+def problem_analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
+    h_args = " ".join(h_eq["variables"])
+    schema_args = [v.upper() for v in h_eq["variables"]]
+    schema_lhs = term_to_str_subst(h_eq["lhs"], dict(zip(h_eq["variables"], schema_args)))
+    schema_rhs = term_to_str_subst(h_eq["rhs"], dict(zip(h_eq["variables"], schema_args)))
+    lines = [
+        f"h variables, in call order: {h_eq['variables']}",
+        f"goal variables, introduce in this order if writing proof: {g_eq['variables']}",
+        f"`h {h_args}` has type: {h_eq['text']}",
+        f"schematically, h {' '.join(schema_args)} gives: {schema_lhs} = {schema_rhs}",
+        "goal subterms worth bridging: " + ", ".join(goal_terms(g_eq, 8)),
+    ]
+    return "\n".join(lines)
+
+
+def tool_registry_text(capability_mask: Any = None, *, include_research_tools: bool = False) -> str:
+    normalized_mask = normalize_capability_mask(capability_mask)
+    disabled = set(normalized_mask["disabled"])
+    rows = []
+    for name, spec in TOOL_REGISTRY.items():
+        if spec.get("deployability") == "research_only" and not include_research_tools:
+            continue
+        required = required_capabilities_for_tool(name)
+        available = not any(capability in disabled for capability in required)
+        if not available:
+            continue
+        row = {
+            "tool": name,
+            "domain": spec["domain"],
+            "scope": spec.get("scope", "whole_goal"),
+            "cost": spec.get("cost", "medium"),
+            "feedback_quality": spec.get("feedback_quality", "basic"),
+            "native_import": spec.get("native_import", "collaborative"),
+            "aliases": spec.get("aliases", [])[:4],
+            "description": spec["description"],
+        }
+        if capability_mask is not None:
+            row["capability"] = f"tool:{name}"
+            row["required_capabilities"] = required
+        rows.append(row)
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
+    nargs = len(h_eq["variables"])
+    example_args = ["x"] * nargs
+    return "\n".join([
+        "If H has right-square absorption shape, use:",
+        '{"kind":"tool_call","tool":"right_square_chain","target":"goal","budget":15}',
+        "or the generic helper chain:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
+        "If H has square-witness/sandwich shape, use:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}',
+        "If H has square-rowconst grounding shape, use:",
+        '{"kind":"tool_call","tool":"grounding_derived","target":"goal","budget":12}',
+        "If shallow h-instances almost connect the goal, use graph-first proof battery:",
+        '{"kind":"tool_call","tool":"proof_battery","target":"goal","max_graph_candidates":3}',
+        "If feedback asks for a bridge, use lemma_hint with equations and optional seed_h_args:",
+        json.dumps({"kind": "tool_call", "tool": "lemma_hint", "target": "goal", "lemmas": [{"equation": "<left frontier> = <right frontier>", "seed_h_args": [example_args]}]}, ensure_ascii=False),
+        "If graph search is stuck and no focused family applies, try broad proof-carrying superposition:",
+        '{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8}',
+        "If the goal may collapse under a standard lemma, try auxiliary superposition:",
+        '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10}',
+        "If feedback says a stronger helper was refuted_by_small_model, do not repeat that helper; use the closest non-refuted bridge instead.",
+        "Repair example: if a projection-like target has the same left prefix on both sides, propose a reusable right-argument contraction:",
+        '{"kind":"midpoint","lemma":"a ◇ ((b ◇ c) ◇ d) = a ◇ b","why":"connects a left-prefix goal by contracting the right argument; mechanical side will prove and consume it"}',
+        "Repair example: if feedback says rowconst was the target but direct opconst is not refuted, opconst can be a useful stronger bridge:",
+        '{"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"derived opconst-like bridge was not refuted and would consume row/product goals"}',
+        "Repair example: if rowconst `a ◇ b = a ◇ c` is proved but not consumed, add a non-refuted follow-up helper rather than repeating rowconst alone:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"rowconst","equation":"a ◇ b = a ◇ c"},{"name":"right_contract","equation":"a ◇ ((b ◇ c) ◇ d) = a ◇ b"}]}',
+        "Repair example: if one projection is proved but not consumed, add the opposite projection in the same lemma_chain:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"proj_l","equation":"a ◇ b = a"},{"name":"proj_r","equation":"a ◇ b = b"}]}',
+        "Projection warning: a proved closest-pair midpoint can still be too goal-specific; if projection-shaped feedback is visible, prefer the reusable projection pair.",
+        "If feedback says a projection aux was proved but not consumed, ask standard_aux_superposition for the opposite projection too:",
+        '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["proj_l","proj_r"],"budget":10}',
+        "Repair example: for right-square absorption, do not stop after one helper; use the two-lemma chain:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
+        "Repair example: for square-sandwich hypotheses, square_const/right_id alone may be proved_not_consumed; add sandwich helpers:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}',
+        "Repair example: if a proposed midpoint simply repeats the target goal, replace it with reusable helper lemmas; for square-sandwich feedback use the four-lemma chain above.",
+        "If false, prefer concrete untried routes:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"local_search","routes":["local_search:n=6:seed=2"],"budget":6}',
+        "Natural false-search hints are also accepted:",
+        '{"kind":"false_model_hint","template":"local_search","sizes":[5,6,7],"seeds":[0,1,2],"time_budget":12}',
+        "For deterministic native witness families, use:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["structured_ce:max_n=7"],"budget":8}',
+        "If false and a complete small-size check is useful, ask for propagation model finding:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder","routes":["model_finder:n=4"],"budget":6}',
+        "If false and ordinary finite search is sparse, ask for the goal-directed model finder:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder_v2","routes":["model_finder_v2:n=6"],"budget":8}',
+        "If exact finite-domain CP-SAT is available and small sizes need proof/witness search, ask for:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}',
+        "If false may need a structured larger witness, ask for polynomial magma search:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}',
+    ])
+
+
+def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool = False) -> str:
+    ranked = []
+    for item in goal_generalization_actions(h_eq, g_eq):
+        action = item["action"]
+        ranked.append({
+            "tool": action.get("tool") or action.get("kind", "midpoint"),
+            "score": 96,
+            "why": item["reason"],
+            "strategy_card": item["card"],
+            "call": action,
+        })
+    for action in right_context_contraction_actions(h_eq, g_eq):
+        ranked.append({
+            "tool": "lemma_hint",
+            "score": 91,
+            "why": "Goal differs only by a right argument under a shared left prefix; try this non-refuted reusable contraction helper.",
+            "call": action,
+        })
+    if right_square_chain_body(h_eq, g_eq) or special_right_square_h(h_eq):
+        ranked.append({"tool": "right_square_chain", "score": 98, "why": "H/G match the trusted right-square absorption helper-chain renderer.", "call": {"kind": "tool_call", "tool": "right_square_chain", "target": "goal", "budget": 15}})
+        ranked.append({"tool": "lemma_chain", "score": 90, "why": "Same proof through generic helper-chain consumer.", "call": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [
+            {"name": "square_absorb", "equation": "u ◇ (v ◇ v) = v"},
+            {"name": "right_square", "equation": "u ◇ v = v ◇ v"},
+        ]}})
+    if square_sandwich_h(h_eq):
+        ranked.append({"tool": "lemma_chain", "score": 98, "why": "H has the square-witness/sandwich shape; use the four-helper chain.", "call": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [
+            {"name": "square_const", "equation": "u ◇ u = v ◇ v"},
+            {"name": "right_id_square", "equation": "u ◇ (v ◇ v) = u"},
+            {"name": "sandwich", "equation": "(v ◇ u) ◇ v = u"},
+            {"name": "left_sandwich", "equation": "v ◇ (u ◇ v) = u"},
+        ]}})
+        ranked.append({"tool": "square_sandwich_chain", "score": 92, "why": "Focused equivalent renderer for the square-witness helper chain.", "call": {"kind": "tool_call", "tool": "square_sandwich_chain", "target": "goal", "budget": 15}})
+    if rowconst_h(h_eq):
+        ranked.append({"tool": "rowconst_certificates", "score": 85, "why": "H matches a row-constant certificate pattern.", "call": {"kind": "tool_call", "tool": "rowconst_certificates", "target": "goal"}})
+    if square_rowconst_h(h_eq):
+        ranked.append({"tool": "grounding_derived", "score": 84, "why": "H matches square-rowconst grounding; derive/use a◇b=a◇a with an explicit final close.", "call": {"kind": "tool_call", "tool": "grounding_derived", "target": "goal", "budget": 12}})
+    ranked.append({"tool": "proof_battery", "score": 46, "why": "Try old battery h-instance layers through the explicit equality graph before risky grind bodies.", "call": {"kind": "tool_call", "tool": "proof_battery", "target": "goal", "max_graph_candidates": 3}})
+    aux_score = 88 if standard_aux_plausible_h(h_eq) else 42
+    aux_why = (
+        "H has variables on only one side; try collapse/projection/rowconst lemmas through proof-carrying superposition."
+        if standard_aux_plausible_h(h_eq)
+        else "Try standard collapse/projection/rowconst lemmas through proof-carrying superposition and consume any proved helper."
+    )
+    ranked.append({"tool": "standard_aux_superposition", "score": aux_score, "why": aux_why, "call": {"kind": "tool_call", "tool": "standard_aux_superposition", "target": "goal", "lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": 10}})
+    ranked.append({"tool": "lemma_hint", "score": 50, "why": "Use closest_pairs from mechanical feedback to propose a concrete bridge equation; never return the placeholder text.", "call": {"kind": "tool_call", "tool": "lemma_hint", "target": "goal", "lemmas": ["<small bridge equation>"]}})
+    ranked.append({"tool": "forward_saturation", "score": 45, "why": "Try extra h-instantiation seed terms near the frontier.", "call": {"kind": "tool_call", "tool": "forward_saturation", "target": "goal", "seed_terms": goal_terms(g_eq, 4), "budget": 3}})
+    ranked.append({"tool": "goal_superposition", "score": 43, "why": "Broad proof-carrying paramodulation consumer; useful when graph search needs unification-on-demand.", "call": {"kind": "tool_call", "tool": "goal_superposition", "target": "goal", "budget": 8}})
+    false_routes = (
+        [
+            "local_search:n=6:seed=0",
+            "local_search:n=6:seed=1",
+            "local_search:n=7:seed=0",
+            "model_finder_v2:n=7",
+            "cp_sat:n=5",
+            "cp_sat:n=6",
+            "poly_ce:tier=2:nmax=13",
+            "structured_ce:max_n=7",
+        ]
+        if prefer_false
+        else ["model_finder_v2:n=5", "local_search:n=6:seed=2", "poly_ce:tier=2:nmax=13", "structured_ce:max_n=7"]
+    )
+    ranked.append({"tool": "false_model_search", "score": 94 if prefer_false else 40, "why": "Prefer concrete finite-countermodel routes now; true-side tools have already failed or are low-confidence." if prefer_false else "Try bounded finite countermodel routes if false is plausible; model_finder_v2 gives goal-directed Skolem feedback and poly_ce can find structured larger witnesses.", "call": {"kind": "tool_call", "tool": "false_model_search", "target": "goal", "routes": false_routes, "budget": 12 if prefer_false else 8}})
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return json.dumps({
+        "kind": "tool_recommendations",
+        "recommended_next_action": ranked[0]["call"] if ranked else None,
+        "ranked": ranked[:6],
+    }, ensure_ascii=False)
+
+
+def try_true(body: str) -> bool:
+    result = call_judge("true", make_true_code(body))
+    return result.get("status") == "accepted"
+
+
+def try_false(n: int, table: list[list[int]]) -> bool:
+    result = call_judge("false", make_false_code(n, table))
+    return result.get("status") == "accepted"
+
+
+def try_false_artifact(found: tuple[Any, ...]) -> bool:
+    n = int(found[0])
+    table = found[1]
+    if len(found) >= 3 and isinstance(found[2], str) and found[2].strip():
+        result = call_judge("false", make_false_formula_code(n, found[2]))
+        if result.get("status") == "accepted":
+            return True
+    return try_false(n, table)
+
+
+def emit_attribution_attempt(route: str, verdict: str, *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> None:
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "event": "judge_attempt",
+        "route": route,
+        "verdict": verdict,
+        "source": source,
+    }
+    if detail:
+        payload["detail"] = detail
+    print("ATTRIBUTION " + json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
+
+
+def judge_true_attributed(route: str, body: str, *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    emit_attribution_attempt(route, "true", source=source, detail=detail)
+    return call_judge("true", make_true_code(body))
+
+
+def try_true_attributed(route: str, body: str, *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> bool:
+    result = judge_true_attributed(route, body, source=source, detail=detail)
+    return result.get("status") == "accepted"
+
+
+def try_false_attributed(route: str, n: int, table: list[list[int]], *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> bool:
+    emit_attribution_attempt(route, "false", source=source, detail=detail)
+    return try_false(n, table)
+
+
+def try_false_artifact_attributed(route: str, found: tuple[Any, ...], *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> bool:
+    n = int(found[0])
+    table = found[1]
+    if len(found) >= 3 and isinstance(found[2], str) and found[2].strip():
+        emit_attribution_attempt(f"{route}:formula", "false", source=source, detail=detail)
+        result = call_judge("false", make_false_formula_code(n, found[2]))
+        if result.get("status") == "accepted":
+            return True
+    emit_attribution_attempt(f"{route}:table", "false", source=source, detail=detail)
+    return try_false(n, table)
+
+
+def judge_infinite_model_artifact_attributed(
+    route: str,
+    code: str,
+    *,
+    source: str = "research_protocol",
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    emit_attribution_attempt(route, "false", source=source, detail={
+        "certificate_class": "infinite_model",
+        "artifact_bytes": len(code.encode("utf-8")),
+        **(detail or {}),
+    })
+    return call_judge("false", code)
+
+
+def is_hint_payload(data: dict[str, Any]) -> bool:
+    tool = TOOL_ALIASES.get(str(data.get("tool") or "").strip(), data.get("tool"))
+    if data.get("kind") == "tool_call" and tool not in {"lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
+        return False
+    return (
+        tool in {"lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}
+        or data.get("kind") in {"midpoint", "midpoint_chain", "lemma_hint", "lemma_chain"}
+        or any(key in data for key in ("lemma", "lemmas", "midpoint", "midpoints"))
+    )
+
+
+def generic_projection_hint_kind(eq: dict[str, Any]) -> str | None:
+    """Classify broad collapse hints that are often stale in false phases."""
+    for lhs, rhs in ((eq["lhs"], eq["rhs"]), (eq["rhs"], eq["lhs"])):
+        if lhs[0] == "var" and rhs[0] == "var" and lhs != rhs:
+            return "const"
+        if lhs[0] == "op" and rhs[0] == "var":
+            if rhs == lhs[1]:
+                return "proj_l"
+            if rhs == lhs[2]:
+                return "proj_r"
+    return None
+
+
+def is_generic_projection_hint_payload(data: dict[str, Any]) -> bool:
+    hints = parse_universal_equations(data)
+    if not hints:
+        return False
+    kinds = [generic_projection_hint_kind(hint.eq) for hint in hints]
+    return all(kind in {"const", "proj_l", "proj_r"} for kind in kinds)
+
+
+def is_false_model_payload(data: dict[str, Any]) -> bool:
+    tool = TOOL_ALIASES.get(str(data.get("tool") or "").strip(), data.get("tool"))
+    kind = str(data.get("kind") or "").strip()
+    template = str(data.get("template") or "").strip().lower()
+    return bool(
+        tool == "false_model_search"
+        or kind in {"false_model_search", "false_model_hint", "countermodel_hint", "false_table_search"}
+        or template in {
+            "local_search",
+            "model_finder",
+            "model_finder_v2",
+            "goal_directed",
+            "goal_directed_model_finder",
+            "poly",
+            "poly_ce",
+            "polynomial",
+            "cp_sat",
+            "cpsat",
+            "constraint_sat",
+            "structured_ce",
+            "ce_engine",
+            "witness_families",
+        }
+    )
+
+
+def is_infinite_model_payload(data: dict[str, Any]) -> bool:
+    tool = TOOL_ALIASES.get(str(data.get("tool") or "").strip(), data.get("tool"))
+    kind = str(data.get("kind") or "").strip()
+    return bool(
+        tool == "infinite_model_artifact"
+        or kind in {"infinite_model", "infinite_countermodel", "infinite_model_artifact"}
+    )
+
+
+def validate_infinite_model_payload(data: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    """Validate only the artifact envelope; mathematical validity belongs to Lean."""
+    code = data.get("code") or data.get("lean_code") or data.get("artifact")
+    errors: list[dict[str, Any]] = []
+    if not isinstance(code, str) or not code.strip():
+        errors.append(ProtocolIssue(
+            "missing_infinite_model_code",
+            "An infinite_model artifact must contain non-empty Lean code.",
+            "code",
+        ).to_dict())
+    elif "def submission" not in code or "Goal" not in code:
+        errors.append(ProtocolIssue(
+            "missing_submission_definition",
+            "Lean code must define `submission : Goal` for the judge-controlled false goal.",
+            "code",
+        ).to_dict())
+    elif len(code.encode("utf-8")) > 10_000:
+        errors.append(ProtocolIssue(
+            "infinite_model_artifact_too_large",
+            "The current false-certificate cap is 10,000 UTF-8 bytes.",
+            "code",
+        ).to_dict())
+    if errors:
+        return None, protocol_state(
+            "InfiniteModelArtifactState",
+            "invalid_envelope",
+            "infinite_model_artifact",
+            tool="infinite_model_artifact",
+            errors=errors,
+            need_hint="Return complete Lean code importing JudgeProblem and defining `submission : Goal`.",
+        )
+    return str(code), protocol_state(
+        "InfiniteModelArtifactState",
+        "ready_for_lean_verification",
+        "infinite_model_artifact",
+        tool="infinite_model_artifact",
+        artifact_bytes=len(str(code).encode("utf-8")),
+        trust_boundary="Envelope checks are syntactic; only the Lean judge can accept the mathematics.",
+    )
+
+
+def normalize_false_model_payload(data: dict[str, Any]) -> dict[str, Any]:
+    out = dict(data)
+    out["kind"] = "tool_call"
+    out["tool"] = "false_model_search"
+    if "route" in out and "routes" not in out:
+        out["routes"] = [out.pop("route")]
+    if "carrier_size" in out and "sizes" not in out:
+        out["sizes"] = [out["carrier_size"]]
+    return out
+
+
+def apply_false_route_memory(false_state: dict[str, Any], tried_routes: set[str], budget: float) -> dict[str, Any]:
+    """Filter false-search continuations against routes tried in prior rounds."""
+    state = dict(false_state)
+    for trial in state.get("trials") or []:
+        route = trial.get("route") if isinstance(trial, dict) else None
+        if route:
+            tried_routes.add(str(route))
+    continuations = [
+        str(route)
+        for route in state.get("untried_requested_routes") or []
+        if str(route) not in tried_routes
+    ]
+    state["untried_requested_routes"] = continuations
+    highlights = dict(state.get("diagnostic_highlights") or {})
+    policy = list(highlights.get("next_action_policy") or [])
+    if continuations:
+        state["recommended_next_call"] = {
+            "kind": "tool_call",
+            "tool": "false_model_search",
+            "target": "goal",
+            "routes": continuations[:1],
+            "budget": false_route_budget(continuations[:1], min(8.0, budget)),
+        }
+        state["suggested_next_actions"] = [state["recommended_next_call"]]
+        policy = [
+            "Try recommended_next_call first; it is untried in this collaboration pass.",
+            *[item for item in policy if not str(item).startswith("Try recommended_next_call")],
+        ][:4]
+    else:
+        state["recommended_next_call"] = None
+        state["suggested_next_actions"] = []
+        state["need_hint"] = (
+            "All locally recommended false-search continuations have already "
+            "been tried in this collaboration pass; propose a new route family "
+            "or switch to a true-side midpoint/lemma_chain."
+        )
+        policy = [
+            "All local continuations have already been tried in this collaboration pass.",
+            "Do not repeat the tried routes; propose a new route family, a larger/smaller carrier size, a new seed, a full table, or a true-side midpoint/lemma_chain.",
+            *[
+                item for item in policy
+                if "repeat" not in str(item).lower()
+                and not str(item).startswith("Try recommended_next_call")
+            ],
+        ][:4]
+    if highlights:
+        highlights["next_action_policy"] = policy
+        highlights["untried_after_memory"] = continuations
+        highlights["tried_in_collaboration"] = sorted(tried_routes)[-12:]
+        state["diagnostic_highlights"] = highlights
+    return state
+
+
+def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Protocol-v0 adapter from flexible LLM JSON to the solver's rigid actions.
+
+    This is intentionally conservative: it repairs obvious envelope mistakes,
+    records the repair, and still sends all mathematical content through the
+    existing mechanical verifier.
+    """
+    if not isinstance(data, dict):
+        issue = ProtocolIssue("not_object", "LLM response was not a JSON object")
+        return None, protocol_state(
+            "LLMAdapterState",
+            "rejected",
+            "llm_adapter",
+            errors=[issue.to_dict()],
+            need_hint="Return exactly one JSON object.",
+        )
+
+    repairs: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    out = dict(data)
+
+    if isinstance(out.get("action"), dict) and not any(
+        key in out
+        for key in (
+            "kind",
+            "tool",
+            "lemma",
+            "lemmas",
+            "midpoint",
+            "midpoints",
+            "verdict",
+            "counterexample_table",
+            "table",
+        )
+    ):
+        out = dict(out["action"])
+        repairs.append(ProtocolIssue("action_envelope", "Unwrapped top-level action object", "action").to_dict())
+
+    if "type" in out and "kind" not in out:
+        action_type = str(out.pop("type") or "").strip()
+        if action_type in {"false_model_search", "countermodel_search", "finite_model_search"}:
+            out["kind"] = "tool_call"
+            out["tool"] = "false_model_search"
+        else:
+            out["kind"] = action_type
+        repairs.append(ProtocolIssue("type_alias", "Renamed type to protocol kind/tool", "type").to_dict())
+
+    if "route" in out and "routes" not in out:
+        out["routes"] = [out.pop("route")]
+        repairs.append(ProtocolIssue("route_alias", "Renamed singular route to routes list", "route").to_dict())
+
+    if "tool_name" in out and "tool" not in out:
+        out["tool"] = out.pop("tool_name")
+        repairs.append(ProtocolIssue("field_alias", "Renamed tool_name to tool", "tool_name").to_dict())
+    if out.get("kind") == "tool":
+        out["kind"] = "tool_call"
+        repairs.append(ProtocolIssue("kind_alias", "Renamed kind=tool to kind=tool_call", "kind").to_dict())
+    if "proof_body" in out and "proof" not in out:
+        out["proof"] = out.pop("proof_body")
+        repairs.append(ProtocolIssue("field_alias", "Renamed proof_body to proof", "proof_body").to_dict())
+    if "lemma_chain" in out and "lemmas" not in out:
+        out["lemmas"] = out.pop("lemma_chain")
+        if not out.get("kind"):
+            out["kind"] = "lemma_chain"
+        repairs.append(ProtocolIssue(
+            "field_alias",
+            "Normalized top-level lemma_chain payload to kind=lemma_chain with lemmas",
+            "lemma_chain",
+        ).to_dict())
+
+    raw_tool = str(out.get("tool") or "").strip()
+    if raw_tool:
+        tool = TOOL_ALIASES.get(raw_tool, raw_tool)
+        if tool != raw_tool:
+            out["tool"] = tool
+            repairs.append(ProtocolIssue("tool_alias", f"Normalized tool alias {raw_tool} to {tool}", "tool").to_dict())
+    elif out.get("kind") == "tool_call":
+        errors.append(ProtocolIssue(
+            "missing_tool",
+            "tool_call responses must name a supported tool",
+            "tool",
+        ).to_dict())
+
+    if out.get("kind") == "tool_call":
+        tool = TOOL_ALIASES.get(str(out.get("tool") or "").strip(), out.get("tool"))
+        if tool not in TOOL_REGISTRY:
+            errors.append(ProtocolIssue(
+                "unknown_tool",
+                f"Unsupported tool {out.get('tool')!r}. For true-side bridges, return kind=midpoint with a lemma equation or tool=lemma_chain with lemmas.",
+                "tool",
+            ).to_dict())
+
+    if is_infinite_model_payload(out):
+        out["kind"] = "tool_call"
+        out["tool"] = "infinite_model_artifact"
+    elif is_false_model_payload(out):
+        before = dict(out)
+        out = normalize_false_model_payload(out)
+        if out != before:
+            repairs.append(ProtocolIssue("false_payload_normalized", "Normalized false-model hint to false_model_search tool call").to_dict())
+    elif is_hint_payload(out):
+        kind = str(out.get("kind") or "").strip()
+        if kind not in {"tool_call", "midpoint", "midpoint_chain", "lemma_hint", "lemma_chain"}:
+            out["kind"] = "midpoint_chain" if isinstance(out.get("lemmas"), list) else "midpoint"
+            repairs.append(ProtocolIssue("hint_kind_inferred", f"Inferred hint kind {out['kind']}", "kind").to_dict())
+        if out.get("kind") == "tool_call":
+            tool = TOOL_ALIASES.get(str(out.get("tool") or "").strip(), out.get("tool"))
+            if tool in {"lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
+                out["tool"] = tool
+    elif out.get("kind") in {"false_table", "goal_proof", "tool_call"} or out.get("verdict") in {"true", "false"}:
+        pass
+    else:
+        errors.append(ProtocolIssue(
+            "unsupported_action",
+            "Response did not match a supported protocol-v0 action",
+        ).to_dict())
+
+    if errors:
+        return None, protocol_state(
+            "LLMAdapterState",
+            "rejected",
+            "llm_adapter",
+            errors=errors,
+            raw_kind=data.get("kind"),
+            need_hint="Return a supported action: tool_call, midpoint, midpoint_chain, lemma_chain, false_model_search, infinite_model, false_table, or goal_proof.",
+        )
+    if repairs:
+        return out, protocol_state(
+            "LLMAdapterState",
+            "syntax_repaired",
+            "llm_adapter",
+            repairs=repairs,
+            normalized_action=compact_tool_signature(out) if "compact_tool_signature" in globals() else out,
+        )
+    return out, None
+
+
+def compact_feedback_value(value: Any, *, string_limit: int, depth: int = 0) -> Any:
+    if depth >= 6:
+        return short_text(str(value), min(string_limit, 180))
+    if isinstance(value, dict):
+        return {
+            str(k): compact_feedback_value(v, string_limit=string_limit, depth=depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        keep = 8 if depth <= 2 else 4
+        out = [
+            compact_feedback_value(v, string_limit=string_limit, depth=depth + 1)
+            for v in value[:keep]
+        ]
+        if len(value) > keep:
+            out.append({"truncated_items": len(value) - keep})
+        return out
+    if isinstance(value, str):
+        return short_text(value, string_limit)
+    return value
+
+
+def feedback_json(feedback: list[dict[str, Any]]) -> str:
+    if not feedback:
+        return "No solver-side midpoint feedback yet."
+    recent = feedback[-3:]
+    for item_count in (3, 2, 1):
+        for string_limit in (800, 400, 220, 120):
+            compact = [
+                compact_feedback_value(item, string_limit=string_limit)
+                for item in recent[-item_count:]
+            ]
+            text = json.dumps(compact, ensure_ascii=False)
+            if len(text) <= 8000:
+                return text
+    fallback = [
+        {
+            "kind": item.get("kind"),
+            "status": item.get("status"),
+            "source": item.get("source"),
+            "need_hint": short_text(str(item.get("need_hint")), 500),
+        }
+        for item in recent[-1:]
+    ]
+    return json.dumps(fallback, ensure_ascii=False)
+
+
+def llm_context(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    mechanical_feedback: list[dict[str, Any]],
+    collaboration_goal: str,
+    *,
+    prefer_false: bool | str = False,
+    semantic_context: dict[str, Any] | None = None,
+    capability_mask: Any = None,
+    allow_infinite_model_artifacts: bool = False,
+) -> dict[str, Any]:
+    if not finite_countermodel_search_allowed(semantic_context):
+        phase_directive = (
+            "Finite countermodel search is prohibited by the audited semantic status. "
+            "Do not return a finite table or finite_model_search call. For research, propose "
+            "an infinite-model construction or a structural lemma."
+            + (
+                " Return a complete infinite_model Lean artifact if you can prove it."
+                if allow_infinite_model_artifacts
+                else " The Lean judge goal can express an infinite model, but this pass has disabled research artifacts."
+            )
+        )
+        advice_prefer_false = False
+    elif prefer_false is True:
+        phase_directive = "This is a false-preferred recovery pass. Return false_model_search, false_model_hint, false_table, or a concrete midpoint/lemma_chain only. Prefer recommended_next_call when present. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition in this pass; those true-side routes were already tried or are low-confidence."
+        advice_prefer_false = True
+    elif prefer_false == "balanced":
+        if false_strategy_cards(mechanical_feedback):
+            phase_directive = "This is a balanced pre-child recovery pass with concrete false-route telemetry. Return the false_model_search recommended_next_call, a concrete false_table, or a real midpoint/lemma_chain only. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition while a false continuation card is available."
+        else:
+            phase_directive = "This is a balanced pre-child recovery pass after native true and false tools failed. Prefer a concrete midpoint/lemma_chain that repairs the failed true-side attempts. Use false_model_search only if the feedback gives a specific untried countermodel route; never repeat stale false routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration."
+        advice_prefer_false = False
+    else:
+        phase_directive = "This is a true-collaboration pass. Prefer the top focused true tool or a concrete midpoint/lemma_chain; use false_model_search only if a finite countermodel route is specifically plausible."
+        advice_prefer_false = False
+    context = {
+        "problem_analysis": problem_analysis(h_eq, g_eq),
+        "analysis": analysis(h_eq, g_eq),
+        "tool_registry": tool_registry_text(
+            capability_mask,
+            include_research_tools=allow_infinite_model_artifacts,
+        ),
+        "tool_advice": tool_advice(h_eq, g_eq, prefer_false=advice_prefer_false),
+        "strategy_cards": strategy_cards_text(
+            h_eq,
+            g_eq,
+            mechanical_feedback,
+            prefer_false=prefer_false,
+        ),
+        "phase_directive": phase_directive,
+        "mechanical_feedback": feedback_json(mechanical_feedback),
+        "fewshots": sidecar_fewshots(h_eq),
+        "collaboration_goal": collaboration_goal,
+    }
+    if capability_mask is not None:
+        context["capability_manifest"] = capability_manifest(capability_mask)
+    if semantic_context and semantic_context.get("semantic_class") != "unclassified":
+        context["semantic_context"] = semantic_context
+    if allow_infinite_model_artifacts:
+        context["research_artifact_schema"] = {
+            "kind": "infinite_model",
+            "code": "complete Lean source importing JudgeProblem and defining submission : Goal",
+            "trust_boundary": "The judge checks the artifact; no mathematical claim is trusted before acceptance.",
+        }
+    return context
+
+
+def compact_tool_signature(data: dict[str, Any]) -> str:
+    if data.get("tool") == "false_model_search":
+        return json.dumps({
+            "tool": "false_model_search",
+            "routes": data.get("routes") or [],
+            "sizes": data.get("sizes") or [],
+            "seeds": data.get("seeds") or [],
+            "template": data.get("template"),
+        }, sort_keys=True)
+    if is_hint_payload(data):
+        return json.dumps({
+            "kind": data.get("kind"),
+            "tool": data.get("tool"),
+            "lemmas": data.get("lemmas") or data.get("lemma") or data.get("midpoints") or data.get("midpoint"),
+        }, sort_keys=True, ensure_ascii=False)
+    return json.dumps(data, sort_keys=True, ensure_ascii=False)[:500]
+
+
+def should_try_collaboration_first(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> bool:
+    return bool(
+        special_right_square_h(h_eq)
+        or square_sandwich_h(h_eq)
+        or rowconst_h(h_eq)
+        or goal_generalization_actions(h_eq, g_eq)
+    )
+
+
+def try_llm_collaboration(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    budget: float,
+    *,
+    max_rounds: int,
+    collaboration_goal: str,
+    initial_feedback: list[dict[str, Any]] | None = None,
+    prefer_false: bool | str = False,
+    feedback_sink: list[dict[str, Any]] | None = None,
+    semantic_context: dict[str, Any] | None = None,
+    capability_mask: Any = None,
+    allow_infinite_model_artifacts: bool = False,
+) -> str | None:
+    mechanical_feedback: list[dict[str, Any]] = list(initial_feedback or [])
+    finite_search_allowed = finite_countermodel_search_allowed(semantic_context)
+    if semantic_context and semantic_context.get("semantic_class") != "unclassified":
+        mechanical_feedback.insert(0, semantic_status_state(semantic_context))
+    failed_signatures: set[str] = set()
+    tried_false_routes: set[str] = false_tried_routes_from_states(false_feedback_states(mechanical_feedback, limit=None))
+    deadline = time.monotonic() + max(8.0, min(90.0, budget * 0.35))
+    rounds = 0
+    while rounds < max_rounds and time.monotonic() < deadline:
+        rounds += 1
+        resp = call_llm(llm_context(
+            h_eq,
+            g_eq,
+            mechanical_feedback,
+            collaboration_goal,
+            prefer_false=prefer_false,
+            semantic_context=semantic_context,
+            capability_mask=capability_mask,
+            allow_infinite_model_artifacts=allow_infinite_model_artifacts,
+        ))
+        if resp.get("error"):
+            mechanical_feedback.append(protocol_state(
+                "LLMAdapterState",
+                "provider_error",
+                "llm_provider",
+                errors=[ProtocolIssue("provider_error", short_text(str(resp.get("error")), 500)).to_dict()],
+                need_hint="LLM provider failed; stop this collaboration pass and fall back to deterministic routes.",
+            ))
+            break
+        data = extract_json(resp.get("response", ""))
+        if not data:
+            mechanical_feedback.append(protocol_state(
+                "LLMAdapterState",
+                "parse_failed",
+                "llm_adapter",
+                errors=[ProtocolIssue("no_json_object", "No JSON object could be extracted from the LLM response").to_dict()],
+                need_hint="Return exactly one JSON object containing a midpoint, midpoint_chain, tool_call, proof, or false_table.",
+            ))
+            continue
+        data, adapter_state = normalize_llm_action(data)
+        if adapter_state is not None:
+            mechanical_feedback.append(adapter_state)
+        if not data:
+            continue
+        if is_infinite_model_payload(data):
+            sig = compact_tool_signature(data)
+            gate_state = capability_gate_state("infinite_model_artifact", capability_mask)
+            if gate_state is not None:
+                mechanical_feedback.append(gate_state)
+                failed_signatures.add(sig)
+                continue
+            if not allow_infinite_model_artifacts:
+                mechanical_feedback.append(protocol_state(
+                    "InfiniteModelArtifactState",
+                    "disabled_outside_research",
+                    "infinite_model_artifact",
+                    tool="infinite_model_artifact",
+                    need_hint="This action is research-only. Use a supported competition artifact or enable the explicit research lane.",
+                ))
+                failed_signatures.add(sig)
+                continue
+            code, artifact_state = validate_infinite_model_payload(data)
+            mechanical_feedback.append(artifact_state)
+            if code is None:
+                failed_signatures.add(sig)
+                continue
+            result = judge_infinite_model_artifact_attributed(
+                "llm:infinite_model_artifact",
+                code,
+                detail={"signature": sig},
+            )
+            if result.get("status") == "accepted":
+                return "accepted_false_infinite_model_llm"
+            mechanical_feedback.append(protocol_state(
+                "InfiniteModelArtifactState",
+                "judge_rejected",
+                "lean_judge",
+                tool="infinite_model_artifact",
+                judge_status=result.get("status"),
+                errors=[ProtocolIssue(
+                    "judge_rejected_infinite_model",
+                    short_text(result.get("stderr") or result.get("message") or "", 1000),
+                ).to_dict()],
+                need_hint="Repair the Type-level magma construction or its proofs using the exact Lean diagnostics.",
+            ))
+            failed_signatures.add(sig)
+            continue
+        if data.get("kind") == "false_table" or data.get("verdict") == "false":
+            if not finite_search_allowed:
+                mechanical_feedback.append(semantic_status_state(semantic_context or {}))
+                failed_signatures.add(compact_tool_signature(data))
+                continue
+            table = data.get("counterexample_table") or data.get("table")
+            if isinstance(table, list) and is_counterexample(h_eq, g_eq, table) and try_false_attributed("llm:false_table", len(table), table, source="llm_direct_artifact"):
+                return "accepted_false_llm"
+        false_cards_available = bool(false_strategy_cards(mechanical_feedback))
+        false_phase_active = prefer_false is True or (prefer_false == "balanced" and false_cards_available)
+        if false_phase_active and not is_false_model_payload(data):
+            top_action = top_false_recommended_action(mechanical_feedback)
+            raw_tool = str(data.get("tool") or "").strip()
+            tool = TOOL_ALIASES.get(raw_tool, raw_tool)
+            off_phase_tool = data.get("kind") == "tool_call" and tool not in {
+                "false_model_search",
+                "lemma_chain",
+                "lemma_hint",
+                "midpoint",
+                "midpoint_chain",
+            }
+            off_phase_generic_hint = is_hint_payload(data) and is_generic_projection_hint_payload(data)
+            if top_action is not None and (off_phase_tool or off_phase_generic_hint):
+                original = data
+                data = dict(top_action)
+                mechanical_feedback.append(protocol_state(
+                    "LLMAdapterState",
+                    "route_repaired",
+                    "llm_adapter",
+                    repairs=[ProtocolIssue(
+                        "false_route_policy",
+                        "Replaced an off-phase generic true-side action with the top false continuation card.",
+                    ).to_dict()],
+                    normalized_action=compact_tool_signature(data),
+                    original_action=compact_tool_signature(original),
+                ))
+        if is_false_model_payload(data):
+            data = normalize_false_model_payload(data)
+            gate_state = capability_gate_state("false_model_search", capability_mask)
+            if gate_state is not None:
+                mechanical_feedback.append(gate_state)
+                failed_signatures.add(compact_tool_signature(data))
+                continue
+            if not finite_search_allowed:
+                mechanical_feedback.append(semantic_status_state(semantic_context or {}))
+                failed_signatures.add(compact_tool_signature(data))
+                continue
+            if prefer_false is True or prefer_false == "balanced":
+                top_action = top_false_recommended_action(mechanical_feedback)
+                action_routes = [str(route) for route in data.get("routes") or []]
+                action_is_stale = bool(action_routes) and all(route in tried_false_routes for route in action_routes)
+                action_is_empty = not action_routes and not data.get("template") and not data.get("sizes")
+                if top_action is not None and (action_is_stale or action_is_empty):
+                    original = data
+                    data = dict(top_action)
+                    mechanical_feedback.append(protocol_state(
+                        "LLMAdapterState",
+                        "route_repaired",
+                        "llm_adapter",
+                        repairs=[ProtocolIssue(
+                            "false_route_policy",
+                            "Replaced mismatched false_model_search route with the top false continuation card.",
+                        ).to_dict()],
+                        normalized_action=compact_tool_signature(data),
+                        original_action=compact_tool_signature(original),
+                    ))
+            sig = compact_tool_signature(data)
+            if sig in failed_signatures:
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "duplicate_failed_call",
+                    "scheduler",
+                    tool="false_model_search",
+                    need_hint="Do not repeat this exact failed false_model_search call; change routes/sizes/seeds or switch to midpoint/lemma_chain.",
+                ))
+                continue
+            found, false_state = false_model_search_detailed(
+                h_eq,
+                g_eq,
+                data,
+                8,
+                semantic_context=semantic_context,
+            )
+            if found and try_false_artifact_attributed(
+                "llm:false_model_search",
+                found,
+                source="llm_tool_call",
+                detail={"signature": sig},
+            ):
+                return "accepted_false_llm"
+            if isinstance(false_state, dict):
+                false_state = apply_false_route_memory(false_state, tried_false_routes, float(data.get("budget") or 8))
+            failed_signatures.add(sig)
+            mechanical_feedback.append(protocol_state(
+                "MechanicalResponse",
+                "stuck",
+                "false_model_search",
+                tool="false_model_search",
+                tool_state=false_state,
+                recommended_next_call=false_state.get("recommended_next_call") if isinstance(false_state, dict) else None,
+                untried_requested_routes=false_state.get("untried_requested_routes") if isinstance(false_state, dict) else None,
+                need_hint=false_state.get("need_hint") if isinstance(false_state, dict) else "Try a different false-search route, or switch to a true-side midpoint if the finite search is unproductive.",
+            ))
+            continue
+        if (prefer_false is True or (prefer_false == "balanced" and false_cards_available)) and data.get("kind") == "tool_call":
+            raw_tool = str(data.get("tool") or "").strip()
+            tool = TOOL_ALIASES.get(raw_tool, raw_tool)
+            if tool not in {"false_model_search", "lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "suppressed_in_false_preferred_pass",
+                    "scheduler",
+                    tool=tool,
+                    need_hint="Return false_model_search/false_model_hint with concrete routes, or a real midpoint/lemma_chain. Do not repeat true-side tool calls in this pass.",
+                ))
+                failed_signatures.add(compact_tool_signature(data))
+                continue
+        body = None
+        candidate_route = "llm:goal_proof"
+        candidate_source = "llm_direct_artifact"
+        if is_hint_payload(data):
+            sig = compact_tool_signature(data)
+            if sig in failed_signatures:
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "duplicate_failed_hint",
+                    "scheduler",
+                    need_hint="Do not repeat this exact failed midpoint/lemma payload; repair it using the frontier and closest_pairs.",
+                ))
+                continue
+            hint_tool = capability_tool_for_action(data)
+            gate_state = capability_gate_state(hint_tool, capability_mask)
+            if gate_state is not None:
+                mechanical_feedback.append(gate_state)
+                failed_signatures.add(sig)
+                continue
+            body, state = hint_payload_attempt(data, h_eq, g_eq, capability_mask=capability_mask)
+            candidate_route = "llm:hint_payload"
+            candidate_source = "llm_hint"
+            mechanical_feedback.append(state)
+            if not body:
+                failed_signatures.add(sig)
+        elif data.get("kind") == "tool_call":
+            sig = compact_tool_signature(data)
+            if sig in failed_signatures:
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "duplicate_failed_call",
+                    "scheduler",
+                    tool=data.get("tool"),
+                    need_hint="Do not repeat this exact failed tool call; change arguments or switch strategy.",
+                ))
+                continue
+            body, tool_state = run_tool_call_detailed(
+                data,
+                h_eq,
+                g_eq,
+                capability_mask=capability_mask,
+            )
+            candidate_route = f"llm:tool:{data.get('tool')}"
+            candidate_source = "llm_tool_call"
+            if not body:
+                failed_signatures.add(sig)
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "stuck",
+                    str(data.get("tool") or "tool_call"),
+                    tool=data.get("tool"),
+                    tool_state=tool_state,
+                    need_hint="This tool did not produce a proof body for the current H/G; use SearchState closest_pairs to propose a midpoint or choose another bounded tool.",
+                ))
+        if not body:
+            body = data.get("proof") or data.get("body")
+        if isinstance(body, str) and body.strip():
+            result = judge_true_attributed(candidate_route, body, source=candidate_source)
+            if result.get("status") == "accepted":
+                return "accepted_true_llm"
+            mechanical_feedback.append(protocol_state(
+                "MechanicalResponse",
+                "judge_rejected_true_body",
+                "lean_judge",
+                errors=[ProtocolIssue("judge_rejected", short_text(result.get("stderr") or result.get("message") or "", 800)).to_dict()],
+                judge_status=result.get("status"),
+                need_hint="Repair the proof body or propose a smaller midpoint/lemma chain that the mechanical prover can stitch.",
+            ))
+    if feedback_sink is not None:
+        feedback_sink.clear()
+        feedback_sink.extend(mechanical_feedback[-10:])
+    return None
+
+
+def solve(problem: dict[str, Any], budget: float) -> str:
+    solve_started = time.monotonic()
+    try:
+        h_eq = parse_equation(problem["equation1"])
+        g_eq = parse_equation(problem["equation2"])
+    except Exception:
+        return "parse_failed"
+    semantic_context = implication_semantics(problem)
+    semantic_state = semantic_status_state(semantic_context)
+    false_failure_feedback: list[dict[str, Any]] = []
+
+    # The executable judge can express an infinite Type-level model, and the
+    # research protocol has an explicit whole-artifact adapter.  The default
+    # competition solve path deliberately keeps that research-only lane off and
+    # renders only finite tables.  An Austin implication is therefore a default
+    # deployment capability gap, not a reason to buy more finite-search time.
+    if semantic_context.get("current_solver_certificate_status") == "unsupported_infinite_model":
+        print(json.dumps(semantic_state, ensure_ascii=False), file=sys.stderr)
+        return "semantic_solver_capability_gap"
+
+    # Cheap false witnesses first.
+    found = None
+    if finite_countermodel_search_allowed(semantic_context):
+        found = small_false_search(h_eq, g_eq, budget=min(4.0, max(1.0, budget * 0.08)))
+    if found and try_false_attributed("native:false:small_false_search", *found, source="native_false_search"):
+        return "accepted_false"
+
+    # Goal-directed propagation catches sparse countermodels by searching
+    # around a concrete Skolem point where the goal must fail.
+    found, false_state = false_model_search_detailed(
+        h_eq,
+        g_eq,
+        {"routes": ["model_finder_v2:n=4", "model_finder_v2:n=5"], "budget": min(8.0, max(2.0, budget * 0.08))},
+        6,
+        semantic_context=semantic_context,
+    )
+    if found and try_false_artifact_attributed("native:false:model_finder_v2_early", found, source="native_false_search"):
+        return "accepted_false_v2"
+    if not found and isinstance(false_state, dict):
+        false_failure_feedback.append(false_state)
+
+    # One-sided variables in H are a strong, cheap signal for collapse,
+    # projection, or row-constancy.  Give those helpers a short native scout
+    # before speculative graph bodies or LLM routing.  A miss still falls
+    # through to the larger late portfolio.
+    if standard_aux_plausible_h(h_eq):
+        aux_body, aux_state = standard_aux_superposition_attempt(
+            h_eq,
+            g_eq,
+            {
+                "lemmas": ["const", "proj_l", "proj_r", "rowconst"],
+                "budget": min(4.0, max(1.0, budget * 0.02)),
+            },
+        )
+        if aux_body:
+            result = judge_true_attributed(
+                "native:true:standard_aux_superposition_early",
+                aux_body,
+                source="native_early_true_tool",
+                detail={
+                    "family": "standard_aux_superposition",
+                    "used_aux": aux_state.get("used_aux") if isinstance(aux_state, dict) else None,
+                },
+            )
+            if result.get("status") == "accepted":
+                return "accepted_true_standard_aux_superposition"
+
+    initial_feedback = [{
+        "kind": "initial_direct_graph_state",
+        "status": "direct_mechanical_routes_available_for_feedback",
+        "search_state": graph_search_state(h_eq, g_eq, status="direct_goal_not_connected"),
+        "need_hint": "Use frontier/closest_pairs to propose a bridge midpoint, or choose the top ranked trusted tool.",
+    }]
+
+    if should_try_collaboration_first(h_eq, g_eq):
+        status = try_llm_collaboration(
+            h_eq,
+            g_eq,
+            budget,
+            max_rounds=2,
+            collaboration_goal=(
+                "Collaboration-first pass: choose the top ranked trusted tool "
+                "or propose an equivalent lemma_chain/midpoint. The mechanical "
+                "side will verify everything and fall back if this fails."
+            ),
+            initial_feedback=initial_feedback,
+            semantic_context=semantic_context,
+        )
+        if status:
+            return status
+
+    # Focused trusted true tools.
+    for route, body in proof_candidates_with_sources(h_eq, g_eq):
+        if try_true_attributed(f"native:true:{route}", body, source="native_true_tool"):
+            return "accepted_true"
+
+    # Stronger bounded false search. Give the goal-directed v2 finder a
+    # dedicated slice before mixing it with stochastic routes; it can need a
+    # few seconds to reach the Skolem branch that violates the goal.
+    found, false_state = false_model_search_detailed(
+        h_eq,
+        g_eq,
+        {"routes": ["model_finder_v2:n=6"], "budget": min(12.0, max(6.0, budget * 0.04))},
+        8,
+        semantic_context=semantic_context,
+    )
+    if found and try_false_artifact_attributed("native:false:model_finder_v2_late", found, source="native_false_search"):
+        return "accepted_false_v2"
+    if not found and isinstance(false_state, dict):
+        false_failure_feedback.append(false_state)
+
+    # False-side collaboration checkpoint. This gives System 2 one chance to
+    # choose the next route from concrete false-search telemetry before the
+    # native portfolio tries that route silently. It is intentionally gated on
+    # strategy cards so true-side problems do not pay for a blind false prompt.
+    if false_strategy_cards(false_failure_feedback):
+        remaining = max(0.0, budget - (time.monotonic() - solve_started))
+        status = try_llm_collaboration(
+            h_eq,
+            g_eq,
+            remaining,
+            max_rounds=1,
+            collaboration_goal=(
+                "False-route collaboration pass after focused true tools and "
+                "goal-directed false search failed. Follow the concrete "
+                "false_model_search continuation from the telemetry unless you "
+                "can provide a verified table or a genuinely better route."
+            ),
+            initial_feedback=[{
+                "kind": "false_route_collaboration_state",
+                "status": "native_v2_false_search_failed",
+                "native_false_failed_attempts": false_failure_feedback[-3:],
+                "need_hint": "Select one untried false_model_search continuation from the telemetry; do not repeat tried routes.",
+            }],
+            prefer_false=True,
+            semantic_context=semantic_context,
+        )
+        if status:
+            return status
+
+    # Fall back to the cheap stochastic witness route and structured
+    # polynomial search. These use the same certificate renderer, so any found
+    # table is still judge-verified before returning.
+    found, false_state = false_model_search_detailed(
+        h_eq,
+        g_eq,
+        {"routes": ["local_search:n=6:seed=2", "cp_sat:n=6", "poly_ce:tier=2:nmax=13", "structured_ce:max_n=7"], "budget": min(18.0, max(8.0, budget * 0.04))},
+        8,
+        semantic_context=semantic_context,
+    )
+    if found and try_false_artifact_attributed("native:false:portfolio_late", found, source="native_false_search"):
+        return "accepted_false"
+    if not found and isinstance(false_state, dict):
+        false_failure_feedback.append(false_state)
+
+    # Late source-independent true portfolio.  These are the minimal native
+    # counterparts of every mechanism class that used to be supplied by the
+    # compatibility solver: grounding/collapse, auxiliary superposition,
+    # saturation, and broad goal superposition.
+    remaining = max(0.0, budget - (time.monotonic() - solve_started))
+    deep_budget = min(120.0, max(12.0, remaining * 0.15))
+    deep_failure_feedback: list[dict[str, Any]] = []
+    for route, body, state in native_deep_true_candidates(h_eq, g_eq, deep_budget):
+        result = judge_true_attributed(
+            f"native:true:{route}",
+            body,
+            source="native_deep_true_tool",
+            detail={"family": state.get("family") if isinstance(state, dict) else None},
+        )
+        if result.get("status") == "accepted":
+            return f"accepted_true_{route.split(':', 1)[0]}"
+        deep_failure_feedback.append(protocol_state(
+            "MechanicalResponse",
+            "judge_rejected_true_body",
+            route,
+            tool_state=state,
+            judge_status=result.get("status"),
+            need_hint="This native certificate was rejected; use its family as evidence and propose a different midpoint or route.",
+        ))
+    deep_failure_feedback = deep_failure_feedback[-6:]
+
+    # Give System 2 a load-bearing late chance. This is where LLM-proposed
+    # midpoints/search routes can complement the bounded native portfolio while
+    # remaining checked by the same mechanical consumers and Lean judge.
+    remaining = max(0.0, budget - (time.monotonic() - solve_started))
+    late_llm_feedback: list[dict[str, Any]] = []
+    status = try_llm_collaboration(
+        h_eq,
+        g_eq,
+        remaining,
+        max_rounds=2,
+        collaboration_goal=(
+            "Late collaboration pass after native deterministic tools failed. "
+            "Prefer a real bridge midpoint/lemma_chain or a concrete false_model_hint. "
+            "A useful midpoint will be proved as H=>M and then consumed as H+M=>G."
+        ),
+        initial_feedback=[{
+            "kind": "late_system2_state",
+            "status": "native_deep_tools_failed",
+            "search_state": graph_search_state(h_eq, g_eq, status="native_deep_goal_not_connected"),
+            "native_false_failed_attempts": false_failure_feedback[-3:],
+            "native_deep_failed_attempts": deep_failure_feedback,
+            "need_hint": "Propose a small midpoint with seed_h_args, or a concrete false_model_hint route not already covered by default search.",
+        }],
+        prefer_false="balanced",
+        feedback_sink=late_llm_feedback,
+        semantic_context=semantic_context,
+    )
+    if status:
+        return status
+
+    # LLM fallback: tool selection, helper chains, direct proof, or table.
+    status = try_llm_collaboration(
+        h_eq,
+        g_eq,
+        budget,
+        max_rounds=3,
+        collaboration_goal=(
+            "Fallback collaboration pass after deterministic routes failed. "
+            "Use mechanical feedback to avoid repeats and propose a bridge "
+            "midpoint, lemma_chain, seed_terms, or a concrete false-model route."
+        ),
+        initial_feedback=[{
+            "kind": "initial_direct_graph_state",
+            "status": "direct_mechanical_routes_exhausted",
+            "search_state": graph_search_state(h_eq, g_eq, status="direct_goal_not_connected"),
+            "need_hint": "Use the frontier/closest_pairs to propose a bridge midpoint, or choose a different bounded tool route.",
+        }, *false_failure_feedback[-3:], *deep_failure_feedback[-4:], *late_llm_feedback[-6:]],
+        prefer_false=True,
+        semantic_context=semantic_context,
+    )
+    return status or "unsolved"
+
+
+def main() -> None:
+    startup = read_msg()
+    problem = startup.get("problem", startup)
+    budget = float(startup.get("budget", {}).get("timeout_seconds", 3600))
+    status = solve(problem, budget)
+    print(f"[baby_solver] {problem.get('id')}: {status}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

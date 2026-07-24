@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "source_run_date": "2026-07-16",
+  "curation_note": "Sanitized derivative of archived runner attribution outputs. Raw provider payloads, local paths, and private workbench labels are intentionally omitted.",
+  "headline": {
+    "rows": 14,
+    "solved": 13,
+    "true_llm_load_bearing_accepts": 8,
+    "false_llm_load_bearing_accepts": 3,
+    "native_non_llm_accepts": 2,
+    "unsolved": 1
+  },
+  "true_llm_examples": [
+    {"id": "hard3_0202", "winning_route": "llm:hint_payload", "llm_calls": 1},
+    {"id": "hard3_0014", "winning_route": "llm:tool:standard_aux_superposition", "llm_calls": 1},
+    {"id": "hard3_0024", "winning_route": "llm:tool:standard_aux_superposition", "llm_calls": 1},
+    {"id": "hard2_0126", "winning_route": "llm:tool:standard_aux_superposition", "llm_calls": 1},
+    {"id": "hard2_0198", "winning_route": "llm:tool:standard_aux_superposition", "llm_calls": 1},
+    {"id": "hard3_0131", "winning_route": "llm:tool:standard_aux_superposition", "llm_calls": 1},
+    {"id": "hard2_0107", "winning_route": "llm:tool:right_square_chain", "llm_calls": 1},
+    {"id": "hard3_0231", "winning_route": "llm:hint_payload", "llm_calls": 1}
+  ],
+  "false_llm_examples": [
+    {"id": "hard1_0009", "winning_route": "llm:false_model_search:table", "llm_calls": 3},
+    {"id": "hard2_0016", "winning_route": "llm:false_model_search:table", "llm_calls": 1},
+    {"id": "hard2_0093", "winning_route": "llm:false_model_search:table", "llm_calls": 3}
+  ],
+  "native_non_llm_controls": [
+    {"id": "hard3_0027", "winning_route": "native:true:proof_battery"},
+    {"id": "hard2_0125", "winning_route": "native:false:portfolio_late:table"}
+  ],
+  "frontier_miss_examples": [
+    {
+      "id": "hard2_0027",
+      "status": "unsolved_in_selected_audit",
+      "note": "Retained as a hard false-side frontier rather than counted as evidence for LLM success."
+    }
+  ],
+  "interpretation": [
+    "The selected true-side examples show runner-attributed LLM tool or hint solves that are verified by Lean.",
+    "The selected false-side examples show finite-countermodel routes selected by the LLM after mechanical feedback and then verified by Lean.",
+    "The main protocol fix tested here was to preserve fresh, untried LLM route choices instead of overriding them with a stale mechanical recommendation.",
+    "This is a curated evidence slice, not a broad benchmark or final competition coverage estimate."
+  ]
+}

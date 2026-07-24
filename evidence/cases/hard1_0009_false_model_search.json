@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "problem_id": "hard1_0009",
+  "verdict": "false",
+  "model": "gpt-oss-120b via an OpenAI-compatible chat API",
+  "equation1": "x = (((x ◇ x) ◇ (y ◇ z)) ◇ y)",
+  "equation2": "x = (((x ◇ (y ◇ x)) ◇ x) ◇ y)",
+  "mechanical_feedback_before_winning_action": [
+    {
+      "kind": "SearchState",
+      "status": "direct_goal_not_connected",
+      "target": "x = (((x ◇ (y ◇ x)) ◇ x) ◇ y)",
+      "left_component_size": 11,
+      "right_component_size": 31,
+      "facts_generated": 920
+    },
+    {
+      "kind": "judge_result",
+      "attempted_verdict": "true",
+      "status": "incorrect",
+      "message_excerpt": "`grind` failed"
+    },
+    {
+      "kind": "false_route_collaboration_state",
+      "status": "native_v2_false_search_failed",
+      "need_hint": "Select one untried false_model_search continuation from the telemetry; do not repeat tried routes."
+    }
+  ],
+  "llm_action": {
+    "kind": "tool_call",
+    "tool": "false_model_search",
+    "target": "goal",
+    "template": "local_search",
+    "routes": ["local_search:n=6:seed=2"],
+    "budget": 6
+  },
+  "mechanical_consumption": {
+    "countermodel_size": 6,
+    "countermodel_table": [
+      [2, 2, 2, 2, 2, 2],
+      [3, 5, 1, 5, 5, 5],
+      [4, 4, 4, 4, 4, 4],
+      [1, 1, 5, 1, 3, 1],
+      [0, 0, 0, 0, 0, 0],
+      [5, 3, 3, 3, 1, 3]
+    ],
+    "lean_certificate": "evidence/lean/hard1_0009_countermodel.lean"
+  },
+  "judge": {
+    "status": "accepted",
+    "accepted": true,
+    "message": "certificate accepted",
+    "seconds": 3.45
+  },
+  "attribution": {
+    "winning_category": "llm_load_bearing",
+    "winning_route": "llm:false_model_search:table",
+    "llm_calls": 3,
+    "judge_calls": 2,
+    "accepted_judge_index": 2
+  }
+}

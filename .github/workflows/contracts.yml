@@ -1,0 +1,26 @@
+name: Contracts
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch official Stage 2 harness
+        run: git clone --depth 1 https://github.com/SAIRcompetition/equational-theories-lean-stage2.git official-stage2
+      - name: Install required dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m py_compile baby_solver.py curriculum_blackboard.py scripts/*.py research_system/*.py
+      - name: Run fast research-system contracts
+        run: python scripts/research_system_contracts.py
+      - name: Audit native import boundaries
+        run: python scripts/native_import_audit.py
+      - name: Build competition submission artifact
+        run: python scripts/compile_submission.py
