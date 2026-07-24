@@ -17,6 +17,7 @@ import json
 import random
 import re
 import select
+import signal
 import sys
 import time
 import difflib
@@ -74,6 +75,8 @@ There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"tool_call","tool":"square_sandwich_chain","target":"goal","why":"H has x = ((y ◇ x) ◇ y) ◇ (z ◇ z)"}
 {"kind":"tool_call","tool":"rowconst_certificates","target":"goal","why":"try row-constant certificates"}
 {"kind":"tool_call","tool":"grounding_derived","target":"goal","why":"try the square-rowconst grounding-derived closer"}
+{"kind":"tool_call","tool":"broad_grounding_derived","target":"goal","budget":12,"why":"derive collapse or factor-irrelevance helper"}
+{"kind":"tool_call","tool":"collapse_certificates","target":"goal","why":"try carrier-collapse certificates"}
 {"kind":"tool_call","tool":"proof_battery","target":"goal","why":"try graph-first old battery h-instances"}
 {"kind":"tool_call","tool":"forward_saturation","target":"goal","seed_terms":["x ◇ y","(x ◇ y) ◇ x"],"budget":3,"why":"try graph proof with extra seed terms"}
 {"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8,"why":"try broad proof-carrying superposition when graph search is stuck"}
@@ -89,6 +92,7 @@ There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"structured_ce","routes":["structured_ce:max_n=7"],"budget":8}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}
 {"kind":"goal_proof","proof":"intro x y\\nhave h1 := h x x x\\ngrind"}
 {"kind":"false_table","counterexample_table":[[0,1],[1,0]]}
 
@@ -572,6 +576,24 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": ["grounding_certificates", "derived_grounding", "cert_ground_derived"],
         "description": "Try the square-rowconst grounding-derived explicit closer.",
     },
+    "broad_grounding_derived": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "structured",
+        "native_import": "native_certificate",
+        "aliases": ["grounding_cert", "broad_grounding_certificates", "cert_grounding_broad"],
+        "description": "Try broad proof-carrying grounding certificates by deriving collapse or factor-irrelevance helpers.",
+    },
+    "collapse_certificates": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "structured",
+        "native_import": "native_certificate",
+        "aliases": ["collapse_cert", "carrier_collapse", "trivial_magma_cert"],
+        "description": "Try proof-carrying collapse certificates: derive a variable-freeing equation and close the goal by carrier collapse.",
+    },
     "proof_battery": {
         "domain": "true",
         "scope": "whole_goal",
@@ -641,7 +663,7 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "cost": "expensive",
         "feedback_quality": "rich",
         "native_import": "native_false_routes",
-        "aliases": ["countermodel_search", "finite_model_search", "local_search", "model_finder", "model_finder_v2", "poly_ce", "cp_sat", "structured_ce"],
+        "aliases": ["countermodel_search", "finite_model_search", "local_search", "model_finder", "model_finder_v2", "poly_ce", "cp_sat", "sympy_sat", "structured_ce"],
         "description": "Search for finite countermodels. Supports deterministic structured families, local search, propagation model finding, goal-directed search, optional CP-SAT, and polynomial routes.",
     },
     "infinite_model_artifact": {
@@ -1466,6 +1488,14 @@ def canonical_skolem_assignments(k: int, n: int) -> list[tuple[int, ...]]:
     return out
 
 
+def noncollapsed_skolem_order(skolems: list[tuple[int, ...]]) -> list[tuple[int, ...]]:
+    """Try witness patterns with more separated goal variables first."""
+    return [
+        skolem
+        for _, skolem in sorted(enumerate(skolems), key=lambda item: (-len(set(item[1])), item[0]))
+    ]
+
+
 def goal_directed_model_finder(
     h_eq: dict[str, Any],
     g_eq: dict[str, Any],
@@ -1766,6 +1796,237 @@ def cp_sat_counterexample_search(
     }
 
 
+_SYMPY_SAT_AVAILABLE: bool | None = None
+
+
+def sympy_sat_available() -> bool:
+    global _SYMPY_SAT_AVAILABLE
+    if _SYMPY_SAT_AVAILABLE is not None:
+        return _SYMPY_SAT_AVAILABLE
+    try:
+        from sympy.logic.inference import satisfiable  # noqa: F401
+
+        _SYMPY_SAT_AVAILABLE = True
+    except Exception:
+        _SYMPY_SAT_AVAILABLE = False
+    return _SYMPY_SAT_AVAILABLE
+
+
+class SympySatTimeout(Exception):
+    pass
+
+
+def sympy_sat_counterexample_search(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    n: int,
+    time_budget: float = 120.0,
+) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+    """Exact finite-model route using sympy's pure-Python SAT engine.
+
+    This is a competition-sandbox-friendly sibling of the optional OR-Tools
+    route. It encodes one fixed carrier size and one canonical Skolem
+    assignment at a time, requiring H everywhere and G to fail at that point.
+    """
+    if n < 5:
+        return "skipped_small_size", None, {
+            "n": n,
+            "reason": "sympy_sat deliberately skips n < 5; tiny UNSAT searches are slow and not the target niche",
+        }
+    if not sympy_sat_available():
+        return "unavailable", None, {
+            "n": n,
+            "reason": "sympy.logic.inference.satisfiable is not available",
+        }
+
+    from sympy import Symbol
+    from sympy.logic.algorithms.dpll2 import EncodedCNF
+    from sympy.logic.inference import satisfiable
+
+    gvars = g_eq["variables"]
+    skolems = noncollapsed_skolem_order(canonical_skolem_assignments(len(gvars), n)) if gvars else [()]
+    envs_h = [dict(zip(h_eq["variables"], vals)) for vals in product(range(n), repeat=len(h_eq["variables"]))]
+    true_lit: int | None = None
+    false_lit = 0
+    symbols: list[Any] = []
+    clauses: list[set[int]] = []
+    cell_vars: dict[tuple[int, int, int], int] = {}
+
+    def new_var(name: str) -> int:
+        symbols.append(Symbol(name))
+        return len(symbols)
+
+    for i in range(n):
+        for j in range(n):
+            vars_ij = [new_var(f"s_{n}_{i}_{j}_{k}") for k in range(n)]
+            for k, var in enumerate(vars_ij):
+                cell_vars[(i, j, k)] = var
+            clauses.append(set(vars_ij))
+            for a in range(n):
+                for b in range(a + 1, n):
+                    clauses.append({-vars_ij[a], -vars_ij[b]})
+
+    def add_clause(lits: list[int | None]) -> None:
+        if any(lit is true_lit for lit in lits):
+            return
+        reduced = {int(lit) for lit in lits if lit != false_lit}
+        clauses.append(reduced if reduced else {false_lit})
+
+    def add_unit(lit: int | None) -> None:
+        add_clause([lit])
+
+    def neg(lit: int | None) -> int | None:
+        if lit is true_lit:
+            return false_lit
+        if lit == false_lit:
+            return true_lit
+        return -int(lit)
+
+    def and_gate(inputs: list[int | None]) -> int | None:
+        if any(lit == false_lit for lit in inputs):
+            return false_lit
+        active = [int(lit) for lit in inputs if lit is not true_lit]
+        if not active:
+            return true_lit
+        if len(active) == 1:
+            return active[0]
+        out = new_var(f"a_{len(symbols) + 1}")
+        for lit in active:
+            add_clause([neg(out), lit])
+        add_clause([out, *[neg(lit) for lit in active]])
+        return out
+
+    def or_gate(inputs: list[int | None]) -> int | None:
+        if any(lit is true_lit for lit in inputs):
+            return true_lit
+        active = [int(lit) for lit in inputs if lit != false_lit]
+        if not active:
+            return false_lit
+        if len(active) == 1:
+            return active[0]
+        out = new_var(f"o_{len(symbols) + 1}")
+        for lit in active:
+            add_clause([neg(lit), out])
+        add_clause([neg(out), *active])
+        return out
+
+    def value_const(value: int) -> list[int | None]:
+        return [true_lit if k == value else false_lit for k in range(n)]
+
+    def eval_lits(term: Term, env: dict[str, int], memo: dict[Term, list[int | None]]) -> list[int | None]:
+        if term in memo:
+            return memo[term]
+        if term[0] == "var":
+            out = value_const(env[term[1]])
+        else:
+            left = eval_lits(term[1], env, memo)
+            right = eval_lits(term[2], env, memo)
+            out = []
+            for k in range(n):
+                disjuncts: list[int | None] = []
+                for a in range(n):
+                    for b in range(n):
+                        disjuncts.append(and_gate([left[a], right[b], cell_vars[(a, b, k)]]))
+                out.append(or_gate(disjuncts))
+        memo[term] = out
+        return out
+
+    def require_equal(lhs: list[int | None], rhs: list[int | None]) -> None:
+        for k in range(n):
+            add_clause([neg(lhs[k]), rhs[k]])
+            add_clause([lhs[k], neg(rhs[k])])
+
+    def require_not_equal(lhs: list[int | None], rhs: list[int | None]) -> None:
+        witnesses: list[int | None] = []
+        for k in range(n):
+            witnesses.append(and_gate([lhs[k], neg(rhs[k])]))
+            witnesses.append(and_gate([rhs[k], neg(lhs[k])]))
+        add_unit(or_gate(witnesses))
+
+    for env in envs_h:
+        memo_h: dict[Term, list[int | None]] = {}
+        require_equal(eval_lits(h_eq["lhs"], env, memo_h), eval_lits(h_eq["rhs"], env, memo_h))
+
+    base_clause_count = len(clauses)
+    base_symbol_count = len(symbols)
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    old_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def on_alarm(_signum: int, _frame: Any) -> None:
+        raise SympySatTimeout()
+
+    trials: list[dict[str, Any]] = []
+    deadline = time.monotonic() + max(0.5, time_budget)
+    try:
+        signal.signal(signal.SIGALRM, on_alarm)
+        for idx, skolem in enumerate(skolems):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.25:
+                return "timeout", None, {
+                    "n": n,
+                    "time_budget": time_budget,
+                    "skolem_count": len(skolems),
+                    "trials": trials,
+                }
+            if idx == 0 and len(skolems) > 1:
+                sub_budget = min(remaining, max(0.2, remaining * 0.8))
+            else:
+                sub_budget = max(0.2, remaining / max(1, len(skolems) - idx))
+            signal.setitimer(signal.ITIMER_REAL, sub_budget)
+            goal_env = dict(zip(gvars, skolem))
+            symbols = symbols[:base_symbol_count]
+            clauses = [set(clause) for clause in clauses[:base_clause_count]]
+            goal_memo: dict[Term, list[int | None]] = {}
+            require_not_equal(eval_lits(g_eq["lhs"], goal_env, goal_memo), eval_lits(g_eq["rhs"], goal_env, goal_memo))
+            enc = EncodedCNF([set(clause) for clause in clauses], {sym: i + 1 for i, sym in enumerate(symbols)})
+            try:
+                model = satisfiable(enc, algorithm="dpll2", all_models=False)
+            except SympySatTimeout:
+                trials.append({"skolem": dict(goal_env), "status": "timeout", "sub_budget": round(sub_budget, 3)})
+                continue
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+            if model is False:
+                trials.append({"skolem": dict(goal_env), "status": "unsat", "sub_budget": round(sub_budget, 3)})
+                continue
+            table: list[list[int]] = []
+            for i in range(n):
+                row: list[int] = []
+                for j in range(n):
+                    chosen = [
+                        k
+                        for k in range(n)
+                        if bool(model.get(symbols[cell_vars[(i, j, k)] - 1], False))
+                    ]
+                    row.append(int(chosen[0]) if chosen else 0)
+                table.append(row)
+            ok = is_counterexample(h_eq, g_eq, table)
+            trials.append({
+                "skolem": dict(goal_env),
+                "status": "sat" if ok else "sat_but_local_check_failed",
+                "sub_budget": round(sub_budget, 3),
+            })
+            if ok:
+                return "found", table, {
+                    "n": n,
+                    "time_budget": time_budget,
+                    "skolem_count": len(skolems),
+                    "trials": trials,
+                    "backend": "sympy.logic.inference.satisfiable",
+                }
+        return "unsat_or_timeout", None, {
+            "n": n,
+            "time_budget": time_budget,
+            "skolem_count": len(skolems),
+            "trials": trials,
+            "backend": "sympy.logic.inference.satisfiable",
+        }
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 PCE_AFFINE = [(0, 0), (1, 0), (0, 1)]
 PCE_BILINEAR = [(0, 0), (1, 0), (0, 1), (1, 1)]
 PCE_QUADRATIC = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
@@ -1908,13 +2169,16 @@ def false_route_continuations(trials: list[dict[str, Any]]) -> list[str]:
         for n in unique(cp_next + base_ns):
             if 2 <= n <= 9:
                 add(f"cp_sat:n={n}")
+    if sympy_sat_available():
+        for n in (6, 7, 8):
+            add(f"sympy_sat:n={n}")
     # Prefer concrete local-search continuations at known promising sizes before
     # jumping to broader complete searches at larger carriers.
     for n in candidate_ns:
         if 2 <= n <= 8:
             for seed in (0, 1, 2, 3, 4):
                 add(f"local_search:n={n}:seed={seed}")
-    for n in unique(model_ns + [4, 5, 6, 7]):
+    for n in unique(model_ns + [4, 5, 6, 7, 8]):
         if 2 <= n <= 8:
             add(f"model_finder_v2:n={n}")
     for n in unique(model_ns + [4, 5, 6]):
@@ -1929,18 +2193,31 @@ def false_route_budget(routes: list[Any], requested_budget: float) -> float:
     """Normalize displayed route budgets to the executor's minimums."""
     budget = float(requested_budget or 0)
     cp_ns: list[int] = []
+    sympy_ns: list[int] = []
+    v2_ns: list[int] = []
     for route in routes:
         route_l = str(route).lower()
-        if "cp_sat" not in route_l and "cpsat" not in route_l and "constraint_sat" not in route_l:
-            continue
         m_model = re.search(r"n=?(\d+)", route_l)
-        if m_model:
+        if not m_model:
+            continue
+        if "cp_sat" in route_l or "cpsat" in route_l or "constraint_sat" in route_l:
             cp_ns.append(int(m_model.group(1)))
+        elif "sympy_sat" in route_l or "sympy" in route_l:
+            sympy_ns.append(int(m_model.group(1)))
+        elif "model_finder_v2" in route_l or "goal_directed" in route_l:
+            v2_ns.append(int(m_model.group(1)))
     if cp_ns:
         if max(cp_ns) >= 8:
             budget = max(budget, 24.0)
         elif max(cp_ns) >= 7:
             budget = max(budget, 16.0)
+    if v2_ns:
+        if max(v2_ns) >= 7:
+            budget = max(budget, 45.0)
+        elif max(v2_ns) >= 6:
+            budget = max(budget, 24.0)
+    if sympy_ns:
+        budget = max(budget, 120.0)
     return max(3.0, budget)
 
 
@@ -1967,6 +2244,7 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
     best_progress_score = -1.0
     propagation_routes: list[dict[str, Any]] = []
     cp_sat_routes: list[dict[str, Any]] = []
+    sympy_sat_routes: list[dict[str, Any]] = []
 
     for trial in trials:
         if not isinstance(trial, dict):
@@ -2010,6 +2288,15 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
                 "unknown_skolems": trial.get("cp_sat_unknown_skolems"),
                 "trials": trial.get("trials"),
             })
+        if template == "sympy_sat":
+            sympy_sat_routes.append({
+                "route": route,
+                "status": trial.get("status"),
+                "n": trial.get("n"),
+                "skolem_count": trial.get("skolem_count"),
+                "backend": trial.get("backend"),
+                "trials": trial.get("trials"),
+            })
 
         for item in trial.get("top_blocked_cells") or []:
             cell = item.get("cell") if isinstance(item, dict) else None
@@ -2040,6 +2327,8 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
         policy.append("A propagation route reached a nearly complete partial table; a complete counterexample table or one nearby local_search continuation is especially useful.")
     if any((row.get("unknown_skolems") or 0) for row in cp_sat_routes):
         policy.append("An exact cp_sat route reached UNKNOWN rather than infeasible; retry the same carrier with more budget, then move carrier size if it remains unknown.")
+    if any(row.get("status") in {"timeout", "unsat_or_timeout"} for row in sympy_sat_routes):
+        policy.append("A sympy_sat exact route timed out; retry only one carrier size with a larger budget, or switch to model_finder_v2/local_search using the same carrier.")
     if not policy:
         policy.append("Return one untried false_model_search route or switch to a true-side midpoint/lemma_chain.")
 
@@ -2049,6 +2338,7 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
         "template_counts": dict(template_counts),
         "propagation_route_summaries": propagation_routes[-4:],
         "cp_sat_route_summaries": cp_sat_routes[-3:],
+        "sympy_sat_route_summaries": sympy_sat_routes[-3:],
         "hot_blocked_cells": top_counter(blocked, limit=5),
         "hot_branch_cells": top_counter(branched, limit=5),
         "best_partial_progress": best_progress,
@@ -2151,6 +2441,8 @@ def false_model_search_detailed(
             routes = ["poly_ce:tier=2:nmax=13"]
         elif template in {"cp_sat", "cpsat", "constraint_sat"}:
             routes = [f"cp_sat:n={int(n)}" for n in sizes]
+        elif template in {"sympy_sat", "sympy", "cnf_sat", "dpll"}:
+            routes = [f"sympy_sat:n={int(n)}" for n in sizes]
         elif template in {"structured_ce", "ce_engine", "witness_families"}:
             routes = ["structured_ce:max_n=7"]
         elif template in {"model_finder", "propagation", "constraint_propagation"}:
@@ -2161,13 +2453,16 @@ def false_model_search_detailed(
     active_routes = list(routes[:route_limit])
     skipped_routes = [str(route) for route in routes[route_limit:]]
     cp_sat_ns = []
+    sympy_sat_ns = []
     for route in active_routes:
         route_l = str(route).lower()
-        if "cp_sat" not in route_l and "cpsat" not in route_l and "constraint_sat" not in route_l:
-            continue
         m_model = re.search(r"n=?(\d+)", route_l)
-        if m_model:
+        if not m_model:
+            continue
+        if "cp_sat" in route_l or "cpsat" in route_l or "constraint_sat" in route_l:
             cp_sat_ns.append(int(m_model.group(1)))
+        elif "sympy_sat" in route_l or "sympy" in route_l:
+            sympy_sat_ns.append(int(m_model.group(1)))
     if cp_sat_ns:
         # CP-SAT UNKNOWN states are budget-sensitive. Treat too-small LLM
         # budgets as a syntax/contract weakness, not as mathematical evidence.
@@ -2175,6 +2470,8 @@ def false_model_search_detailed(
             budget = max(budget, 24.0)
         elif max(cp_sat_ns) >= 7:
             budget = max(budget, 16.0)
+    if sympy_sat_ns:
+        budget = max(budget, 120.0)
     per = max(0.5, budget / max(1, len(active_routes)))
     trials: list[dict[str, Any]] = []
     for route in active_routes:
@@ -2236,6 +2533,26 @@ def false_model_search_detailed(
                     "counterexample_size": n,
                     "source": route_s,
                     "witness_style": "cp_sat_table",
+                }, "false_model_search")
+            continue
+        if "sympy_sat" in route_l or "sympy" in route_l:
+            m_model = re.search(r"n=?(\d+)", route_l)
+            if not m_model:
+                continue
+            n = int(m_model.group(1))
+            if n < 5 or n > 8:
+                trials.append({"route": route_s, "status": "skipped_size", "template": "sympy_sat", "n": n})
+                continue
+            status, table, meta = sympy_sat_counterexample_search(h_eq, g_eq, n, per)
+            trials.append({"route": route_s, "status": status, "template": "sympy_sat", **meta})
+            if table is not None and is_counterexample(h_eq, g_eq, table):
+                return (n, table), protocolize_state({
+                    "kind": "FalseModelSearchState",
+                    "status": "found",
+                    "trials": trials,
+                    "counterexample_size": n,
+                    "source": route_s,
+                    "witness_style": "sympy_sat_table",
                 }, "false_model_search")
             continue
         if "model_finder_v2" in route_l or "goal_directed" in route_l:
@@ -3082,6 +3399,33 @@ def false_strategy_cards(mechanical_feedback: list[dict[str, Any]] | None) -> li
                         "trigger": f"{route or 'cp_sat'} reached UNKNOWN on {row.get('unknown_skolems')} Skolem branches.",
                         "recommended_action": action,
                     })
+        for row in highlights.get("sympy_sat_route_summaries") or []:
+            if not isinstance(row, dict) or row.get("status") not in {"timeout", "unsat_or_timeout"}:
+                continue
+            route = str(row.get("route") or "")
+            m = re.search(r"n=?(\d+)", route)
+            n = int(m.group(1)) if m else int(row.get("n") or 0)
+            if n <= 0:
+                continue
+            action = {
+                "kind": "tool_call",
+                "tool": "false_model_search",
+                "target": "goal",
+                "routes": [f"sympy_sat:n={n}"],
+                "budget": false_route_budget([f"sympy_sat:n={n}"], 120.0),
+                "why": "sympy exact SAT timed out; retry only this carrier with the full exact-search budget",
+            }
+            if routes_already_tried(action):
+                continue
+            sig = compact_tool_signature(action)
+            if sig not in seen_actions:
+                seen_actions.add(sig)
+                add_card({
+                    "name": "sympy_sat_timeout_continuation",
+                    "principle": "A timed-out exact SAT route is inconclusive; retry a single carrier with a real budget before changing hypothesis.",
+                    "trigger": f"{route or 'sympy_sat'} timed out or mixed UNSAT/timeouts.",
+                    "recommended_action": action,
+                })
         progress = highlights.get("best_partial_progress")
         if isinstance(progress, dict) and (progress.get("assigned_ratio") or 0) >= 0.8:
             route = str(progress.get("route") or "")
@@ -3114,6 +3458,8 @@ def false_strategy_cards(mechanical_feedback: list[dict[str, Any]] | None) -> li
             return (0, str(card.get("name") or ""))
         if any("cp_sat" in route or "cpsat" in route for route in routes):
             return (1, str(card.get("name") or ""))
+        if any("sympy_sat" in route or "sympy" in route for route in routes):
+            return (1, str(card.get("name") or ""))
         if card.get("name") == "complete_near_partial_table":
             return (2, str(card.get("name") or ""))
         if card.get("name") == "follow_false_recommended_next_call":
@@ -3128,6 +3474,35 @@ def top_false_recommended_action(mechanical_feedback: list[dict[str, Any]] | Non
         action = card.get("recommended_action")
         if isinstance(action, dict) and action.get("tool") == "false_model_search":
             return action
+    return None
+
+
+def promoted_exact_false_action(mechanical_feedback: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Follow a concrete exact-search continuation before asking the LLM.
+
+    This keeps false-side collaboration load-bearing while avoiding a prompt
+    when native telemetry has already identified the next exact route.
+    """
+    states = false_feedback_states(mechanical_feedback, limit=None)
+    if not states:
+        return None
+    highlights = states[-1].get("diagnostic_highlights") or {}
+    progress = highlights.get("best_partial_progress") or {}
+    try:
+        assigned_ratio = float(progress.get("assigned_ratio") or 0.0)
+    except Exception:
+        assigned_ratio = 0.0
+    if assigned_ratio < 0.65:
+        return None
+    action = top_false_recommended_action(mechanical_feedback)
+    if not isinstance(action, dict):
+        return None
+    routes = [str(route).lower() for route in action.get("routes") or []]
+    if any("sympy_sat" in route or "cp_sat" in route or "cpsat" in route for route in routes):
+        promoted = dict(action)
+        promoted["budget"] = false_route_budget(promoted.get("routes") or [], float(promoted.get("budget") or 0))
+        promoted["why"] = "native false telemetry reached a near-complete partial table; follow this exact route before LLM recovery"
+        return promoted
     return None
 
 
@@ -4044,6 +4419,512 @@ def pc_rec_summary(rec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def collapse_witness_vars(t: Term, acc: set[str] | None = None) -> set[str]:
+    acc = acc if acc is not None else set()
+    if t[0] == "var":
+        acc.add(str(t[1]))
+    else:
+        collapse_witness_vars(t[1], acc)
+        collapse_witness_vars(t[2], acc)
+    return acc
+
+
+def is_collapse_witness(l: Term, r: Term) -> bool:
+    """An equation x = T, with x absent from T, collapses every carrier."""
+    if l[0] == "var" and l[1] not in collapse_witness_vars(r):
+        return True
+    if r[0] == "var" and r[1] not in collapse_witness_vars(l):
+        return True
+    return False
+
+
+COLLAPSE_CERT_DEPTH = 4
+COLLAPSE_CERT_MAX_TERM = 24
+COLLAPSE_CERT_MAX_DERIVED = 600
+
+
+def collapse_cert_vars(t: Term, acc: list[str] | None = None) -> list[str]:
+    acc = acc if acc is not None else []
+    if t[0] == "var":
+        if not str(t[1]).startswith("#") and t[1] not in acc:
+            acc.append(t[1])
+    else:
+        collapse_cert_vars(t[1], acc)
+        collapse_cert_vars(t[2], acc)
+    return acc
+
+
+def collapse_cert_size(t: Term) -> int:
+    return 1 if t[0] == "var" else 1 + collapse_cert_size(t[1]) + collapse_cert_size(t[2])
+
+
+def collapse_cert_term(t: Term) -> str:
+    if t[0] == "var":
+        return str(t[1])
+    return f"({collapse_cert_term(t[1])} ◇ {collapse_cert_term(t[2])})"
+
+
+def collapse_cert_rename(
+    eq: tuple[Term, Term],
+    prefix: str,
+    counter: list[int],
+    mapping: dict[str, Term],
+) -> tuple[Term, Term]:
+    def go(t: Term) -> Term:
+        if t[0] == "var":
+            name = str(t[1])
+            if name.startswith("#"):
+                return t
+            if name not in mapping:
+                mapping[name] = ("var", f"{prefix}{counter[0]}")
+                counter[0] += 1
+            return mapping[name]
+        return ("op", go(t[1]), go(t[2]))
+
+    return go(eq[0]), go(eq[1])
+
+
+class CollapseCertRule:
+    __slots__ = ("name", "vars", "l", "r", "proof_lines", "parents")
+
+    def __init__(
+        self,
+        name: str,
+        vars: list[str],
+        l: Term,
+        r: Term,
+        proof_lines: list[str],
+        parents: list[Any] | None = None,
+    ) -> None:
+        self.name = name
+        self.vars = vars
+        self.l = l
+        self.r = r
+        self.proof_lines = proof_lines
+        self.parents = list(parents or [])
+
+
+def collapse_cert_overlap(
+    rule_a: CollapseCertRule,
+    rule_b: CollapseCertRule,
+    fresh: list[int],
+) -> list[tuple[Term, Term, dict[str, Term], dict[str, Term], dict[str, Term]]]:
+    map_a: dict[str, Term] = {}
+    map_b: dict[str, Term] = {}
+    lhs_a, rhs_a = collapse_cert_rename((rule_a.l, rule_a.r), f"p{fresh[0]}_", fresh, map_a)
+    lhs_b, rhs_b = collapse_cert_rename((rule_b.l, rule_b.r), f"q{fresh[0]}_", fresh, map_b)
+    out = []
+    for pos, subterm in pc_positions(lhs_a):
+        if pos == () or subterm[0] == "var":
+            continue
+        subst = pc_unify(subterm, lhs_b, {})
+        if subst is None:
+            continue
+        cp_l = pc_apply(pc_replace_at(lhs_a, pos, rhs_b), subst)
+        cp_r = pc_apply(rhs_a, subst)
+        if cp_l == cp_r:
+            continue
+        out.append((cp_l, cp_r, map_a, map_b, subst))
+    return out
+
+
+def collapse_cert_subst_unbound(t: Term, bound: set[str], witness: str) -> Term:
+    if t[0] == "var":
+        name = str(t[1])
+        if name.startswith("#"):
+            return t
+        return t if name in bound else ("var", witness)
+    return (
+        "op",
+        collapse_cert_subst_unbound(t[1], bound, witness),
+        collapse_cert_subst_unbound(t[2], bound, witness),
+    )
+
+
+def collapse_cert_emit_rule(
+    rule_a: CollapseCertRule,
+    rule_b: CollapseCertRule,
+    map_a: dict[str, Term],
+    map_b: dict[str, Term],
+    subst: dict[str, Term],
+    cp_l: Term,
+    cp_r: Term,
+    name: str,
+) -> CollapseCertRule:
+    vars_out = collapse_cert_vars(cp_l)
+    collapse_cert_vars(cp_r, vars_out)
+    bound = set(vars_out)
+    witness = vars_out[0] if vars_out else "w"
+
+    def argstr(rule: CollapseCertRule, mapping: dict[str, Term]) -> str:
+        parts: list[str] = []
+        for var in rule.vars:
+            if var not in mapping:
+                parts.append(witness)
+                continue
+            arg = pc_apply(mapping[var], subst)
+            arg = collapse_cert_subst_unbound(arg, bound, witness)
+            parts.append(collapse_cert_term(arg))
+        return " ".join(parts)
+
+    proof = [
+        f"have _iA := {rule_a.name} {argstr(rule_a, map_a)}".rstrip(),
+        f"have _iB := {rule_b.name} {argstr(rule_b, map_b)}".rstrip(),
+        "grind",
+    ]
+    parents = [rule for rule in (rule_a, rule_b) if rule.name != "h"]
+    return CollapseCertRule(name, vars_out, cp_l, cp_r, proof, parents=parents)
+
+
+def collapse_cert_mk_rule(
+    rule_a: CollapseCertRule,
+    rule_b: CollapseCertRule,
+    fresh: list[int],
+    name: str,
+) -> CollapseCertRule | None:
+    best: tuple[int, Term, Term, dict[str, Term], dict[str, Term], dict[str, Term]] | None = None
+    for cp_l, cp_r, map_a, map_b, subst in collapse_cert_overlap(rule_a, rule_b, fresh):
+        canon_l, canon_r = pc_canon(cp_l, cp_r)
+        if not is_collapse_witness(canon_l, canon_r):
+            continue
+        total_size = collapse_cert_size(cp_l) + collapse_cert_size(cp_r)
+        if total_size > COLLAPSE_CERT_MAX_TERM:
+            continue
+        if best is None or total_size < best[0]:
+            best = (total_size, cp_l, cp_r, map_a, map_b, subst)
+    if best is None:
+        return None
+    _, cp_l, cp_r, map_a, map_b, subst = best
+    return collapse_cert_emit_rule(rule_a, rule_b, map_a, map_b, subst, cp_l, cp_r, name)
+
+
+def collapse_cert_path(collapse_rule: CollapseCertRule) -> list[CollapseCertRule]:
+    order: list[CollapseCertRule] = []
+    visited: set[int] = set()
+
+    def visit(rule: CollapseCertRule) -> None:
+        if id(rule) in visited:
+            return
+        visited.add(id(rule))
+        for parent in rule.parents:
+            visit(parent)
+        order.append(rule)
+
+    visit(collapse_rule)
+    remap: dict[str, str] = {}
+    idx = 0
+    for rule in order:
+        if rule is collapse_rule:
+            continue
+        remap[rule.name] = f"M{idx}"
+        idx += 1
+    for rule in order:
+        if rule.name in remap:
+            rule.name = remap[rule.name]
+        patched: list[str] = []
+        for line in rule.proof_lines:
+            for old, new in remap.items():
+                line = line.replace(f":= {old} ", f":= {new} ")
+            patched.append(line)
+        rule.proof_lines = patched
+    return order
+
+
+def collapse_cert_derive(h_rule: CollapseCertRule) -> tuple[list[CollapseCertRule], CollapseCertRule] | None:
+    fresh = [0]
+    direct = collapse_cert_mk_rule(h_rule, h_rule, fresh, "magic")
+    if direct is not None:
+        return [direct], direct
+
+    derived = [h_rule]
+    seen = {pc_canon(h_rule.l, h_rule.r)}
+    frontier = [h_rule]
+    lemma_index = 0
+    for _depth in range(COLLAPSE_CERT_DEPTH):
+        new_frontier: list[CollapseCertRule] = []
+        for rule_a in frontier:
+            for rule_b in derived:
+                for cp_l, cp_r, map_a, map_b, subst in collapse_cert_overlap(rule_a, rule_b, fresh):
+                    if collapse_cert_size(cp_l) + collapse_cert_size(cp_r) > COLLAPSE_CERT_MAX_TERM:
+                        continue
+                    canon_l, canon_r = pc_canon(cp_l, cp_r)
+                    if is_collapse_witness(canon_l, canon_r):
+                        collapse = collapse_cert_emit_rule(rule_a, rule_b, map_a, map_b, subst, cp_l, cp_r, "magic")
+                        return collapse_cert_path(collapse), collapse
+                    key = pc_canon(cp_l, cp_r)
+                    if key in seen:
+                        continue
+                    if collapse_cert_size(cp_l) >= collapse_cert_size(cp_r):
+                        new_l, new_r = cp_l, cp_r
+                    else:
+                        new_l, new_r = cp_r, cp_l
+                    if new_l[0] == "var":
+                        continue
+                    seen.add(key)
+                    name = f"L{lemma_index}"
+                    lemma_index += 1
+                    rule = collapse_cert_emit_rule(rule_a, rule_b, map_a, map_b, subst, new_l, new_r, name)
+                    derived.append(rule)
+                    new_frontier.append(rule)
+                    if len(derived) > COLLAPSE_CERT_MAX_DERIVED:
+                        return None
+        frontier = new_frontier
+        if not frontier:
+            break
+    return None
+
+
+def collapse_cert_all_subterms(t: Term):
+    yield t
+    if t[0] == "op":
+        yield from collapse_cert_all_subterms(t[1])
+        yield from collapse_cert_all_subterms(t[2])
+
+
+def collapse_cert_match(pat: Term, term: Term, subst: dict[str, Term]) -> dict[str, Term] | None:
+    if pat[0] == "var" and not str(pat[1]).startswith("#"):
+        name = str(pat[1])
+        if name in subst:
+            return subst if subst[name] == term else None
+        subst = dict(subst)
+        subst[name] = term
+        return subst
+    if pat[0] == "var":
+        return subst if term == pat else None
+    if term[0] != "op":
+        return None
+    subst_left = collapse_cert_match(pat[1], term[1], subst)
+    if subst_left is None:
+        return None
+    return collapse_cert_match(pat[2], term[2], subst_left)
+
+
+def collapse_cert_goal_instance(cp_l: Term, cp_r: Term, all_vars: list[str], goal_l: Term, goal_r: Term) -> str | None:
+    if cp_r[0] != "var":
+        return None
+    for product_side, other_side in ((goal_l, goal_r), (goal_r, goal_l)):
+        for subterm in collapse_cert_all_subterms(product_side):
+            if subterm[0] != "op":
+                continue
+            subst = collapse_cert_match(cp_l, subterm, {})
+            if subst is None:
+                continue
+            subst = dict(subst)
+            subst.setdefault(str(cp_r[1]), other_side)
+            other = collapse_cert_term(other_side)
+            args = [collapse_cert_term(subst[var]) if var in subst else other for var in all_vars]
+            return " ".join(args)
+    return None
+
+
+def collapse_certificate_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    """Prove goals when H derives a carrier-collapse witness."""
+    h_lhs, h_rhs = h_eq["lhs"], h_eq["rhs"]
+    if is_collapse_witness(h_lhs, h_rhs) and len(h_eq["variables"]) >= 2:
+        if h_lhs[0] == "var" and h_lhs[1] not in collapse_witness_vars(h_rhs):
+            collapse_var = str(h_lhs[1])
+        elif h_rhs[0] == "var" and h_rhs[1] not in collapse_witness_vars(h_lhs):
+            collapse_var = str(h_rhs[1])
+        else:
+            collapse_var = h_eq["variables"][0]
+
+        def direct_args(value: str) -> str:
+            return " ".join(value if var == collapse_var else "u" for var in h_eq["variables"])
+
+        goal_vars = list(g_eq["variables"])
+        lines = []
+        if goal_vars:
+            lines.append("intro " + " ".join(goal_vars))
+        lines.extend([
+            "have triv : ∀ u v : G, u = v := by",
+            "  intro u v",
+            f"  have hu := h {direct_args('u')}",
+            f"  have hv := h {direct_args('v')}",
+            "  grind",
+            f"exact triv ({collapse_cert_term(g_eq['lhs'])}) ({collapse_cert_term(g_eq['rhs'])})",
+        ])
+        return "\n".join(lines)
+    if h_lhs[0] != "var" and h_rhs[0] != "var":
+        return None
+    if h_lhs[0] == "var":
+        big, lone = h_rhs, h_lhs
+    elif h_rhs[0] == "var":
+        big, lone = h_lhs, h_rhs
+    else:
+        return None
+
+    h_rule = CollapseCertRule("h", list(h_eq["variables"]), big, lone, [])
+    derived = collapse_cert_derive(h_rule)
+    if derived is None:
+        return None
+    lemmas, collapse = derived
+
+    goal_vars = list(g_eq["variables"])
+    goal_l, goal_r = g_eq["lhs"], g_eq["rhs"]
+    cp_l, cp_r, all_vars = collapse.l, collapse.r, collapse.vars
+    collapse_slot = str(cp_r[1]) if cp_r[0] == "var" else None
+
+    lines: list[str] = []
+    if goal_vars:
+        lines.append("intro " + " ".join(goal_vars))
+
+    for rule in lemmas:
+        binders = " ".join(rule.vars)
+        lines.append(f"have {rule.name} : ∀ {binders} : G, {collapse_cert_term(rule.l)} = {collapse_cert_term(rule.r)} := by")
+        lines.append("  intro " + binders)
+        for proof_line in rule.proof_lines:
+            lines.append("  " + proof_line)
+
+    if collapse_slot is not None and collapse_slot in all_vars and goal_vars:
+        witness = goal_vars[0]
+
+        def margs(slot_value: str) -> str:
+            return " ".join(slot_value if var == collapse_slot else witness for var in all_vars)
+
+        lines.extend([
+            "have triv : ∀ u v : G, u = v := by",
+            "  intro u v",
+            f"  have eu := {collapse.name} {margs('u')}",
+            f"  have ev := {collapse.name} {margs('v')}",
+            "  grind",
+            f"exact triv ({collapse_cert_term(goal_l)}) ({collapse_cert_term(goal_r)})",
+        ])
+        return "\n".join(lines)
+
+    inst = collapse_cert_goal_instance(cp_l, cp_r, all_vars, goal_l, goal_r)
+    if inst is not None:
+        lines.append(f"have hgoal := {collapse.name} " + inst)
+    lines.append("grind")
+    return "\n".join(lines)
+
+
+def collapse_certificate_bodies(h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    body = collapse_certificate_body(h_eq, g_eq)
+    if body:
+        yield "collapse_certificates", body
+
+
+def broad_grounding_vars(term: Term, acc: list[str] | None = None) -> list[str]:
+    acc = acc if acc is not None else []
+    if term[0] == "var":
+        if term[1] not in acc:
+            acc.append(term[1])
+    else:
+        broad_grounding_vars(term[1], acc)
+        broad_grounding_vars(term[2], acc)
+    return acc
+
+
+def broad_grounding_orientable(lhs: Term, rhs: Term) -> bool:
+    left_vars = set(broad_grounding_vars(lhs))
+    right_vars = set(broad_grounding_vars(rhs))
+    return left_vars <= right_vars or right_vars <= left_vars
+
+
+def broad_grounding_target_collapse(eq: tuple[Term, Term]) -> bool:
+    lhs, rhs = eq
+    return is_collapse_witness(lhs, rhs)
+
+
+def broad_grounding_target_right_irrel(eq: tuple[Term, Term]) -> bool:
+    lhs, rhs = eq
+    return (
+        lhs[0] == "op"
+        and rhs[0] == "op"
+        and lhs[1] == rhs[1]
+        and lhs[2][0] == "var"
+        and rhs[2][0] == "var"
+        and lhs[2] != rhs[2]
+    )
+
+
+def broad_grounding_target_left_irrel(eq: tuple[Term, Term]) -> bool:
+    lhs, rhs = eq
+    return (
+        lhs[0] == "op"
+        and rhs[0] == "op"
+        and lhs[2] == rhs[2]
+        and lhs[1][0] == "var"
+        and rhs[1][0] == "var"
+        and lhs[1] != rhs[1]
+    )
+
+
+BROAD_GROUNDING_TARGETS = [
+    ("right_irrel", broad_grounding_target_right_irrel),
+    ("left_irrel", broad_grounding_target_left_irrel),
+    ("collapse", broad_grounding_target_collapse),
+]
+
+
+def self_root_absorption_h(h_eq: dict[str, Any]) -> bool:
+    """Detect H shapes like x = x ◇ T or x = T ◇ x."""
+    for lone, other in ((h_eq["lhs"], h_eq["rhs"]), (h_eq["rhs"], h_eq["lhs"])):
+        if lone[0] == "var" and other[0] == "op" and (other[1] == lone or other[2] == lone):
+            return True
+    return False
+
+
+def broad_grounding_derived_body(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    budget: float = 12.0,
+    *,
+    full_budget_per_target: bool = False,
+) -> tuple[str | None, dict[str, Any]]:
+    """Derive a broad grounding helper, then let Lean close the original goal."""
+    if not broad_grounding_orientable(h_eq["lhs"], h_eq["rhs"]):
+        return None, {
+            "kind": "broad_grounding_derived_state",
+            "status": "not_applicable",
+            "reason": "H is non-orientable; grounding_h is the matching certificate family.",
+        }
+    attempts: list[dict[str, Any]] = []
+    per_target_budget = (
+        max(1.0, float(budget))
+        if full_budget_per_target
+        else max(1.0, float(budget) / max(1, len(BROAD_GROUNDING_TARGETS)))
+    )
+    for name, predicate in BROAD_GROUNDING_TARGETS:
+        tid, recs, meta = pc_saturate(
+            [(h_eq["lhs"], h_eq["rhs"])],
+            predicate,
+            max_rounds=6,
+            max_eqs=2000,
+            max_size=26,
+            time_budget=per_target_budget,
+        )
+        attempts.append({
+            "target_helper": name,
+            "status": "derived" if tid is not None else "stuck",
+            "generated_equations": len(recs),
+            "rounds": meta.get("rounds"),
+            "stop_reason": meta.get("stop_reason"),
+        })
+        if tid is not None:
+            body = pc_render(
+                tid,
+                recs,
+                list(g_eq["variables"]),
+                goal_lhs=g_eq["lhs"],
+                goal_rhs=g_eq["rhs"],
+            )
+            return body, {
+            "kind": "broad_grounding_derived_state",
+            "status": "body_built",
+            "derived_helper": name,
+            "full_budget_per_target": full_budget_per_target,
+            "attempts": attempts,
+        }
+    return None, {
+        "kind": "broad_grounding_derived_state",
+        "status": "stuck",
+        "full_budget_per_target": full_budget_per_target,
+        "attempts": attempts,
+        "need_hint": "No collapse or factor-irrelevance helper was derived; try goal_superposition, collapse_certificates, or a midpoint close to the best superposition frontier.",
+    }
+
+
 def equation_shape_tags(lhs: Term, rhs: Term) -> list[str]:
     tags: list[str] = []
     for l, r in ((lhs, rhs), (rhs, lhs)):
@@ -4550,10 +5431,25 @@ def native_deep_true_candidates(
     """Late native portfolio covering every retired true-side mechanism class."""
     deadline = time.monotonic() + max(1.0, budget)
 
+    for route, body in collapse_certificate_bodies(h_eq, g_eq):
+        if time.monotonic() >= deadline:
+            return
+        yield route, body, {"family": "collapse_certificates"}
+
     for route, body in grounding_h_certificate_bodies(h_eq, g_eq):
         if time.monotonic() >= deadline:
             return
         yield route, body, {"family": "grounding_h"}
+
+    remaining = deadline - time.monotonic()
+    if remaining > 1.0:
+        body, state = broad_grounding_derived_body(
+            h_eq,
+            g_eq,
+            budget=min(12.0, max(1.0, remaining * 0.45)),
+        )
+        if body:
+            yield "broad_grounding_derived", body, state
 
     remaining = deadline - time.monotonic()
     if remaining > 1.0:
@@ -5474,6 +6370,10 @@ def proof_battery_graph_body(h_eq: dict[str, Any], g_eq: dict[str, Any], max_lay
 def proof_candidates_with_sources(h_eq: dict[str, Any], g_eq: dict[str, Any]):
     if g_eq["lhs"] == g_eq["rhs"]:
         yield "rfl_goal", "intro " + " ".join(g_eq["variables"]) + "\nrfl"
+    for route, body in collapse_certificate_bodies(h_eq, g_eq):
+        yield route, body
+    for route, body in grounding_h_certificate_bodies(h_eq, g_eq):
+        yield route, body
     for maker in (right_square_chain_body, generic_right_square_chain_body, square_sandwich_chain_body, rowconst_body, grounding_derived_body):
         try:
             body = maker(h_eq, g_eq)
@@ -5610,6 +6510,26 @@ def run_tool_call_detailed(
             "derived_helper": "target : ∀ a b : G, a ◇ b = a ◇ a" if body else None,
             "need_hint": None if body else "Square-rowconst grounding closer did not apply; try certificates/rowconst/standard_aux or a midpoint.",
         }, "grounding_derived")
+    if tool == "broad_grounding_derived":
+        body, state = broad_grounding_derived_body(
+            h_eq,
+            g_eq,
+            budget=float(call.get("budget") or call.get("time_budget") or 12.0),
+            full_budget_per_target=bool(call.get("full_budget_per_target", False)),
+        )
+        state = state or {}
+        return body, protocolize_state(state, "broad_grounding_derived", status="proved" if body else state.get("status", "stuck"))
+    if tool == "collapse_certificates":
+        bodies = list(collapse_certificate_bodies(h_eq, g_eq))
+        body = bodies[0][1] if bodies else None
+        return body, protocol_state(
+            "MechanicalResponse",
+            "proved" if body else "not_applicable",
+            "collapse_certificates",
+            tool=tool,
+            candidate_count=len(bodies),
+            need_hint=None if body else "No carrier-collapse witness was derived within the bounded certificate search; try standard_aux_superposition, goal_superposition, or a midpoint.",
+        )
     if tool == "grounding_h":
         bodies = list(grounding_h_certificate_bodies(h_eq, g_eq))
         body = bodies[-1][1] if bodies else None
@@ -5679,12 +6599,17 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
     advice = []
     advice.append("General midpoint engine is available: propose one small equation M or a short chain; each must be proved from H before use.")
     advice.append("Broad true-side consumer available: goal_superposition runs bounded proof-carrying paramodulation and reports a frontier if it gets stuck.")
+    advice.append("Broad grounding certificates available: broad_grounding_derived tries to derive collapse or factor-irrelevance helpers and then close G.")
     advice.append("Standard auxiliary consumer available: standard_aux_superposition tries const/projection/rowconst lemmas as explicit proved helpers.")
     if goal_generalization_actions(h_eq, g_eq):
         advice.append("Goal-generalization cards are active: G appears to be a special case of a stronger reusable law, so try proving the reusable law first.")
     one_sided = one_sided_variables(h_eq)
     if one_sided:
         advice.append(f"H has variables on only one side {one_sided}; standard_aux_superposition is a strong next tool because these often imply collapse/projection/rowconst helpers.")
+    if h_eq["lhs"][0] == "var" or h_eq["rhs"][0] == "var":
+        advice.append("H has a lone-variable side; collapse_certificates may derive a carrier-collapse witness and close the whole goal.")
+    if self_root_absorption_h(h_eq):
+        advice.append("H has self-root absorption form x = x ◇ T or x = T ◇ x; broad_grounding_derived gets a stronger helper-derivation budget.")
     if special_right_square_h(h_eq):
         advice.append("H matches right_square_chain: try helpers u ◇ (v ◇ v)=v and u ◇ v=v ◇ v.")
     if square_sandwich_h(h_eq):
@@ -5693,7 +6618,7 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         advice.append("H matches rowconst_certificates.")
     if square_rowconst_h(h_eq):
         advice.append("H matches grounding_derived square-rowconst: derive a ◇ b = a ◇ a and close explicitly.")
-    advice.append("If false, use false_model_search. Strong routes: structured_ce:max_n=7 for deterministic named/structured/dual families, model_finder_v2:n=k for goal-directed constraint search, optional cp_sat:n=k for exact finite-domain search when available, poly_ce:tier=2:nmax=13 for polynomial magmas, then local_search/model_finder fallbacks.")
+    advice.append("If false, use false_model_search. Strong routes: structured_ce:max_n=7 for deterministic named/structured/dual families, model_finder_v2:n=k for goal-directed constraint search, sympy_sat:n=k for sandbox-legal exact SAT at n≥5, optional cp_sat:n=k for exact finite-domain search when OR-Tools is available, poly_ce:tier=2:nmax=13 for polynomial magmas, then local_search/model_finder fallbacks.")
     return "\n".join(advice)
 
 
@@ -5752,6 +6677,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}',
         "If H has square-rowconst grounding shape, use:",
         '{"kind":"tool_call","tool":"grounding_derived","target":"goal","budget":12}',
+        "If H is orientable but seems to need a derived collapse/factor-irrelevance helper, use:",
+        '{"kind":"tool_call","tool":"broad_grounding_derived","target":"goal","budget":12}',
         "If shallow h-instances almost connect the goal, use graph-first proof battery:",
         '{"kind":"tool_call","tool":"proof_battery","target":"goal","max_graph_candidates":3}',
         "If feedback asks for a bridge, use lemma_hint with equations and optional seed_h_args:",
@@ -5789,6 +6716,7 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder_v2","routes":["model_finder_v2:n=6"],"budget":8}',
         "If exact finite-domain CP-SAT is available and small sizes need proof/witness search, ask for:",
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}',
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}',
         "If false may need a structured larger witness, ask for polynomial magma search:",
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}',
     ])
@@ -5830,6 +6758,16 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
         ranked.append({"tool": "rowconst_certificates", "score": 85, "why": "H matches a row-constant certificate pattern.", "call": {"kind": "tool_call", "tool": "rowconst_certificates", "target": "goal"}})
     if square_rowconst_h(h_eq):
         ranked.append({"tool": "grounding_derived", "score": 84, "why": "H matches square-rowconst grounding; derive/use a◇b=a◇a with an explicit final close.", "call": {"kind": "tool_call", "tool": "grounding_derived", "target": "goal", "budget": 12}})
+    if h_eq["lhs"][0] == "var" or h_eq["rhs"][0] == "var":
+        ranked.append({"tool": "collapse_certificates", "score": 72, "why": "H has a lone-variable side; try deriving a carrier-collapse witness and closing the goal from triviality.", "call": {"kind": "tool_call", "tool": "collapse_certificates", "target": "goal", "budget": 12}})
+    if broad_grounding_orientable(h_eq["lhs"], h_eq["rhs"]):
+        bg_score = 86 if self_root_absorption_h(h_eq) else 74
+        bg_why = (
+            "H has self-root absorption form; derive a factor-irrelevance helper with the broad grounding certificate route."
+            if self_root_absorption_h(h_eq)
+            else "H is orientable; try deriving a collapse or factor-irrelevance helper and let Lean close the goal."
+        )
+        ranked.append({"tool": "broad_grounding_derived", "score": bg_score, "why": bg_why, "call": {"kind": "tool_call", "tool": "broad_grounding_derived", "target": "goal", "budget": 12}})
     ranked.append({"tool": "proof_battery", "score": 46, "why": "Try old battery h-instance layers through the explicit equality graph before risky grind bodies.", "call": {"kind": "tool_call", "tool": "proof_battery", "target": "goal", "max_graph_candidates": 3}})
     aux_score = 88 if standard_aux_plausible_h(h_eq) else 42
     aux_why = (
@@ -5847,6 +6785,8 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
             "local_search:n=6:seed=1",
             "local_search:n=7:seed=0",
             "model_finder_v2:n=7",
+            "model_finder_v2:n=8",
+            "sympy_sat:n=6",
             "cp_sat:n=5",
             "cp_sat:n=6",
             "poly_ce:tier=2:nmax=13",
@@ -6748,6 +7688,30 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             if result.get("status") == "accepted":
                 return "accepted_true_standard_aux_superposition"
 
+    if broad_grounding_orientable(h_eq["lhs"], h_eq["rhs"]):
+        bg_body, bg_state = broad_grounding_derived_body(
+            h_eq,
+            g_eq,
+            budget=min(4.0, max(1.0, budget * 0.04)),
+        )
+        if bg_body:
+            result = judge_true_attributed(
+                "native:true:broad_grounding_derived_early",
+                bg_body,
+                source="native_early_true_tool",
+                detail={
+                    "family": "broad_grounding_derived",
+                    "derived_helper": bg_state.get("derived_helper") if isinstance(bg_state, dict) else None,
+                },
+            )
+            if result.get("status") == "accepted":
+                return "accepted_true_broad_grounding_derived"
+
+    # Focused trusted true tools.
+    for route, body in proof_candidates_with_sources(h_eq, g_eq):
+        if try_true_attributed(f"native:true:{route}", body, source="native_true_tool"):
+            return "accepted_true"
+
     initial_feedback = [{
         "kind": "initial_direct_graph_state",
         "status": "direct_mechanical_routes_available_for_feedback",
@@ -6755,35 +7719,16 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         "need_hint": "Use frontier/closest_pairs to propose a bridge midpoint, or choose the top ranked trusted tool.",
     }]
 
-    if should_try_collaboration_first(h_eq, g_eq):
-        status = try_llm_collaboration(
-            h_eq,
-            g_eq,
-            budget,
-            max_rounds=2,
-            collaboration_goal=(
-                "Collaboration-first pass: choose the top ranked trusted tool "
-                "or propose an equivalent lemma_chain/midpoint. The mechanical "
-                "side will verify everything and fall back if this fails."
-            ),
-            initial_feedback=initial_feedback,
-            semantic_context=semantic_context,
-        )
-        if status:
-            return status
-
-    # Focused trusted true tools.
-    for route, body in proof_candidates_with_sources(h_eq, g_eq):
-        if try_true_attributed(f"native:true:{route}", body, source="native_true_tool"):
-            return "accepted_true"
-
     # Stronger bounded false search. Give the goal-directed v2 finder a
     # dedicated slice before mixing it with stochastic routes; it can need a
     # few seconds to reach the Skolem branch that violates the goal.
     found, false_state = false_model_search_detailed(
         h_eq,
         g_eq,
-        {"routes": ["model_finder_v2:n=6"], "budget": min(12.0, max(6.0, budget * 0.04))},
+        {
+            "routes": ["model_finder_v2:n=6", "model_finder_v2:n=7", "model_finder_v2:n=8"],
+            "budget": min(90.0, max(45.0, budget * 0.08)),
+        },
         8,
         semantic_context=semantic_context,
     )
@@ -6791,6 +7736,37 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         return "accepted_false_v2"
     if not found and isinstance(false_state, dict):
         false_failure_feedback.append(false_state)
+
+    exact_action = promoted_exact_false_action(false_failure_feedback)
+    if exact_action is not None:
+        found, exact_state = false_model_search_detailed(
+            h_eq,
+            g_eq,
+            exact_action,
+            1,
+            semantic_context=semantic_context,
+        )
+        if found and try_false_artifact_attributed("native:false:exact_continuation", found, source="native_false_search"):
+            return "accepted_false_exact_continuation"
+        if not found and isinstance(exact_state, dict):
+            false_failure_feedback.append(exact_state)
+
+    if should_try_collaboration_first(h_eq, g_eq) and not false_strategy_cards(false_failure_feedback):
+        status = try_llm_collaboration(
+            h_eq,
+            g_eq,
+            budget,
+            max_rounds=2,
+            collaboration_goal=(
+                "Collaboration pass after focused native tools: choose the top "
+                "ranked trusted tool or propose an equivalent lemma_chain/midpoint. "
+                "The mechanical side will verify everything and fall back if this fails."
+            ),
+            initial_feedback=initial_feedback,
+            semantic_context=semantic_context,
+        )
+        if status:
+            return status
 
     # False-side collaboration checkpoint. This gives System 2 one chance to
     # choose the next route from concrete false-search telemetry before the
@@ -6827,7 +7803,18 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     found, false_state = false_model_search_detailed(
         h_eq,
         g_eq,
-        {"routes": ["local_search:n=6:seed=2", "cp_sat:n=6", "poly_ce:tier=2:nmax=13", "structured_ce:max_n=7"], "budget": min(18.0, max(8.0, budget * 0.04))},
+        {
+            "routes": [
+                "local_search:n=6:seed=2",
+                "model_finder_v2:n=7",
+                "model_finder_v2:n=8",
+                "sympy_sat:n=6",
+                "cp_sat:n=6",
+                "poly_ce:tier=2:nmax=13",
+                "structured_ce:max_n=7",
+            ],
+            "budget": min(90.0, max(45.0, budget * 0.08)),
+        },
         8,
         semantic_context=semantic_context,
     )

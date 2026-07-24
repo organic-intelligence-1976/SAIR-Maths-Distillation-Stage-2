@@ -99,3 +99,10 @@ The main solver entry points are:
   `solver.py` under `.artifacts/compiled_submission/submission/`;
 - `research_system/`: modular experimental framework for curriculum,
   blackboard, planner, executor, verifier, and feedback protocols.
+
+Latest focused import evidence: `evidence/native_import_2026_07_24.md`
+records the first public native import pass for sandbox-legal exact SAT,
+collapse certificates, and broad grounding-derived certificates. The verified
+slice solved eight targeted rows through the compiled official proxy with zero
+LLM calls, while also documenting the remaining broad-grounding cascade close
+risk.
