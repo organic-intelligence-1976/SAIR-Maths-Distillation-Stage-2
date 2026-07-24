@@ -1,5 +1,27 @@
 # SAIR-Maths-Distillation-Stage-2
 
+## Background: the Mathematics Distillation Challenge
+
+[SAIR](https://sair.foundation)'s Mathematics Distillation Challenge asks whether the knowledge
+inside a large machine-generated mathematical corpus — implications between equational theories —
+can be distilled into compact artifacts that transfer. Stage 1 asked for a "cheatsheet": a short
+document that teaches an LLM to predict whether one equational theory implies another. Our Stage-1
+submission [placed 3rd](https://competition.sair.foundation/leaderboard/mathematics-distillation-challenge-equational-theories-stage1).
+
+One Stage-1 finding shaped how we think about this problem. Our highest-scoring cheatsheet drafts
+were not, strictly speaking, mathematically correct — they contained rules that predicted well but
+were logically unsound. More interestingly, every attempt to keep a draft close to the top scorer
+while nudging it slightly toward rigor *lowered* its score, consistently. We submitted the
+mathematically valid version anyway, and kept the observation: the most effective educational
+material for a model on this task was not the most rigorous one — as is often true, in our
+experience, of educational material for humans.
+
+Stage 2 raises the bar from prediction to verification: instead of a cheatsheet that guesses
+implications, the goal is deterministically checkable artifacts — Lean-certified proofs and
+explicit counterexamples. This repository is our working solver and research harness for that.
+
+## This repository
+
 This repository contains a solver and research harness for the
 [SAIR Stage 2 equational-theories competition](https://github.com/SAIRcompetition/equational-theories-lean-stage2).
 Each problem asks whether one universally quantified equation over a magma
