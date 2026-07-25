@@ -77,6 +77,33 @@ def main() -> int:
         and structured_witness is not None
         and structured_witness[0] == 2
     )
+    original_judge_true_attributed = baby_solver.judge_true_attributed
+    judged_forward_routes: list[str] = []
+    try:
+        accept_route = saturation_bodies[1][0] if len(saturation_bodies) > 1 else saturation_bodies[0][0]
+
+        def fake_judge_true_attributed(route, body, **kwargs):
+            del body, kwargs
+            judged_forward_routes.append(route)
+            return {"status": "accepted" if route.endswith(accept_route) else "incorrect"}
+
+        baby_solver.judge_true_attributed = fake_judge_true_attributed
+        fs_body, fs_state = baby_solver.run_tool_call_detailed(
+            {"kind": "tool_call", "tool": "forward_saturation", "target": "goal"},
+            replacement_h,
+            replacement_g,
+            verify_candidates=True,
+        )
+    finally:
+        baby_solver.judge_true_attributed = original_judge_true_attributed
+    checks["forward_saturation_tool_verifies_cheapest_first"] = (
+        fs_body is not None
+        and fs_state is not None
+        and fs_state.get("status") == "proved"
+        and fs_state.get("accepted_route") == accept_route
+        and len(judged_forward_routes) == 2
+        and fs_state.get("already_judged_accepted") is True
+    )
     aux_h = baby_solver.parse_equation("x = (x ◇ y) ◇ ((z ◇ y) ◇ y)")
     aux_g = baby_solver.parse_equation("x = (x ◇ y) ◇ (z ◇ (z ◇ w))")
     rowconst = baby_solver.UniversalEquation(

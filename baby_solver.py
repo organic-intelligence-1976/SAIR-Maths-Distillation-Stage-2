@@ -6544,6 +6544,7 @@ def run_tool_call_detailed(
     g_eq: dict[str, Any],
     *,
     capability_mask: Any = None,
+    verify_candidates: bool = False,
 ) -> tuple[str | None, dict[str, Any] | None]:
     raw_tool = str(call.get("tool") or "").strip()
     tool = TOOL_ALIASES.get(raw_tool, raw_tool)
@@ -6552,13 +6553,58 @@ def run_tool_call_detailed(
         return None, gate_state
     if tool == "forward_saturation":
         bodies = list(native_saturation_bodies(h_eq, g_eq))
-        body = bodies[-1][1] if bodies else None
+        attempts: list[dict[str, Any]] = []
+        if verify_candidates:
+            for idx, (route, body) in enumerate(bodies, start=1):
+                result = judge_true_attributed(
+                    f"llm:tool:forward_saturation:{route}",
+                    body,
+                    source="llm_tool_call",
+                    detail={
+                        "tool": "forward_saturation",
+                        "candidate_index": idx,
+                        "candidate_count": len(bodies),
+                    },
+                )
+                attempts.append({
+                    "route": route,
+                    "status": result.get("status"),
+                    "message": short_text(result.get("message") or result.get("stderr") or "", 300),
+                })
+                if result.get("status") == "accepted":
+                    return body, protocol_state(
+                        "MechanicalResponse",
+                        "proved",
+                        "forward_saturation",
+                        tool=tool,
+                        candidate_count=len(bodies),
+                        accepted_route=route,
+                        judge_attempts=attempts,
+                        already_judged_accepted=True,
+                    )
+            return None, protocol_state(
+                "MechanicalResponse",
+                "stuck",
+                "forward_saturation",
+                tool=tool,
+                candidate_count=len(bodies),
+                judge_attempts=attempts,
+                need_hint=(
+                    "Forward saturation tried every generated body cheapest-first "
+                    "and none closed; use closest_pairs to propose a midpoint, or "
+                    "switch to goal_superposition."
+                ),
+            )
+
+        body = bodies[0][1] if bodies else None
+        route = bodies[0][0] if bodies else None
         return body, protocol_state(
             "MechanicalResponse",
-            "body_built" if body else "not_applicable",
+            "candidate_generated" if body else "not_applicable",
             "forward_saturation",
             tool=tool,
             candidate_count=len(bodies),
+            selected_route=route,
             need_hint=None if body else "No bounded saturation body was generated; try goal_superposition or a midpoint.",
         )
     if tool == "right_square_chain":
@@ -7701,9 +7747,12 @@ def try_llm_collaboration(
                 h_eq,
                 g_eq,
                 capability_mask=capability_mask,
+                verify_candidates=True,
             )
             candidate_route = f"llm:tool:{data.get('tool')}"
             candidate_source = "llm_tool_call"
+            if body and isinstance(tool_state, dict) and tool_state.get("already_judged_accepted"):
+                return "accepted_true_llm"
             if not body:
                 failed_signatures.add(sig)
                 mechanical_feedback.append(protocol_state(

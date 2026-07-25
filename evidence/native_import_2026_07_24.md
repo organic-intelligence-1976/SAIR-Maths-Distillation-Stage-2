@@ -74,6 +74,13 @@ The compiled submission also returned `verdict=true` for all four rows through
 the official proxy with zero LLM calls. This is a native mechanical import, not
 a load-bearing LLM win.
 
+Follow-up adapter fix: an LLM `forward_saturation` tool call now verifies the
+generated saturation bodies cheapest-first and returns the first accepted body.
+This matters because later saturation bodies can fail even when an earlier body
+closes the goal (`hard2_0021` is an example). A fake-LLM test confirmed the
+collaboration loop returns `accepted_true_llm` when the tool call succeeds
+internally.
+
 Two other recommendation groups remain open:
 
 - `hard2_0178` / `hard3_0271`: derived-helper target selection/final-consumer
