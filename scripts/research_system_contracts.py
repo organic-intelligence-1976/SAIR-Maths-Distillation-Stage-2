@@ -118,6 +118,28 @@ def main() -> int:
         and "rowconst ((x ◇ y))" in aux_tail
         and aux_state.get("status") == "consumed_by_one_h_aux"
     )
+    proj_l_h = baby_solver.parse_equation("x = x ◇ ((y ◇ z) ◇ (x ◇ y))")
+    proj_l_g = baby_solver.parse_equation("x = x ◇ ((y ◇ y) ◇ (z ◇ y))")
+    proj_l_body, proj_l_state = baby_solver.standard_aux_superposition_attempt(
+        proj_l_h,
+        proj_l_g,
+        {"lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": 5},
+    )
+    proj_r_h = baby_solver.parse_equation("x = (y ◇ ((z ◇ x) ◇ z)) ◇ x")
+    proj_r_g = baby_solver.parse_equation("x = ((y ◇ z) ◇ w) ◇ (w ◇ x)")
+    proj_r_body, proj_r_state = baby_solver.standard_aux_superposition_attempt(
+        proj_r_h,
+        proj_r_g,
+        {"lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": 5},
+    )
+    checks["standard_aux_projection_focus"] = (
+        proj_l_body is not None
+        and proj_l_state.get("used_aux") == "proj_l"
+        and proj_l_state.get("attempts", [{}])[0].get("kind") == "proj_l"
+        and proj_r_body is not None
+        and proj_r_state.get("used_aux") == "proj_r"
+        and proj_r_state.get("attempts", [{}])[0].get("kind") == "proj_r"
+    )
     problem = ProblemSpec(
         id="contract",
         eq1_id=1167,

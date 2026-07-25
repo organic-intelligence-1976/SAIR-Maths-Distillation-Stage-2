@@ -76,10 +76,10 @@ continuations. The public evidence note is
 
 Focused official-proxy validation solved `hard1_0009`, `hard3_0058`,
 `hard3_0278`, `hard3_0279`, `hard1_0013`, `hard1_0034`, `hard1_0046`, and
-`hard1_0054` with zero LLM calls. The broader cascade rows are not declared
-done: `hard2_0178` can generate a useful full-budget broad-grounding helper,
-but its final Lean close can run too long, so full per-helper broad grounding
-is not enabled automatically.
+`hard1_0054` with zero LLM calls. A later standard-aux focus pass also solved
+`hard2_0178` and `hard3_0271` natively by deriving the appropriate projection
+helper first, then closing the goal through the existing proof-carrying
+consumer.
 
 ## Current Rule
 

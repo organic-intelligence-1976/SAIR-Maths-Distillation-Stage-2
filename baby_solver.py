@@ -5233,6 +5233,23 @@ def standard_aux_order(call: dict[str, Any] | None = None) -> list[str]:
     return out
 
 
+def implied_standard_aux_lemmas(h_eq: dict[str, Any]) -> list[str]:
+    """Cheap semantic scout for standard auxiliary lemmas.
+
+    This is deliberately conservative as a scheduler signal, not a soundness
+    assumption.  Every returned lemma still has to be proved by the
+    proof-carrying superposition engine and accepted by Lean.
+    """
+    plausible = [
+        kind
+        for kind in ("const", "proj_l", "proj_r", "rowconst")
+        if hint_refutation(h_eq, standard_aux_equation(kind)) is None
+    ]
+    if "const" in plausible:
+        return ["const"]
+    return [kind for kind in ("proj_l", "proj_r", "rowconst") if kind in plausible]
+
+
 def standard_aux_equation(kind: str) -> dict[str, Any]:
     return parse_equation(STANDARD_AUX_EQUATIONS[kind])
 
@@ -5398,9 +5415,15 @@ def standard_aux_superposition_attempt(
 ) -> tuple[str | None, dict[str, Any]]:
     call = call or {}
     kinds = standard_aux_order(call)
+    implied_kinds = implied_standard_aux_lemmas(h_eq)
+    prefer_implied = call.get("prefer_implied", True) is not False
+    if prefer_implied and implied_kinds:
+        preferred = [kind for kind in implied_kinds if kind in kinds]
+        remainder = [kind for kind in kinds if kind not in preferred]
+        kinds = preferred + remainder
     total_budget = float(call.get("budget") or call.get("time_budget") or 10.0)
     deadline = time.monotonic() + max(1.0, total_budget)
-    allow_var_overlap = bool(call.get("allow_var_overlap", True))
+    allow_overlap_fallback = bool(call.get("allow_var_overlap", True))
     attempts: list[dict[str, Any]] = []
     for idx, kind in enumerate(kinds):
         rem = deadline - time.monotonic()
@@ -5422,18 +5445,51 @@ def standard_aux_superposition_attempt(
             })
             continue
         remaining = max(1, len(kinds) - idx)
-        attempt_budget = max(1.0, rem / remaining)
+        focused_floor = 1.0
+        if kind in implied_kinds:
+            focused_floor = 8.0 if kind in {"proj_l", "proj_r"} else 5.0
+        attempt_budget = min(rem, max(1.0, rem / remaining, focused_floor))
         proof_body, proof_state = superposition_prove_detailed(
             h_eq,
             eq,
             budget=attempt_budget,
-            allow_var_overlap=allow_var_overlap,
+            allow_var_overlap=False,
         )
+        if proof_body is None and allow_overlap_fallback:
+            overlap_rem = deadline - time.monotonic()
+            if overlap_rem > 0.75:
+                overlap_body, overlap_state = superposition_prove_detailed(
+                    h_eq,
+                    eq,
+                    budget=min(overlap_rem, max(1.0, attempt_budget * 0.5)),
+                    allow_var_overlap=True,
+                )
+                if isinstance(proof_state, dict):
+                    proof_state = dict(proof_state)
+                    proof_state["overlap_fallback_state"] = overlap_state
+                else:
+                    proof_state = {"overlap_fallback_state": overlap_state}
+                if overlap_body is not None:
+                    proof_body = overlap_body
+                    proof_state["used_overlap_fallback"] = True
         if proof_body is None:
+            budget_starved = isinstance(proof_state, dict) and (
+                proof_state.get("stop_reason") == "time_budget"
+                or (
+                    isinstance(proof_state.get("superposition_state"), dict)
+                    and proof_state["superposition_state"].get("stop_reason") == "time_budget"
+                )
+                or (
+                    isinstance(proof_state.get("overlap_fallback_state"), dict)
+                    and proof_state["overlap_fallback_state"].get("stop_reason") == "time_budget"
+                )
+            )
             attempts.append({
                 "kind": kind,
-                "status": "not_proved",
+                "status": "budget_starved" if budget_starved else "not_proved",
                 "equation": eq["text"],
+                "attempt_budget": round(attempt_budget, 3),
+                "implied_by_scout": kind in implied_kinds,
                 "proof_state": proof_state,
             })
             continue
@@ -5447,6 +5503,8 @@ def standard_aux_superposition_attempt(
             "kind": kind,
             "status": "proved" if (tail or secondary_tail) else "proved_not_consumed",
             "equation": eq["text"],
+            "attempt_budget": round(attempt_budget, 3),
+            "implied_by_scout": kind in implied_kinds,
             "proof_state": proof_state,
             "consume_state": consume_state,
             "secondary_state": secondary_state,
@@ -5461,6 +5519,7 @@ def standard_aux_superposition_attempt(
                 "kind": "StandardAuxSuperpositionState",
                 "status": "body_built",
                 "used_aux": kind,
+                "implied_aux": implied_kinds,
                 "used_secondary_bridge": secondary_state.get("bridge") if isinstance(secondary_state, dict) else None,
                 "attempts": attempts,
             }
@@ -5490,6 +5549,7 @@ def standard_aux_superposition_attempt(
         "kind": "StandardAuxSuperpositionState",
         "status": "stuck",
         "attempted_aux": kinds,
+        "implied_aux": implied_kinds,
         "attempts": attempts[:5],
         "need_hint": need_hint or {
             "kind": "standard_aux_failed",
@@ -7848,12 +7908,22 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     # before speculative graph bodies or LLM routing.  A miss still falls
     # through to the larger late portfolio.
     if standard_aux_plausible_h(h_eq):
+        early_aux_lemmas = implied_standard_aux_lemmas(h_eq)
+        early_aux_budget = min(4.0, max(1.0, budget * 0.02))
+        if early_aux_lemmas:
+            early_aux_budget = min(
+                8.0,
+                max(
+                    5.0 if any(kind in early_aux_lemmas for kind in ("proj_l", "proj_r")) else 4.0,
+                    budget * 0.025,
+                ),
+            )
         aux_body, aux_state = standard_aux_superposition_attempt(
             h_eq,
             g_eq,
             {
-                "lemmas": ["const", "proj_l", "proj_r", "rowconst"],
-                "budget": min(4.0, max(1.0, budget * 0.02)),
+                "lemmas": early_aux_lemmas or ["const", "proj_l", "proj_r", "rowconst"],
+                "budget": early_aux_budget,
             },
         )
         if aux_body:

@@ -45,13 +45,12 @@ Additional repo checks passed:
 
 ## Caveat
 
-The broader cascade rows from the recommendation are not fully solved by this
-safe import. In particular, `hard2_0178` can generate a useful
-grounding-derived helper under a full per-helper budget, but the final Lean
-close may run too long. The automatic solver therefore keeps the safe split
-budget by default. The next principled improvement is an explicit final closer
-for broad grounding-derived helpers, or a pre-judge risk filter that avoids
-submitting expensive `grind` closes.
+The first safe import did not solve every broader cascade row. In particular,
+`hard2_0178` originally generated a useful grounding-derived helper whose final
+Lean close did not discharge the goal. The later standard-aux focus pass below
+resolved that row through a cleaner projection-lemma route, so broad
+grounding-derived still remains a diagnostic/certificate tool rather than the
+primary route for this pair.
 
 ## Follow-up: Forward Saturation Battery
 
@@ -81,12 +80,26 @@ closes the goal (`hard2_0021` is an example). A fake-LLM test confirmed the
 collaboration loop returns `accepted_true_llm` when the tool call succeeds
 internally.
 
-Two other recommendation groups remain open:
+## Follow-up: Derived Standard Aux Focus
 
-- `hard2_0178` / `hard3_0271`: derived-helper target selection/final-consumer
-  gap. `hard2_0178` quickly derives a valid helper, but the first helper is not
-  sufficient for the goal; `hard3_0271` does not hit a helper inside the older
-  limits.
+The next recommendation group was `hard2_0178` / `hard3_0271`. The archived
+mechanical solver won these by deriving full standard projection lemmas and then
+closing the goal:
+
+| Problem | Derived helper | Compiled solver result |
+|---|---|---|
+| `hard2_0178` | `∀ a b : G, a ◇ b = a` | true, 1 judge call, 0 LLM calls, 6.52s |
+| `hard3_0271` | `∀ a b : G, a ◇ b = b` | true, 1 judge call, 0 LLM calls, 7.84s |
+
+The native fix was not a new opaque fallback. `standard_aux_superposition` now
+uses a cheap refutation scout to order plausible standard aux lemmas, proves the
+chosen helper with proof-carrying superposition, and tries ordinary
+non-overlap superposition before the more explosive variable-overlap fallback.
+The protocol state reports `implied_aux`, per-helper budgets, and whether a
+failed helper was budget-starved.
+
+One recommendation group remains open:
+
 - `hard3_0204` / `hard3_0210`: midpoint-chain candidates. A repeated
   self-absorption strategy card and early true-side LLM checkpoint were added,
   with midpoint-chain mechanical work capped in that pass. A live trace showed
