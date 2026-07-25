@@ -69,8 +69,8 @@ The main LLM-facing actions are:
 - `lemma_hint`: propose a single midpoint equation;
 - `lemma_chain`: propose an ordered sequence of helper equations;
 - `false_model_search`: choose a finite-countermodel search route;
-- `infinite_model`: research-only support for externally checked semantic
-  countermodels.
+- `infinite_model`: policy-sensitive support for complete Lean Type-level
+  countermodel artifacts on audited finite-true/general-false semantic cases.
 
 The key design constraint is that the LLM is allowed to be creative but never
 trusted. If it proposes a bad midpoint, the mechanical layer should reject it

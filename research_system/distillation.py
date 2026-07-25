@@ -128,7 +128,7 @@ class VerifiedDistiller:
                 "artifact_sha256": hashlib.sha256(execution.infinite_code.encode("utf-8")).hexdigest(),
                 "artifact_bytes": len(execution.infinite_code.encode("utf-8")),
             }
-            deployability = "research_only"
+            deployability = "policy_sensitive"
         else:
             return None
         identity = {"kind": kind, "trigger": trigger, "payload": payload}

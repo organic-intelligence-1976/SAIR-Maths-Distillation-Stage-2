@@ -671,8 +671,8 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "scope": "whole_goal",
         "cost": "expensive",
         "feedback_quality": "judge_exact",
-        "native_import": "research_protocol",
-        "deployability": "research_only",
+        "native_import": "collab_protocol",
+        "deployability": "policy_sensitive",
         "aliases": ["infinite_model", "infinite_countermodel", "type_level_model"],
         "description": "Submit a complete Lean Type-level countermodel artifact directly to the trusted false judge.",
     },
@@ -733,7 +733,7 @@ def implication_semantics(problem: dict[str, Any]) -> dict[str, Any]:
         "finite_status": "unknown",
         "certificate_class": "finite_model",
         "competition_policy": "prose_finite_vs_judge_general",
-        "current_solver_false_artifacts": ["finite_table"],
+        "current_solver_false_artifacts": ["finite_table", "llm_infinite_model_artifact"],
         "research_solver_false_artifacts": ["finite_table", "infinite_model_artifact"],
         "source": "competition row only",
     }
@@ -741,11 +741,12 @@ def implication_semantics(problem: dict[str, Any]) -> dict[str, Any]:
         out.update(known)
     if out["general_status"] == "false" and out["finite_status"] == "true":
         out["judge_certificate_status"] = "expressible_as_infinite_lean_model"
-        out["current_solver_certificate_status"] = "unsupported_infinite_model"
+        out["current_solver_certificate_status"] = "requires_infinite_model_artifact"
         out["certificate_policy_conflict"] = (
             "The Stage 2 prose requests a finite false witness, while the executable Lean "
-            "goal permits an infinite Type-level countermodel. The default competition solver "
-            "adapter only renders finite tables; the broader whole-artifact adapter is research-only."
+            "goal permits an infinite Type-level countermodel. The solver blocks doomed finite "
+            "countermodel search and may ask System 2 for a complete Lean infinite-model artifact; "
+            "the judge remains the trust boundary."
         )
     else:
         out["judge_certificate_status"] = "potentially_expressible"
@@ -766,8 +767,8 @@ def semantic_status_state(semantic_context: dict[str, Any]) -> dict[str, Any]:
         need_hint = (
             "Do not spend more compute on finite countermodels. For unrestricted research, "
             "seek an infinite model or a structural description of one. The Lean judge goal and "
-            "the explicit research adapter can express it, but the default competition solve path "
-            "keeps that research-only artifact lane disabled."
+            "the explicit infinite-model adapter can express it when a complete Lean artifact is "
+            "available; finite tables are semantically impossible here."
         )
         actions = [{
             "kind": "research_task",
@@ -7279,12 +7280,12 @@ def llm_context(
     if not finite_countermodel_search_allowed(semantic_context):
         phase_directive = (
             "Finite countermodel search is prohibited by the audited semantic status. "
-            "Do not return a finite table or finite_model_search call. For research, propose "
+            "Do not return a finite table or finite_model_search call. Instead propose "
             "an infinite-model construction or a structural lemma."
             + (
                 " Return a complete infinite_model Lean artifact if you can prove it."
                 if allow_infinite_model_artifacts
-                else " The Lean judge goal can express an infinite model, but this pass has disabled research artifacts."
+                else " The Lean judge goal can express an infinite model, but this pass has not enabled whole-artifact responses."
             )
         )
         advice_prefer_false = False
@@ -7427,10 +7428,10 @@ def try_llm_collaboration(
             if not allow_infinite_model_artifacts:
                 mechanical_feedback.append(protocol_state(
                     "InfiniteModelArtifactState",
-                    "disabled_outside_research",
+                    "disabled_in_this_pass",
                     "infinite_model_artifact",
                     tool="infinite_model_artifact",
-                    need_hint="This action is research-only. Use a supported competition artifact or enable the explicit research lane.",
+                    need_hint="This pass did not enable whole-artifact infinite models. Use a supported action for this phase or wait for the semantic infinite-model lane.",
                 ))
                 failed_signatures.add(sig)
                 continue
@@ -7663,11 +7664,30 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     false_failure_feedback: list[dict[str, Any]] = []
 
     # The executable judge can express an infinite Type-level model, and the
-    # research protocol has an explicit whole-artifact adapter.  The default
-    # competition solve path deliberately keeps that research-only lane off and
-    # renders only finite tables.  An Austin implication is therefore a default
-    # deployment capability gap, not a reason to buy more finite-search time.
-    if semantic_context.get("current_solver_certificate_status") == "unsupported_infinite_model":
+    # protocol has an explicit whole-artifact adapter.  An Austin implication is
+    # not a reason to buy more finite-search time, but it is exactly the case
+    # where System 2 may be able to propose a compact Type-level artifact.
+    if semantic_context.get("current_solver_certificate_status") == "requires_infinite_model_artifact":
+        remaining = max(0.0, budget - (time.monotonic() - solve_started))
+        if remaining >= 8.0:
+            status = try_llm_collaboration(
+                h_eq,
+                g_eq,
+                remaining,
+                max_rounds=1,
+                collaboration_goal=(
+                    "Audited semantics say finite countermodels are impossible "
+                    "but the unrestricted implication is false. Do not search "
+                    "finite tables. If possible, return a complete compact Lean "
+                    "infinite_model artifact defining `submission : Goal`."
+                ),
+                initial_feedback=[semantic_state],
+                prefer_false=True,
+                semantic_context=semantic_context,
+                allow_infinite_model_artifacts=True,
+            )
+            if status:
+                return status
         print(json.dumps(semantic_state, ensure_ascii=False), file=sys.stderr)
         return "semantic_solver_capability_gap"
 

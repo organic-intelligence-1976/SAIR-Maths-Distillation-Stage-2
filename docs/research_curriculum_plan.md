@@ -48,12 +48,13 @@ execution seams instead of refactoring the packed solver:
   `finite_status`, `certificate_class`, competition-policy information, and
   the current solver's artifact support;
 - every finite-model route has a semantic stop guard;
-- `hard2_0027` now stops immediately with
-  `semantic_solver_capability_gap` instead of spending compute on finite
+- `hard2_0027` blocks finite countermodel search and routes first to the
+  infinite-model artifact protocol instead of spending compute on finite
   searches that cannot succeed;
-- the stop is explicitly a **solver capability gap**, not a judge limitation:
-  the current Lean false goal can express an infinite Type-level model, while
-  this solver currently renders only finite tables;
+- a remaining `semantic_solver_capability_gap` is explicitly an artifact
+  construction gap, not a judge limitation: the current Lean false goal can
+  express an infinite Type-level model, while finite tables cannot solve this
+  semantic class;
 - the existing tool registry now exposes capability IDs, primitive
   dependencies, a manifest, and experimental masks;
 - the right-square curriculum family can run full mechanics, a focused-tool
@@ -102,7 +103,7 @@ The second bounded slice completed the core targets left by Vertical Slice 1:
    `df8184f8ae59c71d6f5463b71682d871823a779c`. The source file hash is recorded
    in `data/semantics/austin_implications.json`. An audit of all 1,669 public
    rows found exactly one Austin implication, `hard2_0027`.
-2. A research-only `infinite_model_artifact` action now has an explicit
+2. A policy-sensitive `infinite_model_artifact` action now has an explicit
    capability contract and Lean trust boundary. The closed historical
    E3994 -> E3588 countermodel is accepted by the official judge under the
    research declaration policy. The unchanged competition declaration
@@ -229,9 +230,8 @@ official proxy/judge protocol smoke with zero LLM calls and one accepted judge
 call.
 
 The v1 compiler still treats `baby_solver.py` as one legacy packed source unit.
-It records that research-only definitions remain physically present but are
-disabled on the competition entry path. Physical tree shaking is a later
-compiler improvement, not a claim of the current build.
+It records policy-sensitive definitions explicitly. Physical tree shaking is a
+later compiler improvement, not a claim of the current build.
 
 Architecture, commands, evidence paths, and component status are documented in
 `docs/research_system_architecture.md`.

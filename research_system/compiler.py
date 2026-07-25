@@ -110,11 +110,7 @@ class SubmissionCompiler:
 
         tool_rows = baby_solver.capability_manifest()["tools"]
         capability_ids = [row["capability"] for row in tool_rows]
-        default_active = [
-            row["capability"]
-            for row in tool_rows
-            if row.get("tool") != "infinite_model_artifact"
-        ]
+        default_active = [row["capability"] for row in tool_rows]
         manifest = {
             "schema_version": 1,
             "compiler_version": COMPILER_VERSION,
@@ -136,11 +132,12 @@ class SubmissionCompiler:
             },
             "included_capability_ids": capability_ids,
             "default_active_capability_ids": default_active,
-            "research_only_capability_ids": ["tool:infinite_model_artifact"],
-            "research_capability_note": (
-                "The v1 legacy packed source still contains research-lane definitions, "
-                "but the competition entry path and default prompt keep them disabled. "
-                "A later tree-shaking backend should remove them physically."
+            "policy_sensitive_capability_ids": ["tool:infinite_model_artifact"],
+            "policy_sensitive_capability_note": (
+                "The v1 legacy packed source includes an infinite-model artifact "
+                "adapter. It is activated only for audited finite-true/general-false "
+                "semantic cases, blocks finite-table search, and still relies on the "
+                "official Lean judge as the trust boundary."
             ),
             "required_top_level_names": sorted(self.required_top_level_names),
         }

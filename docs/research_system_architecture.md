@@ -145,17 +145,18 @@ The v1 compiler treats `baby_solver.py` as one legacy packed source unit. It:
 - requires the competition entry definitions and a literal top-level `PROMPT`;
 - emits a directory containing exactly one regular `solver.py`;
 - validates Python syntax and the 500,000-byte limit;
-- records input/output hashes, capability IDs, and the research-only policy;
-- keeps the research infinite-model action disabled in the default competition
-  entry path.
+- records input/output hashes, capability IDs, and policy-sensitive capability
+  metadata;
+- keeps the infinite-model action available only through the audited semantic
+  lane that blocks finite-table search first.
 
 The first build was 333,482 bytes and passed an official proxy/judge protocol
 smoke with zero LLM calls and one accepted Lean call.
 
 This v1 compiler does not yet tree-shake definitions from the packed legacy
-source. Its manifest states that research-only definitions are physically
-present but disabled. The next compiler backend should inline individually
-marked competition-safe units and remove unreachable research code.
+source. Its manifest records policy-sensitive definitions explicitly. The next
+compiler backend should inline individually marked competition-safe units and
+remove unreachable experimental code.
 
 ## Contract checks
 
