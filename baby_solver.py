@@ -558,6 +558,15 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": ["square_chain", "sandwich_chain", "square_witness_chain"],
         "description": "Prove/use square_const, right_id_square, sandwich, and left_sandwich helpers.",
     },
+    "helper_chain_portfolio": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collab_protocol",
+        "aliases": ["standard_helper_chains", "helper_portfolio", "chain_portfolio"],
+        "description": "Try a small portfolio of reusable helper lemma chains through the generic midpoint-chain consumer.",
+    },
     "rowconst_certificates": {
         "domain": "true",
         "scope": "whole_goal",
@@ -805,6 +814,7 @@ def semantic_status_state(semantic_context: dict[str, Any]) -> dict[str, Any]:
 CAPABILITY_DEPENDENCIES: dict[str, list[str]] = {
     "lemma_hint": ["primitive:generic_midpoint_prover"],
     "lemma_chain": ["primitive:generic_midpoint_prover"],
+    "helper_chain_portfolio": ["primitive:generic_midpoint_prover"],
     "goal_superposition": ["primitive:proof_carrying_superposition"],
     "standard_aux_superposition": ["primitive:proof_carrying_superposition"],
     "false_model_search": ["primitive:finite_model_search"],
@@ -6598,6 +6608,174 @@ def helper_kind(eq_text: str) -> str | None:
     return None
 
 
+STANDARD_HELPER_CHAIN_SPECS: list[dict[str, Any]] = [
+    {
+        "name": "generic_right_square_absorption",
+        "trigger": "repeated_self_absorption",
+        "budget_floor": 12.0,
+        "lemmas": [
+            ("square_absorb", "u ◇ (v ◇ v) = v"),
+            ("right_square", "u ◇ v = v ◇ v"),
+        ],
+        "why": (
+            "A repeated self-absorption H can sometimes first prove "
+            "`u ◇ (v ◇ v) = v`, then use it to prove `u ◇ v = v ◇ v`, "
+            "and only then consume the pair toward a goal."
+        ),
+    },
+]
+
+
+def helper_chain_trigger_flags(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    if repeated_self_absorption_h(h_eq, g_eq):
+        flags.append("repeated_self_absorption")
+    if special_right_square_h(h_eq):
+        flags.append("focused_right_square_shape")
+    if square_sandwich_h(h_eq):
+        flags.append("focused_square_sandwich_shape")
+    return flags
+
+
+def selected_helper_chain_specs(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    call = call or {}
+    requested_raw = call.get("chains") or call.get("chain") or call.get("families") or call.get("family")
+    requested: set[str] = set()
+    if isinstance(requested_raw, str):
+        requested = {part.strip() for part in requested_raw.split(",") if part.strip()}
+    elif isinstance(requested_raw, list):
+        requested = {str(part).strip() for part in requested_raw if str(part).strip()}
+    flags = helper_chain_trigger_flags(h_eq, g_eq)
+    specs: list[dict[str, Any]] = []
+    for spec in STANDARD_HELPER_CHAIN_SPECS:
+        if requested and spec["name"] not in requested:
+            continue
+        if spec.get("trigger") in flags or requested:
+            specs.append(spec)
+    return specs, flags
+
+
+def helper_chain_hints(spec: dict[str, Any]) -> list[UniversalEquation]:
+    hints = []
+    for name, equation in spec.get("lemmas", []):
+        hints.append(UniversalEquation(name=name, eq=parse_equation(equation), extra_args=[]))
+    return hints
+
+
+def helper_chain_portfolio_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+    *,
+    budget: float | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Try reusable helper chains through the generic midpoint consumer.
+
+    This is a protocol-visible wrapper, not a separate proof engine: every
+    helper is still proved from H and then consumed by the ordinary midpoint
+    stitcher.  The wrapper only decides which canonical helper-chain shapes are
+    worth trying for the current H/G.
+    """
+    call = call or {}
+    specs, flags = selected_helper_chain_specs(h_eq, g_eq, call)
+    total_budget = float(budget if budget is not None else call.get("budget") or call.get("time_budget") or 12.0)
+    deadline = time.monotonic() + max(1.0, total_budget)
+    attempts: list[dict[str, Any]] = []
+
+    if not specs:
+        return None, {
+            "protocol_version": PROTOCOL_VERSION,
+            "kind": "helper_chain_portfolio_state",
+            "status": "not_applicable",
+            "trigger_flags": flags,
+            "available_chains": [spec["name"] for spec in STANDARD_HELPER_CHAIN_SPECS],
+            "need_hint": "No standard helper-chain trigger fired; use lemma_chain with a problem-specific midpoint, goal_superposition, or false_model_search.",
+        }
+
+    for index, spec in enumerate(specs):
+        rem = deadline - time.monotonic()
+        if rem <= 0.5:
+            attempts.append({
+                "chain": spec["name"],
+                "status": "skipped_budget_exhausted",
+                "lemmas": [equation for _name, equation in spec.get("lemmas", [])],
+            })
+            continue
+
+        hints = helper_chain_hints(spec)
+        refuted = []
+        for hint in hints:
+            refutation = hint_refutation(h_eq, hint.eq)
+            if refutation is not None:
+                refuted.append({
+                    "name": hint.name,
+                    "equation": hint.eq["text"],
+                    "refutation": refutation,
+                })
+        if refuted:
+            attempts.append({
+                "chain": spec["name"],
+                "status": "refuted_by_small_model",
+                "lemmas": [{"name": hint.name, "equation": hint.eq["text"]} for hint in hints],
+                "refuted_lemmas": refuted,
+            })
+            continue
+
+        remaining_specs = max(1, len(specs) - index)
+        attempt_budget = min(rem, max(float(spec.get("budget_floor", 8.0)), rem / remaining_specs))
+        body, state = generic_midpoint_chain_attempt(
+            h_eq,
+            g_eq,
+            hints,
+            total_budget=attempt_budget,
+        )
+        attempts.append({
+            "chain": spec["name"],
+            "status": "body_built" if body else state.get("status", "stuck"),
+            "why": spec.get("why"),
+            "budget": round(attempt_budget, 3),
+            "lemmas": [{"name": hint.name, "equation": hint.eq["text"]} for hint in hints],
+            "chain_state": state,
+        })
+        if body:
+            return body, {
+                "protocol_version": PROTOCOL_VERSION,
+                "kind": "helper_chain_portfolio_state",
+                "status": "body_built",
+                "trigger_flags": flags,
+                "winning_chain": spec["name"],
+                "proved_lemmas": state.get("proved_lemmas", []),
+                "attempts": attempts,
+            }
+
+    need_hint: Any = None
+    for attempt in attempts:
+        chain_state = attempt.get("chain_state")
+        if isinstance(chain_state, dict) and chain_state.get("need_hint"):
+            need_hint = chain_state.get("need_hint")
+            break
+    return None, {
+        "protocol_version": PROTOCOL_VERSION,
+        "kind": "helper_chain_portfolio_state",
+        "status": "stuck",
+        "trigger_flags": flags,
+        "attempts": attempts,
+        "need_hint": need_hint or {
+            "kind": "helper_chain_repair",
+            "reason": "Standard helper chains were plausible but did not close; propose a problem-specific lemma_chain using the closest proof/consume feedback.",
+        },
+    }
+
+
+def helper_chain_portfolio_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
+    body, _state = helper_chain_portfolio_attempt(h_eq, g_eq, budget=12.0)
+    return body
+
+
 def run_tool_call_detailed(
     call: dict[str, Any],
     h_eq: dict[str, Any],
@@ -6684,6 +6862,19 @@ def run_tool_call_detailed(
             "square_sandwich_chain",
             tool=tool,
             need_hint=None if body else "Square-sandwich renderer did not match; try lemma_chain with square_const/right_id/sandwich helpers.",
+        )
+    if tool == "helper_chain_portfolio":
+        body, state = helper_chain_portfolio_attempt(
+            h_eq,
+            g_eq,
+            call,
+            budget=float(call.get("budget") or call.get("time_budget") or 12.0),
+        )
+        state = state or {}
+        return body, protocolize_state(
+            state,
+            "helper_chain_portfolio",
+            status="proved" if body else state.get("status", "stuck"),
         )
     if tool == "rowconst_certificates":
         body = rowconst_body(h_eq, g_eq)
@@ -6793,6 +6984,7 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
     advice.append("Broad true-side consumer available: goal_superposition runs bounded proof-carrying paramodulation and reports a frontier if it gets stuck.")
     advice.append("Broad grounding certificates available: broad_grounding_derived tries to derive collapse or factor-irrelevance helpers and then close G.")
     advice.append("Standard auxiliary consumer available: standard_aux_superposition tries const/projection/rowconst lemmas as explicit proved helpers.")
+    advice.append("Helper-chain portfolio available: helper_chain_portfolio tries a small set of reusable lemma chains through the generic midpoint stitcher and reports proved-but-not-consumed chains.")
     if goal_generalization_actions(h_eq, g_eq):
         advice.append("Goal-generalization cards are active: G appears to be a special case of a stronger reusable law, so try proving the reusable law first.")
     one_sided = one_sided_variables(h_eq)
@@ -6867,6 +7059,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"right_square_chain","target":"goal","budget":15}',
         "or the generic helper chain:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
+        "If H has repeated self-absorption but does not match a focused renderer, try the standard helper-chain portfolio:",
+        '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["generic_right_square_absorption"],"budget":12}',
         "If H has square-witness/sandwich shape, use:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}',
         "If H has square-rowconst grounding shape, use:",
@@ -6942,6 +7136,8 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
             {"name": "square_absorb", "equation": "u ◇ (v ◇ v) = v"},
             {"name": "right_square", "equation": "u ◇ v = v ◇ v"},
         ]}})
+    if repeated_self_absorption_h(h_eq, g_eq):
+        ranked.append({"tool": "helper_chain_portfolio", "score": 93, "why": "H has repeated self-absorption; try reusable helper chains through the generic midpoint consumer and use their proved/not-consumed feedback.", "call": {"kind": "tool_call", "tool": "helper_chain_portfolio", "target": "goal", "chains": ["generic_right_square_absorption"], "budget": 12}})
     if square_sandwich_h(h_eq):
         ranked.append({"tool": "lemma_chain", "score": 98, "why": "H has the square-witness/sandwich shape; use the four-helper chain.", "call": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [
             {"name": "square_const", "equation": "u ◇ u = v ◇ v"},
@@ -7853,6 +8049,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     semantic_context = implication_semantics(problem)
     semantic_state = semantic_status_state(semantic_context)
     false_failure_feedback: list[dict[str, Any]] = []
+    early_true_feedback: list[dict[str, Any]] = []
 
     # The executable judge can express an infinite Type-level model, and the
     # protocol has an explicit whole-artifact adapter.  An Austin implication is
@@ -7958,6 +8155,32 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             if result.get("status") == "accepted":
                 return "accepted_true_broad_grounding_derived"
 
+    if repeated_self_absorption_h(h_eq, g_eq):
+        remaining = max(0.0, budget - (time.monotonic() - solve_started))
+        if remaining >= 10.0:
+            chain_budget = min(14.0, remaining, max(12.0, remaining * 0.02))
+            chain_body, chain_state = helper_chain_portfolio_attempt(
+                h_eq,
+                g_eq,
+                {"chains": ["generic_right_square_absorption"], "budget": chain_budget},
+                budget=chain_budget,
+            )
+            if chain_body:
+                result = judge_true_attributed(
+                    "native:true:helper_chain_portfolio_early",
+                    chain_body,
+                    source="native_early_true_tool",
+                    detail={
+                        "family": "helper_chain_portfolio",
+                        "winning_chain": chain_state.get("winning_chain") if isinstance(chain_state, dict) else None,
+                        "proved_lemmas": chain_state.get("proved_lemmas") if isinstance(chain_state, dict) else None,
+                    },
+                )
+                if result.get("status") == "accepted":
+                    return "accepted_true_helper_chain_portfolio"
+            elif isinstance(chain_state, dict):
+                early_true_feedback.append(chain_state)
+
     # Focused trusted true tools.
     for route, body in proof_candidates_with_sources(h_eq, g_eq):
         if try_true_attributed(f"native:true:{route}", body, source="native_true_tool"):
@@ -7968,7 +8191,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         "status": "direct_mechanical_routes_available_for_feedback",
         "search_state": graph_search_state(h_eq, g_eq, status="direct_goal_not_connected"),
         "need_hint": "Use frontier/closest_pairs to propose a bridge midpoint, or choose the top ranked trusted tool.",
-    }]
+    }, *early_true_feedback[-2:]]
 
     if repeated_self_absorption_h(h_eq, g_eq):
         remaining = max(0.0, budget - (time.monotonic() - solve_started))

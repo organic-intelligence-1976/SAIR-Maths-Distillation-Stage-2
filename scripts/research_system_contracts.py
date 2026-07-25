@@ -58,6 +58,7 @@ def main() -> int:
             "deep_saturation",
             "standard_aux_superposition",
             "goal_superposition",
+            "helper_chain_portfolio",
             "false_model_search",
         )
     )
@@ -139,6 +140,20 @@ def main() -> int:
         and proj_r_body is not None
         and proj_r_state.get("used_aux") == "proj_r"
         and proj_r_state.get("attempts", [{}])[0].get("kind") == "proj_r"
+    )
+    chain_h = baby_solver.parse_equation("x = (y ◇ (x ◇ x)) ◇ (z ◇ x)")
+    chain_g = baby_solver.parse_equation("x = y ◇ (((x ◇ z) ◇ z) ◇ x)")
+    chain_body, chain_state = baby_solver.helper_chain_portfolio_attempt(
+        chain_h,
+        chain_g,
+        {"chains": ["generic_right_square_absorption"], "budget": 12},
+        budget=12,
+    )
+    checks["helper_chain_portfolio_hard3_0204"] = (
+        chain_body is not None
+        and chain_state.get("winning_chain") == "generic_right_square_absorption"
+        and [row.get("name") for row in chain_state.get("proved_lemmas", [])]
+        == ["square_absorb", "right_square"]
     )
     problem = ProblemSpec(
         id="contract",

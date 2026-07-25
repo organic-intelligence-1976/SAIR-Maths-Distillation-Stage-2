@@ -98,10 +98,26 @@ non-overlap superposition before the more explosive variable-overlap fallback.
 The protocol state reports `implied_aux`, per-helper budgets, and whether a
 failed helper was budget-starved.
 
-One recommendation group remains open:
+## Follow-up: Helper Chain Portfolio
 
-- `hard3_0204` / `hard3_0210`: midpoint-chain candidates. A repeated
-  self-absorption strategy card and early true-side LLM checkpoint were added,
-  with midpoint-chain mechanical work capped in that pass. A live trace showed
-  the checkpoint is reached promptly, but no new accepted proof has been
-  established yet.
+The next recommendation group was the midpoint-chain/cascade family around
+`hard3_0204` / `hard3_0210`. The solver now exposes
+`helper_chain_portfolio`, a protocol-visible wrapper around the generic
+midpoint-chain consumer. It tries reusable helper chains only when structural
+triggers fire, and preserves the ordinary proof obligation: each helper is
+proved from H before the goal is proved from H plus the helpers.
+
+Focused results:
+
+| Problem | Chain | Compiled solver result |
+|---|---|---|
+| `hard3_0204` | `square_absorb`; `right_square` | true, 2 judge calls, 0 LLM calls, 17.03s |
+| `hard3_0205` | `square_absorb` | true, 1 judge call, 0 LLM calls, 7.48s |
+
+The remaining row in this small group is still open:
+
+- `hard3_0210`: the same right-square helper-chain candidate is not refuted,
+  but under a 12-15s chain budget it does not prove the first helper
+  `u ◇ (v ◇ v) = v`. The structured failure reports a superposition subgoal
+  with the closest derived equation `(v0 ◇ (v1 ◇ v0)) = v0`; this is now useful
+  feedback for a future LLM-proposed intermediate chain.

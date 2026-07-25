@@ -74,6 +74,11 @@ The 2026-07-24 import pass added a sandbox-legal `sympy_sat` route, native
 continuations. The public evidence note is
 `evidence/native_import_2026_07_24.md`.
 
+The follow-up helper-chain portfolio pass added a protocol-visible
+`helper_chain_portfolio` route over the generic midpoint stitcher. It closes
+`hard3_0204` and `hard3_0205` through proved reusable helper chains, while
+`hard3_0210` remains a structured feedback frontier rather than a silent miss.
+
 Focused official-proxy validation solved `hard1_0009`, `hard3_0058`,
 `hard3_0278`, `hard3_0279`, `hard1_0013`, `hard1_0034`, `hard1_0046`, and
 `hard1_0054` with zero LLM calls. A later standard-aux focus pass also solved
