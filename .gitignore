@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .artifacts/
+official-stage2
 official-stage2/
 sidecar_runs/
 .venv/

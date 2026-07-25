@@ -538,7 +538,7 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "feedback_quality": "rich",
         "native_import": "collaborative",
         "aliases": ["saturation", "h_graph", "hargs"],
-        "description": "Generate h-instantiations from goal/seed terms and try the equality graph/calc renderer.",
+        "description": "Generate h-instantiations by bounded forward saturation and hand them to Lean/grind.",
     },
     "right_square_chain": {
         "domain": "true",
@@ -1004,6 +1004,12 @@ def term_variables(t: Term) -> list[str]:
     if t[0] == "var":
         return [t[1]]
     return unique(term_variables(t[1]) + term_variables(t[2]))
+
+
+def term_var_count(t: Term, var: str) -> int:
+    if t[0] == "var":
+        return 1 if t[1] == var else 0
+    return term_var_count(t[1], var) + term_var_count(t[2], var)
 
 
 def one_sided_variables(eq: dict[str, Any]) -> list[str]:
@@ -3553,6 +3559,26 @@ def strategy_cards(
             "trigger": item["reason"],
             "recommended_action": item["action"],
         })
+    if repeated_self_absorption_h(h_eq, g_eq):
+        cards.append({
+            "name": "self_absorption_midpoint_chain",
+            "principle": (
+                "When H rewrites a variable to a term containing repeated copies "
+                "of the same variable, a multi-rung absorption chain is often "
+                "better than one large direct midpoint."
+            ),
+            "trigger": "H has x = T with x repeated inside T, and G asks for x = compound.",
+            "recommended_action": {
+                "kind": "tool_call",
+                "tool": "lemma_chain",
+                "target": "goal",
+                "lemmas": [
+                    {"name": "absorb_step", "equation": "<small absorption/contraction equation near a closest_pair>"},
+                    {"name": "goal_bridge", "equation": "<second bridge that consumes the first helper toward G>"},
+                ],
+                "why": "Use SearchState closest_pairs to fill the placeholders; the mechanical side will prove each rung before using it.",
+            },
+        })
     cards.extend([
         {
             "name": "prefer_reusable_over_goal_specific",
@@ -3738,7 +3764,7 @@ def native_saturation_combos(
     pool = sorted(
         set(subterms(g_eq["lhs"]) + subterms(g_eq["rhs"])),
         key=lambda term: (term_size(term), term_key(term)),
-    )[:max(1, pool_cap)]
+    )
     rows: list[tuple[Term, ...]] = []
     seen_rows: set[tuple[Term, ...]] = set()
 
@@ -3748,20 +3774,23 @@ def native_saturation_combos(
             rows.append(row)
 
     for _round in range(max(1, depth)):
+        new_terms: set[Term] = set()
+        round_rows: list[tuple[Term, ...]] = []
         current = list(pool)
         for position in range(min(max(1, slots), len(h_vars))):
             for term in current:
                 row = [pad for _ in h_vars]
                 row[position] = term
-                add_row(tuple(row))
-        for diagonal in current:
-            add_row(tuple(diagonal for _ in h_vars))
+                round_rows.append(tuple(row))
+        round_rows.append(tuple(pad for _ in h_vars))
 
-        new_terms = set(current)
-        for row in rows:
+        for row in round_rows:
+            if row in seen_rows:
+                continue
+            add_row(row)
             subst = dict(zip(h_vars, row))
             new_terms.update(subterms(instantiate_term(h_eq["rhs"], subst)))
-        pool = sorted(new_terms, key=lambda term: (term_size(term), term_key(term)))[:max(1, pool_cap)]
+        pool = sorted(set(pool) | new_terms, key=lambda term: (term_size(term), term_key(term)))[:max(1, pool_cap)]
     return rows
 
 
@@ -4892,6 +4921,22 @@ def self_root_absorption_h(h_eq: dict[str, Any]) -> bool:
     """Detect H shapes like x = x ◇ T or x = T ◇ x."""
     for lone, other in ((h_eq["lhs"], h_eq["rhs"]), (h_eq["rhs"], h_eq["lhs"])):
         if lone[0] == "var" and other[0] == "op" and (other[1] == lone or other[2] == lone):
+            return True
+    return False
+
+
+def repeated_self_absorption_h(h_eq: dict[str, Any], g_eq: dict[str, Any] | None = None) -> bool:
+    """Detect absorption-like H where a lone variable recurs inside the other side."""
+    for lone, other in ((h_eq["lhs"], h_eq["rhs"]), (h_eq["rhs"], h_eq["lhs"])):
+        if lone[0] != "var" or other[0] != "op":
+            continue
+        var = str(lone[1])
+        if term_var_count(other, var) < 2:
+            continue
+        if g_eq is None:
+            return True
+        goal_pairs = ((g_eq["lhs"], g_eq["rhs"]), (g_eq["rhs"], g_eq["lhs"]))
+        if any(side[0] == "var" and side[1] == var and other_side[0] == "op" for side, other_side in goal_pairs):
             return True
     return False
 
@@ -6398,6 +6443,25 @@ def proof_battery_graph_body(h_eq: dict[str, Any], g_eq: dict[str, Any], max_lay
     }
 
 
+def old_haves_grind_bodies(h_eq: dict[str, Any], g_eq: dict[str, Any]):
+    """Yield staged HAVE+GRIND bodies from the generic h-instantiation pool.
+
+    The 24-row body was the original cheap fallback.  A focused gap probe on
+    held-out rows found that the same generator needs a slightly deeper
+    prefix for some cases: `hard2_0021` closes at 48 generated instances and
+    `hard3_0193` closes at 64.  Keep the stages separate so Lean can accept a
+    cheap prefix before buying the larger grind context.
+    """
+    intro = "intro " + " ".join(g_eq["variables"]) if g_eq["variables"] else ""
+    for limit in (24, 48, 64):
+        haves = []
+        rows = candidate_h_args(h_eq, g_eq, limit)
+        for i, args in enumerate(rows, start=1):
+            haves.append(f"have h{i} := h " + " ".join(map(lean_arg, args)))
+        if intro and haves:
+            yield f"old_haves_grind_{len(rows)}", "\n".join([intro, *haves, "grind"])
+
+
 def proof_candidates_with_sources(h_eq: dict[str, Any], g_eq: dict[str, Any]):
     if g_eq["lhs"] == g_eq["rhs"]:
         yield "rfl_goal", "intro " + " ".join(g_eq["variables"]) + "\nrfl"
@@ -6419,12 +6483,8 @@ def proof_candidates_with_sources(h_eq: dict[str, Any], g_eq: dict[str, Any]):
         body = h_graph_body(h_eq, g_eq, cfg[0], congruence_cap=cfg[1])
         if body:
             yield f"h_graph_limit_{cfg[0]}_cong_{cfg[1]}", body
-    intro = "intro " + " ".join(g_eq["variables"]) if g_eq["variables"] else ""
-    haves = []
-    for i, args in enumerate(candidate_h_args(h_eq, g_eq, 24), start=1):
-        haves.append(f"have h{i} := h " + " ".join(map(lean_arg, args)))
-    if intro and haves:
-        yield "old_haves_grind", "\n".join([intro, *haves, "grind"])
+    yield from native_saturation_bodies(h_eq, g_eq)
+    yield from old_haves_grind_bodies(h_eq, g_eq)
 
 
 def proof_candidates(h_eq: dict[str, Any], g_eq: dict[str, Any]):
@@ -6491,21 +6551,16 @@ def run_tool_call_detailed(
     if gate_state is not None:
         return None, gate_state
     if tool == "forward_saturation":
-        seed_terms = [normalize(str(t)) for t in call.get("seed_terms", []) if isinstance(t, str)]
-        body = h_graph_body(
-            h_eq,
-            g_eq,
-            limit=80,
-            congruence_cap=1200,
-            extra_terms=seed_terms[:12],
+        bodies = list(native_saturation_bodies(h_eq, g_eq))
+        body = bodies[-1][1] if bodies else None
+        return body, protocol_state(
+            "MechanicalResponse",
+            "body_built" if body else "not_applicable",
+            "forward_saturation",
+            tool=tool,
+            candidate_count=len(bodies),
+            need_hint=None if body else "No bounded saturation body was generated; try goal_superposition or a midpoint.",
         )
-        state = graph_search_state(
-            h_eq,
-            g_eq,
-            status="proved" if body else "stuck",
-            extra_terms=seed_terms[:12],
-        )
-        return body, protocolize_state(state, "forward_saturation", status="proved" if body else "stuck")
     if tool == "right_square_chain":
         body = right_square_chain_body(h_eq, g_eq)
         return body, protocol_state(
@@ -6641,6 +6696,8 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         advice.append("H has a lone-variable side; collapse_certificates may derive a carrier-collapse witness and close the whole goal.")
     if self_root_absorption_h(h_eq):
         advice.append("H has self-root absorption form x = x ◇ T or x = T ◇ x; broad_grounding_derived gets a stronger helper-derivation budget.")
+    if repeated_self_absorption_h(h_eq, g_eq):
+        advice.append("H has repeated self-absorption form x = T[x,x,...] and G is x = compound; prefer an early true-side midpoint/lemma_chain before expensive false search.")
     if special_right_square_h(h_eq):
         advice.append("H matches right_square_chain: try helpers u ◇ (v ◇ v)=v and u ◇ v=v ◇ v.")
     if square_sandwich_h(h_eq):
@@ -6730,6 +6787,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         "Projection warning: a proved closest-pair midpoint can still be too goal-specific; if projection-shaped feedback is visible, prefer the reusable projection pair.",
         "If feedback says a projection aux was proved but not consumed, ask standard_aux_superposition for the opposite projection too:",
         '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["proj_l","proj_r"],"budget":10}',
+        "If H has repeated self-absorption form x = T[x,x,...], use a short concrete lemma_chain of absorption/contraction bridges instead of repeating the whole goal as one midpoint:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"absorb_step","equation":"<fill from closest_pairs>"},{"name":"goal_bridge","equation":"<fill from the remaining gap>"}]}',
         "Repair example: for right-square absorption, do not stop after one helper; use the two-lemma chain:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
         "Repair example: for square-sandwich hypotheses, square_const/right_id alone may be proved_not_consumed; add sandwich helpers:",
@@ -6919,6 +6978,26 @@ def is_hint_payload(data: dict[str, Any]) -> bool:
         or data.get("kind") in {"midpoint", "midpoint_chain", "lemma_hint", "lemma_chain"}
         or any(key in data for key in ("lemma", "lemmas", "midpoint", "midpoints"))
     )
+
+
+def cap_hint_payload_budget(data: dict[str, Any], cap: float | None) -> dict[str, Any]:
+    if cap is None:
+        return data
+    cap_value = max(1.0, float(cap))
+    out = dict(data)
+    for key in ("budget", "time_budget"):
+        if key in out:
+            out[key] = min(_finite_float(out.get(key), cap_value), cap_value)
+    if "budget" not in out and "time_budget" not in out:
+        out["budget"] = cap_value
+    raw_policy = out.get("budget_policy")
+    policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
+    policy["total_budget"] = min(_finite_float(policy.get("total_budget", policy.get("total")), cap_value), cap_value)
+    policy["max_grant"] = min(_finite_float(policy.get("max_grant"), min(4.0, cap_value)), cap_value)
+    policy["initial_grant"] = min(_finite_float(policy.get("initial_grant", policy.get("minimum_grant")), 2.0), policy["max_grant"])
+    policy["max_grants_per_task"] = min(_clamped_int(policy.get("max_grants_per_task"), 2, 1, 8), 3)
+    out["budget_policy"] = policy
+    return out
 
 
 def generic_projection_hint_kind(eq: dict[str, Any]) -> str | None:
@@ -7356,6 +7435,7 @@ def should_try_collaboration_first(h_eq: dict[str, Any], g_eq: dict[str, Any]) -
         special_right_square_h(h_eq)
         or square_sandwich_h(h_eq)
         or rowconst_h(h_eq)
+        or repeated_self_absorption_h(h_eq, g_eq)
         or goal_generalization_actions(h_eq, g_eq)
     )
 
@@ -7373,6 +7453,7 @@ def try_llm_collaboration(
     semantic_context: dict[str, Any] | None = None,
     capability_mask: Any = None,
     allow_infinite_model_artifacts: bool = False,
+    hint_budget_cap: float | None = None,
 ) -> str | None:
     mechanical_feedback: list[dict[str, Any]] = list(initial_feedback or [])
     finite_search_allowed = finite_countermodel_search_allowed(semantic_context)
@@ -7582,6 +7663,7 @@ def try_llm_collaboration(
         candidate_route = "llm:goal_proof"
         candidate_source = "llm_direct_artifact"
         if is_hint_payload(data):
+            data = cap_hint_payload_budget(data, hint_budget_cap)
             sig = compact_tool_signature(data)
             if sig in failed_signatures:
                 mechanical_feedback.append(protocol_state(
@@ -7768,6 +7850,31 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         "search_state": graph_search_state(h_eq, g_eq, status="direct_goal_not_connected"),
         "need_hint": "Use frontier/closest_pairs to propose a bridge midpoint, or choose the top ranked trusted tool.",
     }]
+
+    if repeated_self_absorption_h(h_eq, g_eq):
+        remaining = max(0.0, budget - (time.monotonic() - solve_started))
+        if remaining >= 8.0:
+            early_llm_budget = min(30.0, remaining)
+            hint_budget_cap = min(12.0, max(6.0, remaining * 0.08))
+            status = try_llm_collaboration(
+                h_eq,
+                g_eq,
+                early_llm_budget,
+                max_rounds=2,
+                collaboration_goal=(
+                    "Early true-side pass for repeated self-absorption. "
+                    "Native direct proof and bounded forward saturation did not close. "
+                    "Propose a concrete midpoint or short lemma_chain of absorption/"
+                    "contraction bridges; do not return placeholder equations or the "
+                    "target goal itself as a midpoint. Any midpoint-chain mechanical "
+                    f"budget is capped at about {hint_budget_cap:.1f}s in this pass."
+                ),
+                initial_feedback=initial_feedback,
+                semantic_context=semantic_context,
+                hint_budget_cap=hint_budget_cap,
+            )
+            if status:
+                return status
 
     # Stronger bounded false search. Give the goal-directed v2 finder a
     # dedicated slice before mixing it with stochastic routes; it can need a

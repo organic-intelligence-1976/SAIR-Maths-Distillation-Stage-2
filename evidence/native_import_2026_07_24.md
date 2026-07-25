@@ -52,3 +52,36 @@ close may run too long. The automatic solver therefore keeps the safe split
 budget by default. The next principled improvement is an explicit final closer
 for broad grounding-derived helpers, or a pre-judge risk filter that avoids
 submitting expensive `grind` closes.
+
+## Follow-up: Forward Saturation Battery
+
+A later focused pass found that the native saturation code existed but did not
+match the proven forward-saturation instance generator: it added too many
+diagonal rows and could truncate away the useful generated instances. The solver
+now uses the bounded feed-forward generator in the early true-candidate stream,
+before the older flat HAVE+GRIND fallback.
+
+Direct judge checks of the generated saturation bodies:
+
+| Problem | First accepted route | Result |
+|---|---|---|
+| `hard2_0021` | `deep_saturation:d=2:slots=1:haves=10` | accepted |
+| `hard3_0193` | `deep_saturation:d=3:slots=2:haves=37` | accepted |
+| `hard3_0196` | `deep_saturation:d=2:slots=1:haves=13` | accepted |
+| `hard3_0307` | `deep_saturation:d=3:slots=3:haves=46` | accepted |
+
+The compiled submission also returned `verdict=true` for all four rows through
+the official proxy with zero LLM calls. This is a native mechanical import, not
+a load-bearing LLM win.
+
+Two other recommendation groups remain open:
+
+- `hard2_0178` / `hard3_0271`: derived-helper target selection/final-consumer
+  gap. `hard2_0178` quickly derives a valid helper, but the first helper is not
+  sufficient for the goal; `hard3_0271` does not hit a helper inside the older
+  limits.
+- `hard3_0204` / `hard3_0210`: midpoint-chain candidates. A repeated
+  self-absorption strategy card and early true-side LLM checkpoint were added,
+  with midpoint-chain mechanical work capped in that pass. A live trace showed
+  the checkpoint is reached promptly, but no new accepted proof has been
+  established yet.
