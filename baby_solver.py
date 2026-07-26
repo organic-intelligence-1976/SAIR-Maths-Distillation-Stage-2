@@ -4951,6 +4951,35 @@ def repeated_self_absorption_h(h_eq: dict[str, Any], g_eq: dict[str, Any] | None
     return False
 
 
+def nested_tail_absorption_h(h_eq: dict[str, Any], g_eq: dict[str, Any] | None = None) -> bool:
+    """Detect H like x = (y ◇ (z ◇ x)) ◇ (w ◇ x).
+
+    This family naturally proves `u ◇ (v ◇ u) = u`, then a broad tail
+    contraction `((u ◇ v) ◇ v) ◇ (w ◇ t) = t`.
+    """
+    for lone, other in ((h_eq["lhs"], h_eq["rhs"]), (h_eq["rhs"], h_eq["lhs"])):
+        if lone[0] != "var" or other[0] != "op":
+            continue
+        left, right = other[1], other[2]
+        if left[0] != "op" or right[0] != "op":
+            continue
+        left_tail = left[2]
+        if left_tail[0] != "op":
+            continue
+        if left_tail[2] != lone or right[2] != lone:
+            continue
+        if left_tail[1] == lone:
+            # This is the square-inner subfamily handled cheaply by the
+            # generic_right_square_absorption chain.
+            continue
+        if g_eq is None:
+            return True
+        goal_pairs = ((g_eq["lhs"], g_eq["rhs"]), (g_eq["rhs"], g_eq["lhs"]))
+        if any(side == lone and other_side[0] == "op" for side, other_side in goal_pairs):
+            return True
+    return False
+
+
 def broad_grounding_derived_body(
     h_eq: dict[str, Any],
     g_eq: dict[str, Any],
@@ -6610,6 +6639,25 @@ def helper_kind(eq_text: str) -> str | None:
 
 STANDARD_HELPER_CHAIN_SPECS: list[dict[str, Any]] = [
     {
+        "name": "nested_tail_absorption",
+        "trigger": "nested_tail_absorption",
+        "budget_floor": 32.0,
+        "budget_policy": {
+            "initial_grant": 3.0,
+            "max_grant": 15.0,
+            "max_grants_per_task": 4,
+        },
+        "lemmas": [
+            ("nested_absorb", "u ◇ (v ◇ u) = u"),
+            ("tail_any", "((u ◇ v) ◇ v) ◇ (w ◇ t) = t"),
+        ],
+        "why": (
+            "For H of the form x = (y ◇ (z ◇ x)) ◇ (w ◇ x), first prove "
+            "`u ◇ (v ◇ u) = u`; with that helper, prove the broad tail law "
+            "`((u ◇ v) ◇ v) ◇ (w ◇ t) = t`, which directly instantiates the goal."
+        ),
+    },
+    {
         "name": "generic_right_square_absorption",
         "trigger": "repeated_self_absorption",
         "budget_floor": 12.0,
@@ -6628,6 +6676,8 @@ STANDARD_HELPER_CHAIN_SPECS: list[dict[str, Any]] = [
 
 def helper_chain_trigger_flags(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> list[str]:
     flags: list[str] = []
+    if nested_tail_absorption_h(h_eq, g_eq):
+        flags.append("nested_tail_absorption")
     if repeated_self_absorption_h(h_eq, g_eq):
         flags.append("repeated_self_absorption")
     if special_right_square_h(h_eq):
@@ -6727,10 +6777,13 @@ def helper_chain_portfolio_attempt(
 
         remaining_specs = max(1, len(specs) - index)
         attempt_budget = min(rem, max(float(spec.get("budget_floor", 8.0)), rem / remaining_specs))
+        raw_policy = dict(spec.get("budget_policy") or {})
+        raw_policy["total_budget"] = attempt_budget
         body, state = generic_midpoint_chain_attempt(
             h_eq,
             g_eq,
             hints,
+            budget_policy=raw_policy,
             total_budget=attempt_budget,
         )
         attempts.append({
@@ -6996,6 +7049,8 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         advice.append("H has self-root absorption form x = x ◇ T or x = T ◇ x; broad_grounding_derived gets a stronger helper-derivation budget.")
     if repeated_self_absorption_h(h_eq, g_eq):
         advice.append("H has repeated self-absorption form x = T[x,x,...] and G is x = compound; prefer an early true-side midpoint/lemma_chain before expensive false search.")
+    if nested_tail_absorption_h(h_eq, g_eq):
+        advice.append("H has nested-tail absorption form x = (y ◇ (z ◇ x)) ◇ (w ◇ x); try nested_absorb then the broad tail_any contraction helper.")
     if special_right_square_h(h_eq):
         advice.append("H matches right_square_chain: try helpers u ◇ (v ◇ v)=v and u ◇ v=v ◇ v.")
     if square_sandwich_h(h_eq):
@@ -7061,6 +7116,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
         "If H has repeated self-absorption but does not match a focused renderer, try the standard helper-chain portfolio:",
         '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["generic_right_square_absorption"],"budget":12}',
+        "If H has nested-tail absorption x = (y ◇ (z ◇ x)) ◇ (w ◇ x), use:",
+        '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["nested_tail_absorption"],"budget":36}',
         "If H has square-witness/sandwich shape, use:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}',
         "If H has square-rowconst grounding shape, use:",
@@ -7138,6 +7195,8 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
         ]}})
     if repeated_self_absorption_h(h_eq, g_eq):
         ranked.append({"tool": "helper_chain_portfolio", "score": 93, "why": "H has repeated self-absorption; try reusable helper chains through the generic midpoint consumer and use their proved/not-consumed feedback.", "call": {"kind": "tool_call", "tool": "helper_chain_portfolio", "target": "goal", "chains": ["generic_right_square_absorption"], "budget": 12}})
+    if nested_tail_absorption_h(h_eq, g_eq):
+        ranked.append({"tool": "helper_chain_portfolio", "score": 97, "why": "H has nested-tail absorption; prove nested_absorb, then the broad tail_any contraction law and instantiate it to G.", "call": {"kind": "tool_call", "tool": "helper_chain_portfolio", "target": "goal", "chains": ["nested_tail_absorption"], "budget": 36}})
     if square_sandwich_h(h_eq):
         ranked.append({"tool": "lemma_chain", "score": 98, "why": "H has the square-witness/sandwich shape; use the four-helper chain.", "call": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [
             {"name": "square_const", "equation": "u ◇ u = v ◇ v"},
@@ -8158,11 +8217,21 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     if repeated_self_absorption_h(h_eq, g_eq):
         remaining = max(0.0, budget - (time.monotonic() - solve_started))
         if remaining >= 10.0:
-            chain_budget = min(14.0, remaining, max(12.0, remaining * 0.02))
+            nested_tail_shape = nested_tail_absorption_h(h_eq, g_eq)
+            chain_budget = (
+                min(40.0, remaining, max(36.0, remaining * 0.04))
+                if nested_tail_shape
+                else min(14.0, remaining, max(12.0, remaining * 0.02))
+            )
+            chain_names = (
+                ["nested_tail_absorption"]
+                if nested_tail_shape
+                else ["generic_right_square_absorption"]
+            )
             chain_body, chain_state = helper_chain_portfolio_attempt(
                 h_eq,
                 g_eq,
-                {"chains": ["generic_right_square_absorption"], "budget": chain_budget},
+                {"chains": chain_names, "budget": chain_budget},
                 budget=chain_budget,
             )
             if chain_body:

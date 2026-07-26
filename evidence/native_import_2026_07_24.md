@@ -113,11 +113,12 @@ Focused results:
 |---|---|---|
 | `hard3_0204` | `square_absorb`; `right_square` | true, 2 judge calls, 0 LLM calls, 17.03s |
 | `hard3_0205` | `square_absorb` | true, 1 judge call, 0 LLM calls, 7.48s |
+| `hard3_0210` | `nested_absorb`; `tail_any` | true, 2 judge calls, 0 LLM calls, 25.67s |
 
-The remaining row in this small group is still open:
-
-- `hard3_0210`: the same right-square helper-chain candidate is not refuted,
-  but under a 12-15s chain budget it does not prove the first helper
-  `u ◇ (v ◇ v) = v`. The structured failure reports a superposition subgoal
-  with the closest derived equation `(v0 ◇ (v1 ◇ v0)) = v0`; this is now useful
-  feedback for a future LLM-proposed intermediate chain.
+The natural `hard3_0210` route is a good example of why the protocol should
+allow the helper chain itself to change after mechanical feedback. The earlier
+right-square candidate stalled on `u ◇ (v ◇ v) = v`, while the failed
+superposition state exposed the closer absorption shape
+`u ◇ (v ◇ u) = u`. The accepted chain first proves that nested absorption
+lemma, then proves the broad tail contraction
+`((u ◇ v) ◇ v) ◇ (w ◇ t) = t`, whose goal instance closes the problem.

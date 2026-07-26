@@ -156,6 +156,20 @@ def main() -> int:
         and [row.get("name") for row in chain_state.get("proved_lemmas", [])]
         == ["square_absorb", "right_square"]
     )
+    nested_chain_h = baby_solver.parse_equation("x = (y ◇ (z ◇ x)) ◇ (w ◇ x)")
+    nested_chain_g = baby_solver.parse_equation("x = ((x ◇ y) ◇ y) ◇ (y ◇ x)")
+    nested_body, nested_state = baby_solver.helper_chain_portfolio_attempt(
+        nested_chain_h,
+        nested_chain_g,
+        {"chains": ["nested_tail_absorption"], "budget": 36},
+        budget=36,
+    )
+    checks["helper_chain_portfolio_hard3_0210"] = (
+        nested_body is not None
+        and nested_state.get("winning_chain") == "nested_tail_absorption"
+        and [row.get("name") for row in nested_state.get("proved_lemmas", [])]
+        == ["nested_absorb", "tail_any"]
+    )
     problem = ProblemSpec(
         id="contract",
         eq1_id=1167,
