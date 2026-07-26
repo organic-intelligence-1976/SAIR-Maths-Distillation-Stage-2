@@ -55,6 +55,10 @@ The most useful orientation documents are:
 - `research_system/`: modular curriculum, planning, obligation, verification,
   experience, and distillation components.
 - `scripts/run_research_episode.py`: run scripted or live-LLM research episodes.
+- `scripts/teacher_student_search.py`: run resumable mechanically ranked
+  teacher search and ordinary-student attribution.
+- `scripts/structured_infinite_model_probe.py`: assemble and judge a typed
+  infinite countermodel plan.
 - `scripts/research_system_contracts.py`: fast contract and regression checks.
 - `scripts/compile_submission.py`: compile the current system into a single
   competition-compatible `solver.py`.

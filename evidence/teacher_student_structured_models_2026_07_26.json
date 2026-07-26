@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-26",
+  "scope": "Curated derivative of local teacher-search reports; provider credentials and raw transcripts are excluded.",
+  "finite_symbolic_search": {
+    "case_id": "hard2_0093",
+    "outcome": "teacher_unsolved",
+    "claim": "The bounded teacher search produced mechanically measured near-model progress, but no countermodel and no promoted lesson.",
+    "exact_size_probe": [
+      {
+        "carrier_size": 2,
+        "status": "exhausted_no_countermodel",
+        "nodes": 15
+      },
+      {
+        "carrier_size": 3,
+        "status": "exhausted_no_countermodel",
+        "nodes": 190
+      },
+      {
+        "carrier_size": 4,
+        "status": "exhausted_no_countermodel",
+        "nodes": 8657
+      },
+      {
+        "carrier_size": 5,
+        "status": "exhausted_no_countermodel",
+        "nodes": 1111936
+      }
+    ],
+    "minimum_unexcluded_carrier_size": 6,
+    "teacher_unique_actions": 63,
+    "policy_rejections_below_lower_bound": 4,
+    "best_size_6_goal_breaking_near_model": {
+      "hypothesis_failures": 9,
+      "hypothesis_assignments_checked": 36,
+      "goal_was_broken": true
+    },
+    "next_platform_hypothesis": "Use mechanically assisted multiobjective table fitting or a richer symbolic family; do not spend another identical conversational beam on this case."
+  },
+  "structured_infinite_model": {
+    "case_id": "reference_austin_3994_3588",
+    "equation1": "x \u25c7 y = (z \u25c7 (x \u25c7 y)) \u25c7 z",
+    "equation2": "x \u25c7 y = z \u25c7 ((x \u25c7 y) \u25c7 z)",
+    "expected_verdict": false,
+    "fixture": "data/semantics/austin_3994_3588_infinite_model_plan.json",
+    "assembled_artifact_bytes": 865,
+    "reference_assembly": {
+      "official_research_judge_accepted": true,
+      "verdict": "false",
+      "seconds": 16.993
+    },
+    "repair_experiment": {
+      "injected_fault": "Nat.xor_comm_typo",
+      "initial_judge_error_code": "LEAN_REJECTED",
+      "initial_judge_feedback": "Unknown constant Nat.xor_comm_typo, followed by the remaining unsolved equality.",
+      "teacher_model": "openai/gpt-oss-120b",
+      "teacher_result": "Replaced only the rejected hypothesis proof while preserving the carrier, operation, setup, and counterexample proof.",
+      "minimized_action_count": 1,
+      "minimized_action_sha256": "547783819106c533a51e8b6c0e0c039e71e94915ff5c478dc360925a8df1e904",
+      "mechanical_replay_accepted": true
+    },
+    "ordinary_student_attribution": {
+      "student_model": "openai/gpt-oss-120b",
+      "student_round_budget": 2,
+      "no_lesson_accepted": false,
+      "no_lesson_attempts": 2,
+      "with_verified_lesson_accepted": true,
+      "with_lesson_attempts": 1,
+      "with_lesson_action_equal_to_minimized_action": true,
+      "official_research_judge_accepted": true,
+      "judge_seconds": 6.602,
+      "load_bearing": true
+    },
+    "caveat": "This is exact-case teacher-to-student distillation and replay. It is not evidence of transfer to a different implication or discovery of the original infinite model from scratch."
+  }
+}

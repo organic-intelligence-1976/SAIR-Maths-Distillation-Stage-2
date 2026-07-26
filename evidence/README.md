@@ -16,6 +16,11 @@ consumption result, and Lean judge outcome.
   attributed to an LLM-selected hint or tool call.
 - `case_study_hard3_0231_true.md`: end-to-end true-side helper-chain case.
 - `case_study_hard1_0009_false.md`: end-to-end false-side route-selection case.
+- `case_study_structured_infinite_repair.md`: structured infinite-model
+  assembly, exact Lean repair feedback, and load-bearing teacher-to-student
+  replay.
+- `teacher_student_structured_models_2026_07_26.json`: machine-readable finite
+  teacher-search stop result and structured infinite-model attribution summary.
 - `cases/*.json`: machine-readable versions of the case studies.
 - `lean/*.lean`: Lean certificates accepted by the official Stage 2 judge for
   the showcased cases.

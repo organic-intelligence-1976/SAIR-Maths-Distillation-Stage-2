@@ -47,6 +47,31 @@ class FunctionPlanner:
         return self.function(context)
 
 
+class ContextAugmentingPlanner:
+    """Add research-only context without changing the wrapped planner contract."""
+
+    def __init__(
+        self,
+        planner: Planner,
+        additions: dict[str, Any],
+        *,
+        name: str | None = None,
+    ):
+        self.planner = planner
+        self.additions = deepcopy(additions)
+        self.name = name or f"context:{planner.name}"
+
+    @property
+    def last_trace(self) -> dict[str, Any] | None:
+        trace = getattr(self.planner, "last_trace", None)
+        return deepcopy(trace) if isinstance(trace, dict) else None
+
+    def next_action(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        augmented = deepcopy(context)
+        augmented.update(deepcopy(self.additions))
+        return self.planner.next_action(augmented)
+
+
 class RetrievedLessonPlanner:
     """Deterministic baseline that replays only missing nodes from the best lesson.
 
@@ -158,6 +183,9 @@ class OpenAICompatiblePlanner:
             "obligation_graph": context.get("obligation_graph"),
             "recent_observations": context.get("recent_observations"),
             "retrieved_verified_artifacts": context.get("retrieved_artifacts") or [],
+            "mechanical_diagnostics": context.get("mechanical_diagnostics") or {},
+            "teacher_search": context.get("teacher_search") or {},
+            "teacher_lesson": context.get("teacher_lesson"),
         }
         return "\n".join([
             "You are the untrusted System-2 planner in a mechanically verified equational prover.",
@@ -171,6 +199,12 @@ class OpenAICompatiblePlanner:
             "A blocked exact node may be reopened only with reopen_novelty describing a materially new construction, invariant, representation, or proof mechanism.",
             "Do not call an unavailable tool. Prefer a reusable universal helper over restating the goal with its variables.",
             "Closest-pair equations are diagnostics, not commands: generalize their recurring algebraic shape before proposing a helper.",
+            "During teacher search, use the proposal slot and avoided-action list to explore a genuinely different mathematical family, not a renamed duplicate.",
+            "Obey teacher_search.directive exactly; it defines which action language this experiment is evaluating.",
+            "When teacher_search.parent_action is present, return a complete repaired replacement for that exact action unless the feedback justifies changing family or carrier.",
+            "Never use a carrier below mechanical_diagnostics.minimum_unexcluded_carrier_size; those sizes were exhaustively eliminated by the mechanical side.",
+            "A teacher lesson is verified experience, not a trusted target proof. Adapt its decisive action to the current state; the mechanical side will check it again.",
+            "For an exact-problem student replay, preserve a complete verified decisive action verbatim on the first attempt, including all mutually referenced Lean identifiers. Improvise only after mechanical feedback rejects that replay.",
             "When several genuinely different mechanisms are plausible, use one proof_plan with family-labeled nodes. Dependencies are AND prerequisites; alternative_group marks OR routes.",
             "Allowed JSON shapes include:",
             '{"kind":"proof_plan","nodes":[{"id":"collapse","equation":"a ◇ b = c ◇ d","family_id":"operation_collapse","mechanism":"derive global product collapse","alternative_group":"root_bridge","depends_on":[],"advances":"root"},{"id":"projection","equation":"a ◇ b = a","family_id":"projection","mechanism":"derive a projection law","alternative_group":"root_bridge","depends_on":[],"advances":"root"}]}',
@@ -179,7 +213,10 @@ class OpenAICompatiblePlanner:
             '{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8}',
             '{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["model_finder_v2:n=6"],"budget":8}',
             '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}',
+            'false_model_family conditions: diagonal, off_diagonal, same_mod, different_mod, left_residue, right_residue, or {"kind":"cell","i":0,"j":1}; string conditions may use i, j, n and bounded arithmetic/comparisons.',
             '{"kind":"false_table","counterexample_table":[[0,1],[1,0]]}',
+            '{"kind":"infinite_model_plan","model_name":"model","imports":["Mathlib.Tactic"],"carrier":"ℕ","operation":"fun x y ↦ ...","setup":["have helper : ... := by\\n  ..."],"hypothesis_proof":"intro x y z\\n...","counterexample_proof":"simp only [not_forall]\\nuse ...\\n..."}',
+            '{"kind":"infinite_model_patch","set":{"hypothesis_proof":"<complete repaired tactic body>"}}',
             "Angle-bracket text above is schema notation only; replace it with actual mathematics.",
             "Return exactly one JSON object and no markdown.",
             json.dumps(compact, ensure_ascii=False, sort_keys=True),

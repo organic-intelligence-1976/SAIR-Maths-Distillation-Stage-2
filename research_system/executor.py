@@ -8,6 +8,11 @@ from typing import Any
 import baby_solver
 
 from .protocol import ExecutionResult, ProblemSpec, SemanticRecord
+from .infinite_models import (
+    assemble_infinite_model_plan,
+    is_infinite_model_patch,
+    is_infinite_model_plan,
+)
 
 
 class MechanicalExecutor:
@@ -25,7 +30,64 @@ class MechanicalExecutor:
 
     @staticmethod
     def normalize(action: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if is_infinite_model_plan(action) or is_infinite_model_patch(action):
+            return dict(action), None
         return baby_solver.normalize_llm_action(action)
+
+    @staticmethod
+    def planner_diagnostics(
+        problem: ProblemSpec,
+        *,
+        semantics: SemanticRecord | None = None,
+        max_carrier: int = 4,
+    ) -> dict[str, Any]:
+        """Expose cheap machine-computed clues without trusting a verdict."""
+        h_eq = baby_solver.parse_equation(problem.equation1)
+        g_eq = baby_solver.parse_equation(problem.equation2)
+        semantic_context = semantics.to_mapping() if semantics is not None else None
+        finite_allowed = (
+            baby_solver.finite_countermodel_search_allowed(semantic_context)
+            if semantic_context
+            else True
+        )
+        diagnostics: dict[str, Any] = {
+            "symbolic_invariant_report": baby_solver.symbolic_invariant_report(h_eq, g_eq),
+            "finite_countermodel_search_allowed": finite_allowed,
+        }
+        if not finite_allowed:
+            return diagnostics
+
+        size_probe = []
+        excluded_prefix = 1
+        probe_budgets = {2: 0.8, 3: 0.35, 4: 0.45, 5: 30.0}
+        for n in range(2, max(2, min(5, int(max_carrier))) + 1):
+            budget = probe_budgets[n]
+            status, table, meta = baby_solver.propagation_model_finder(
+                h_eq,
+                g_eq,
+                n,
+                time_budget=budget,
+                node_cap=8_000_000 if n >= 5 else 1_000_000,
+            )
+            if table is not None:
+                public_status = "countermodel_found"
+            elif status == "none":
+                public_status = "exhausted_no_countermodel"
+                if n == excluded_prefix + 1:
+                    excluded_prefix = n
+            else:
+                public_status = "unknown_budget"
+            size_probe.append({
+                "carrier_size": n,
+                "status": public_status,
+                "nodes": meta.get("nodes"),
+                "forced_assignments": meta.get("forced_assignments"),
+                "contradictions": meta.get("contradictions"),
+            })
+        diagnostics["finite_size_probe"] = size_probe
+        if excluded_prefix >= 2:
+            diagnostics["minimum_unexcluded_carrier_size"] = excluded_prefix + 1
+        return diagnostics
 
     def execute(
         self,
@@ -58,6 +120,39 @@ class MechanicalExecutor:
             normalized = dict(normalized)
             normalized["budget_policy"] = dict(self.budget_policy)
         semantic_context = semantics.to_mapping() if semantics is not None else None
+
+        if is_infinite_model_plan(normalized):
+            code, state = assemble_infinite_model_plan(normalized)
+            return ExecutionResult(
+                status="candidate_ready" if code else (
+                    "artifact_rejected"
+                    if state.get("status") == "invalid_plan"
+                    else "mechanical_stuck"
+                ),
+                normalized_action=normalized,
+                submitted_action=normalized,
+                infinite_code=code,
+                state=state,
+                adapter_state=adapter_state,
+                seconds=time.monotonic() - started,
+            )
+
+        if is_infinite_model_patch(normalized):
+            return ExecutionResult(
+                status="mechanical_stuck",
+                normalized_action=normalized,
+                submitted_action=normalized,
+                state={
+                    "kind": "InfiniteModelPlanState",
+                    "status": "patch_without_parent",
+                    "need_hint": (
+                        "Apply this patch to a prior infinite_model_plan or return "
+                        "a complete infinite_model_plan."
+                    ),
+                },
+                adapter_state=adapter_state,
+                seconds=time.monotonic() - started,
+            )
 
         if baby_solver.is_infinite_model_payload(normalized):
             code, state = baby_solver.validate_infinite_model_payload(normalized)

@@ -126,10 +126,13 @@ submission readiness is the higher-return move.
 6. Improve false-side continuation policy: when feedback lists
    `untried_requested_routes`, prefer one concrete route or focused repair under
    the same fixed budget before trying broad larger-carrier model finding.
-7. Explore symbolic/piecewise counterexample families only in a sidecar. The
-   first sparse-patch experiment did not produce a witness, but it identified a
-   cleaner LLM task: propose structured finite-model families that System 1 can
-   verify and, if successful, render into Lean.
+7. Add a mechanically assisted multiobjective repair operator for finite
+   symbolic near-models. The `hard2_0093` teacher now reaches goal-breaking
+   size-6 tables with 9/36 H failures, but more conversational repair alone
+   reached its stop condition.
+8. Test whether the verified structured infinite-model repair lesson transfers
+   to a different known construction. Exact-case teacher-to-student replay is
+   now load-bearing; held-out transfer is the next evidence boundary.
 
 ## Current Item Strengths
 
@@ -144,6 +147,8 @@ submission readiness is the higher-return move.
 | False-side route-feedback uptake | B+ | Live model follows recommended routes; `hard1_0009`, `hard2_0016`, and hard-focus `hard2_0093` have accepted continuation/countermodel evidence. Harder misses move to the next-frontier queue. |
 | False-side load-bearing LLM solves in runner attribution | B+ | `.artifacts/collab_false_llm_checkpoint_smoke_summary.json` attributes three false accepts (`hard1_0009`, `hard2_0016`, `hard2_0093`) to `llm:false_model_search`, and `.artifacts/llm_contribution_audit_2026_07_16_v2.md` records 3 false plus 8 true load-bearing LLM accepts in the selected audit set. The key protocol fix was respecting fresh untried LLM routes instead of replacing them with a mechanically preferred card unless stale/empty. |
 | Symbolic/piecewise false-model families | Working C+ | `false_model_family` is now a production tool rather than a sidecar-only DSL: it validates compact affine/projection/residue/piecewise schemas, expands them, checks H universally, requires a concrete G failure, returns repair classes plus hot-cell examples, and emits an ordinary Lean-checked finite certificate. The no-builtins live control `evaluation_order5_0005` initially failed when the LLM invented three elaborate families; after adding machine-computed Stage-1 strict invariant cards, the same model returned right projection first and the official Lean judge accepted the size-2 countermodel. A two-round `hard2_0093` probe produced one H-valid-but-sterile affine family and several G-breaking/H-failing near misses but no solution. Committed evidence: `evidence/symbolic_model_family_2026_07_26.json`. Raise this only after a nontrivial held-out symbolic-family solve or verified repair trajectory. |
+| Bounded teacher search and student replay | Working B | The research harness now runs concurrent mechanically ranked beams, preserves parent actions and exact failures, resumes from checkpoints, minimizes accepted trajectories, and promotes only mechanically replayed, counterfactually load-bearing lessons. The finite `hard2_0093` run remained unsolved after 63 unique actions, correctly producing no lesson. The structured infinite-model experiment produced a verified exact-case lesson: the ordinary model failed twice without it and passed in one round with it. Evidence: `evidence/teacher_student_structured_models_2026_07_26.json`. Raise to B+ after one held-out transfer or a finite residual teacher discovery becomes an attributed ordinary-budget solve. |
+| Structured infinite-model plans | Working B | A typed five-part plan now separates carrier, operation, setup, H proof, and G counterexample proof. The mechanical assembler accepted the known E3994 -> E3588 `ℕ` model under the official research profile. After an injected theorem-name failure, live `gpt-oss-120b` repaired the rejected H proof from Lean diagnostics while preserving the other parts; minimization replay and lesson-aware student replay both passed. Evidence: `evidence/case_study_structured_infinite_repair.md`. This proves repair/replay, not model discovery. Next require transfer to another construction, then operation-family proposal. |
 
 Stop-loss override for the false-side rows above: any older note that points to
 `hard2_0027` `cp_sat:n=8` as the next action is superseded by

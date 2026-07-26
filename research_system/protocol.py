@@ -135,5 +135,31 @@ class EpisodeRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     protocol_version: str = RESEARCH_PROTOCOL_VERSION
 
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> "EpisodeRecord":
+        return cls(
+            episode_id=str(data["episode_id"]),
+            case_id=str(data["case_id"]),
+            problem=dict(data.get("problem") or {}),
+            semantics=dict(data.get("semantics") or {}),
+            capability_mask=dict(data.get("capability_mask") or {}),
+            planner=str(data.get("planner") or "unknown"),
+            split_label=str(data.get("split_label") or "development"),
+            started_at=str(data.get("started_at") or ""),
+            attempts=list(data.get("attempts") or []),
+            blackboard=dict(data.get("blackboard") or {}),
+            obligations=dict(data.get("obligations") or {}),
+            verification=(
+                dict(data["verification"])
+                if isinstance(data.get("verification"), dict)
+                else None
+            ),
+            accepted=bool(data.get("accepted")),
+            outcome=str(data.get("outcome") or "running"),
+            seconds=float(data.get("seconds") or 0.0),
+            metadata=dict(data.get("metadata") or {}),
+            protocol_version=str(data.get("protocol_version") or RESEARCH_PROTOCOL_VERSION),
+        )
+
     def to_mapping(self) -> dict[str, Any]:
         return asdict(self)

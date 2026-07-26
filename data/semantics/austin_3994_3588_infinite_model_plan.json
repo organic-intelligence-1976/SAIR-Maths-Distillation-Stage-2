@@ -1,0 +1,16 @@
+{
+  "kind": "infinite_model_plan",
+  "version": "sair-infinite-model-plan-v1",
+  "model_name": "magN",
+  "imports": [
+    "Mathlib.Data.Nat.Bitwise",
+    "Mathlib.Tactic"
+  ],
+  "carrier": "ℕ",
+  "operation": "fun x y ↦ if Even x ∧ Even y then x ^^^ y else if Even y then y + 2 else if Even x then x - 2 else 0",
+  "setup": [
+    "have range : ∀ x y : ℕ, Even (x ◇ y : ℕ) := by\n  intro x y\n  unfold magN\n  simp\n  split_ifs\n  · simp_all\n  · simpa [Nat.even_add]\n  · by_cases x < 2\n    · rw [Nat.sub_eq_zero_of_le]\n      simp\n      omega\n    rw [Nat.even_sub]\n    · simp_all\n    · omega\n  · exact .zero"
+  ],
+  "hypothesis_proof": "intro x y z\ngeneralize h : x ◇ y = v\nhave : Even v := by rw [← h]; apply range\nunfold magN\nby_cases hz : Even z\n· simp [this, hz, Nat.xor_comm]\n· simp [hz, this, Nat.even_add]",
+  "counterexample_proof": "simp only [not_forall]\nuse 1, 1, 1\nunfold magN\nsimp"
+}

@@ -1550,6 +1550,7 @@ def symbolic_family_rule_value(rule: dict[str, Any], i: int, j: int, n: int) -> 
 def normalize_symbolic_family_payload(data: dict[str, Any]) -> dict[str, Any]:
     source = data.get("family") if isinstance(data.get("family"), dict) else data
     out = dict(source)
+    schema_repairs: list[dict[str, Any]] = []
     operation = out.get("operation")
     if isinstance(operation, dict) and any(key in operation for key in ("default", "rules", "patches")):
         if "default" not in out and "default" in operation:
@@ -1562,6 +1563,65 @@ def normalize_symbolic_family_payload(data: dict[str, Any]) -> dict[str, Any]:
         out["default"] = operation
     if "n" in out and "carrier_size" not in out:
         out["carrier_size"] = out.get("n")
+    raw_rules = out.get("rules")
+    normalized_rules: list[Any] = []
+    for index, raw_rule in enumerate(raw_rules if isinstance(raw_rules, list) else []):
+        if not isinstance(raw_rule, dict):
+            normalized_rules.append(raw_rule)
+            continue
+        rule = dict(raw_rule)
+        condition_key = next(
+            (key for key in ("when", "if", "condition") if key in rule),
+            "when",
+        )
+        condition = rule.get(condition_key)
+        if isinstance(condition, dict):
+            fixed = dict(condition)
+            kind = str(fixed.get("kind") or "").strip().lower()
+            if kind in {"diagonal", "diag"} and (
+                "i" in fixed or "j" in fixed or "value" in fixed
+            ):
+                diagonal_value = fixed.get("i", fixed.get("j", fixed.get("value", 0)))
+                fixed = {
+                    "kind": "cell",
+                    "i": diagonal_value,
+                    "j": diagonal_value,
+                }
+            elif kind in {"pair", "exact_pair", "point"}:
+                if "left" in fixed and "right" in fixed:
+                    fixed = {
+                        "kind": "cell",
+                        "i": fixed.get("left"),
+                        "j": fixed.get("right"),
+                    }
+            elif not kind and "left" in fixed and "right" in fixed:
+                fixed = {
+                    "kind": "cell",
+                    "i": fixed.get("left"),
+                    "j": fixed.get("right"),
+                }
+            elif not kind and "i" in fixed and "j" in fixed:
+                fixed["kind"] = "cell"
+            elif kind in {"left_eq", "left_value", "row"}:
+                value = fixed.get("value", fixed.get("left", fixed.get("i", 0)))
+                fixed = f"i == {int(value)}"
+            elif kind in {"right_eq", "right_value", "column"}:
+                value = fixed.get("value", fixed.get("right", fixed.get("j", 0)))
+                fixed = f"j == {int(value)}"
+            if fixed != condition:
+                schema_repairs.append({
+                    "rule_index": index,
+                    "field": condition_key,
+                    "from": condition,
+                    "to": fixed,
+                    "reason": "canonicalized_unambiguous_condition_alias",
+                })
+                rule[condition_key] = fixed
+        normalized_rules.append(rule)
+    if isinstance(raw_rules, list):
+        out["rules"] = normalized_rules
+    if schema_repairs:
+        out["_schema_repairs"] = schema_repairs
     return out
 
 
@@ -1616,6 +1676,7 @@ def table_from_symbolic_family(data: dict[str, Any]) -> tuple[list[list[int]], d
         "rule_count": len(rules),
         "patch_count": len(patches),
         "rule_touched_cells": len(touched),
+        "schema_repairs": list(family.get("_schema_repairs") or []),
     }
 
 
@@ -1732,6 +1793,14 @@ def false_model_family_attempt(
             "H holds universally, but G also holds. Add a coherent residue, block, "
             "diagonal, or affine-region change that breaks the displayed goal assignment "
             "without disturbing H."
+        )
+    elif h_profile["complete"] and h_profile["failures_observed"] > 0:
+        status = "h_violated_goal_unbroken"
+        repair_class = "repair_h_and_break_g"
+        need_hint = (
+            "This family violates H and does not yet break G. Prefer a different coherent "
+            "family or carrier unless one small repair can both remove the displayed H "
+            "violations and create a concrete G-breaking assignment."
         )
     elif not h_profile["complete"]:
         status = "h_check_incomplete"

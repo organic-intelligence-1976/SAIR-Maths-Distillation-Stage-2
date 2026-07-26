@@ -76,6 +76,11 @@ def compact_mechanical_feedback(
         "tried_routes",
         "attempts",
         "budget_allocation",
+        "repair_class",
+        "family_summary",
+        "h_profile",
+        "g_profile",
+        "errors",
     ):
         if source.get(key) not in (None, [], {}):
             feedback[key] = _bounded(source[key])
@@ -125,7 +130,14 @@ def compact_mechanical_feedback(
     if verification is not None:
         feedback["verification"] = _bounded({
             key: verification.get(key)
-            for key in ("status", "accepted", "verdict", "message", "error_code")
+            for key in (
+                "status",
+                "accepted",
+                "verdict",
+                "message",
+                "error_code",
+                "details",
+            )
             if verification.get(key) is not None
         })
     return feedback
@@ -194,6 +206,8 @@ class ResearchEpisodeRunner:
         planner: Planner,
         *,
         resume_from: dict[str, Any] | None = None,
+        persist: bool = True,
+        distill: bool = True,
     ) -> tuple[EpisodeRecord, StrategyArtifact | None]:
         started = time.monotonic()
         semantic = self.semantics.classify(case.problem)
@@ -441,9 +455,13 @@ class ResearchEpisodeRunner:
             if isinstance(row, dict)
         ]
         episode.seconds = round(time.monotonic() - started, 3)
-        if self.store is not None:
+        if persist and self.store is not None:
             self.store.append_episode(episode)
-        artifact = self.distiller.distill(episode, last_execution) if self.distiller else None
-        if artifact is not None and self.store is not None:
+        artifact = (
+            self.distiller.distill(episode, last_execution)
+            if distill and self.distiller
+            else None
+        )
+        if artifact is not None and persist and self.store is not None:
             self.store.append_artifact(artifact)
         return episode, artifact

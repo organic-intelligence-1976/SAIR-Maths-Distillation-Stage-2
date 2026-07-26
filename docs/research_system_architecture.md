@@ -42,8 +42,10 @@ official Lean verifier accepts the final artifact.
 | Blackboard | `research_system/blackboard.py` | Immutable proved nodes and alpha-canonical small-model refutations |
 | Obligation graph | `research_system/obligations.py` | Approach families, executable dependencies, diverse alternatives, blocking, and novelty-gated reopening |
 | Planner | `research_system/planner.py` | Deterministic scripted planner, callable adapter, and live OpenAI-compatible planner |
+| Teacher search | `research_system/teacher.py` | Resumable mechanically ranked beams, trajectory minimization, and counterfactual ordinary-student replay |
 | Budget broker | `research_system/budget.py` | Renewable geometric worker leases, tunable policy genotypes, and reproducible mutation |
-| Executor | `research_system/executor.py` | True lemma/tool actions, finite tables/search, direct proofs, and infinite artifacts through `baby_solver.py` |
+| Executor | `research_system/executor.py` | True lemma/tool actions, finite tables/search, direct proofs, structured infinite plans, and legacy artifacts through `baby_solver.py` |
+| Infinite-model contract | `research_system/infinite_models.py` | Typed model parts, safe syntax normalization, field patches, and deterministic Lean assembly |
 | Verifier | `research_system/verifier.py` | Official Lean checks under competition or research declaration policy |
 | Curriculum | `research_system/curriculum.py` | True-dropout, finite-false, and infinite-false reference episodes |
 | Orchestrator | `research_system/orchestrator.py` | Multi-round propose/check/retain/refute/verify loop |
@@ -132,6 +134,37 @@ They also expose the next capability gap: System 2 follows local closest-pair
 diagnostics too literally and needs a curriculum/retrieval layer that teaches
 reusable abstraction from those diagnostics.
 
+## Teacher search and structured models
+
+The teacher harness explores several independent actions per state and ranks
+them only by mechanically observed progress:
+
+```bash
+python3 scripts/teacher_student_search.py \
+  --id hard2_0093 \
+  --focus finite_symbolic \
+  --beam-width 2 \
+  --proposals-per-branch 3
+```
+
+Reports contain a resumable beam checkpoint. Exact bounded propagation probes
+also prevent the LLM from proposing carriers already eliminated by the
+mechanical side.
+
+Structured infinite countermodels use a smaller repair surface than whole-file
+Lean generation:
+
+```bash
+python3 scripts/structured_infinite_model_probe.py
+python3 scripts/structured_infinite_repair_probe.py --student-replay
+```
+
+The first command assembles and verifies a known five-part `ℕ` model. The
+second injects a rejected proof component, lets a live planner repair it from
+Lean diagnostics, minimizes the accepted trajectory, and can run no-lesson and
+with-lesson student controls. Public results and caveats are in
+[`../evidence/case_study_structured_infinite_repair.md`](../evidence/case_study_structured_infinite_repair.md).
+
 ## Competition compilation
 
 Run:
@@ -169,8 +202,9 @@ python3 scripts/research_system_contracts.py
 The fast suite checks every component boundary, including semantic lookup,
 capability manifests, alpha-canonical blocking, planner exhaustion, reference
 lanes, stateful feedback, verified episode resume, candidate filtering,
-indexed feedback variables, experience persistence, promotion filtering, and
-single-file builds.
+indexed feedback variables, finite-family repair feedback, teacher beam resume,
+structured infinite-model assembly/repair, experience persistence, promotion
+filtering, and single-file builds.
 
 ## Next improvement frontier
 

@@ -18,11 +18,17 @@ from research_system.capabilities import CapabilityService  # noqa: E402
 from research_system.compiler import CompilationSpec, SubmissionCompiler  # noqa: E402
 from research_system.curriculum import CurriculumCase, reference_cases  # noqa: E402
 from research_system.distillation import VerifiedDistiller  # noqa: E402
+from research_system.executor import MechanicalExecutor  # noqa: E402
 from research_system.experience import ExperienceStore  # noqa: E402
 from research_system.integration import IntegrationCatalog  # noqa: E402
+from research_system.infinite_models import (  # noqa: E402
+    assemble_infinite_model_plan,
+    merge_infinite_model_patch,
+)
 from research_system.obligations import ObligationGraph, infer_approach_family  # noqa: E402
 from research_system.orchestrator import ResearchEpisodeRunner, compact_mechanical_feedback  # noqa: E402
 from research_system.planner import (  # noqa: E402
+    ContextAugmentingPlanner,
     FunctionPlanner,
     OpenAICompatiblePlanner,
     RetrievedLessonPlanner,
@@ -37,6 +43,10 @@ from research_system.protocol import (  # noqa: E402
 )
 from research_system.semantics import SemanticService  # noqa: E402
 from research_system.structure import dual_equation, problem_structure, structural_similarity  # noqa: E402
+from research_system.teacher import (  # noqa: E402
+    TeacherSearchConfig,
+    TeacherStudentSearch,
+)
 
 
 def main() -> int:
@@ -227,6 +237,41 @@ def main() -> int:
             "budget": 2,
         },
     )
+    invalid_rules_found, invalid_rules_state = baby_solver.false_model_family_attempt(
+        family_h,
+        family_g,
+        {
+            "kind": "false_model_family",
+            "carrier_size": 3,
+            "default": {"kind": "left"},
+            "rules": {"when": {"kind": "diagonal"}, "value": 0},
+            "budget": 2,
+        },
+    )
+    repaired_alias_found, repaired_alias_state = baby_solver.false_model_family_attempt(
+        family_h,
+        family_g,
+        {
+            "kind": "false_model_family",
+            "carrier_size": 2,
+            "default": {"kind": "left"},
+            "rules": [
+                {
+                    "when": {"kind": "pair", "left": 0, "right": 1},
+                    "value": 0,
+                },
+                {
+                    "when": {"kind": "left_eq", "value": 1},
+                    "value": "i",
+                },
+                {
+                    "when": {"kind": "diagonal", "i": 1},
+                    "value": 1,
+                },
+            ],
+            "budget": 2,
+        },
+    )
     family_gate = baby_solver.capability_gate_state(
         "false_model_family",
         {"disabled": ["primitive:symbolic_family_evaluator"]},
@@ -255,6 +300,12 @@ def main() -> int:
         and bool(near_state.get("g_profile", {}).get("examples"))
         and unsafe_found is None
         and unsafe_state.get("status") == "invalid_family"
+        and invalid_rules_found is None
+        and invalid_rules_state.get("status") == "invalid_family"
+        and repaired_alias_found is not None
+        and len(
+            repaired_alias_state.get("family_summary", {}).get("schema_repairs") or []
+        ) == 3
         and family_gate is not None
         and family_gate.get("status") == "withheld_for_curriculum"
     )
@@ -311,6 +362,67 @@ def main() -> int:
         and len(infinite_judges) == 2
         and "judge_rejected_infinite_model" in infinite_contexts[1].get("mechanical_feedback", "")
         and "10,000-byte artifact" in baby_solver.PROMPT
+    )
+    structured_fixture = json.loads(
+        (
+            ROOT
+            / "data"
+            / "semantics"
+            / "austin_3994_3588_infinite_model_plan.json"
+        ).read_text(encoding="utf-8")
+    )
+    structured_code, structured_state = assemble_infinite_model_plan(structured_fixture)
+    incomplete_code, incomplete_state = assemble_infinite_model_plan({
+        "kind": "infinite_model_plan",
+        "carrier": "ℕ",
+        "operation": "fun x y ↦ x",
+    })
+    patched_fixture = merge_infinite_model_patch(
+        structured_fixture,
+        {
+            "kind": "infinite_model_patch",
+            "set": {"hypothesis_proof": "intro x y z\nexact repaired_marker"},
+        },
+    )
+    noisy_fixture = dict(structured_fixture)
+    noisy_fixture["hypothesis_proof"] = (
+        "by\n"
+        "  intro x y z\n"
+        "  simp <;> omega"
+    )
+    noisy_code, noisy_state = assemble_infinite_model_plan(noisy_fixture)
+    singleton_fixture = dict(structured_fixture)
+    singleton_fixture["imports"] = "Mathlib.Tactic"
+    singleton_fixture["setup"] = structured_fixture["setup"][0]
+    singleton_code, singleton_state = assemble_infinite_model_plan(singleton_fixture)
+    checks["structured_infinite_model_assembly"] = (
+        structured_code is not None
+        and structured_state.get("status") == "candidate_ready"
+        and structured_state.get("part_count") == 5
+        and "let magN : Magma ℕ" in structured_code
+        and incomplete_code is None
+        and set(incomplete_state.get("missing_parts") or [])
+        == {"hypothesis_proof", "counterexample_proof"}
+        and patched_fixture.get("operation") == structured_fixture.get("operation")
+        and "repaired_marker" in patched_fixture.get("hypothesis_proof", "")
+        and noisy_code is not None
+        and {
+            row.get("repair")
+            for row in noisy_state.get("syntax_repairs") or []
+        }
+        == {
+            "removed_redundant_outer_by",
+            "dedented_following_tactics_by_2",
+        }
+        and singleton_code is not None
+        and {
+            row.get("repair")
+            for row in singleton_state.get("schema_repairs") or []
+        }
+        == {
+            "wrapped_single_import_as_list",
+            "wrapped_single_setup_fragment_as_list",
+        }
     )
 
     signature = canonical_equation_signature("x ◇ y = y ◇ y")
@@ -640,6 +752,321 @@ def main() -> int:
         and bool(live_contexts[1].get("capability_manifest"))
     )
 
+    class TeacherExecutor:
+        name = "fake_teacher_executor"
+
+        @staticmethod
+        def normalize(action: dict) -> tuple[dict, None]:
+            return action, None
+
+        @staticmethod
+        def planner_diagnostics(problem, *, semantics=None, max_carrier=4) -> dict:
+            del problem, semantics, max_carrier
+            return {
+                "symbolic_invariant_report": [{"family": "left_projection", "separates": True}],
+                "finite_countermodel_search_allowed": True,
+            }
+
+        def execute(self, problem, action, **kwargs) -> ExecutionResult:
+            del problem, kwargs
+            candidate = action.get("candidate_id")
+            if candidate == "winner":
+                return ExecutionResult(
+                    status="candidate_ready",
+                    submitted_action=action,
+                    finite_table=[[0, 0], [1, 1]],
+                    state={
+                        "kind": "FalseModelFamilyState",
+                        "status": "found",
+                        "repair_class": "verified_countermodel",
+                    },
+                )
+            return ExecutionResult(
+                status="mechanical_stuck",
+                submitted_action=action,
+                state={
+                    "kind": "FalseModelFamilyState",
+                    "status": "h_violated",
+                    "repair_class": "repair_h_preserve_g",
+                    "h_profile": {"failures_observed": 3},
+                    "g_profile": {"failures_observed": 1},
+                    "need_hint": "repair the three H-violating cells",
+                },
+            )
+
+    class TeacherVerifier:
+        def verify(self, problem, execution, *, profile="competition") -> VerificationRecord:
+            del problem, execution
+            return VerificationRecord(
+                status="accepted",
+                accepted=True,
+                verdict="false",
+                profile=profile,
+            )
+
+    teacher_case = CurriculumCase(
+        case_id="contract_teacher_student",
+        problem=ProblemSpec(
+            id="contract_teacher_student",
+            eq1_id=7,
+            eq2_id=8,
+            equation1="x ◇ y = x",
+            equation2="x ◇ y = y",
+            answer=False,
+        ),
+        actions=(),
+        expected_verdict="false",
+        max_rounds=1,
+    )
+    near_action = {
+        "kind": "false_model_family",
+        "candidate_id": "near",
+        "carrier_size": 2,
+        "default": {"kind": "constant", "params": [0]},
+    }
+    winning_action = {
+        "kind": "false_model_family",
+        "candidate_id": "winner",
+        "carrier_size": 2,
+        "default": {"kind": "left"},
+    }
+    teacher_runner = ResearchEpisodeRunner(
+        semantics=semantics,
+        executor=TeacherExecutor(),
+        verifier=TeacherVerifier(),
+    )
+    teacher_config = TeacherSearchConfig(
+        beam_width=1,
+        proposals_per_branch=2,
+        max_depth=1,
+        branch_rounds=1,
+        student_rounds=1,
+        exploration_fraction=0,
+    )
+
+    def student_factory(lesson):
+        return ScriptedPlanner(
+            [winning_action if lesson is not None else near_action],
+            name="contract_student",
+        )
+
+    teacher_report = TeacherStudentSearch(
+        teacher_runner,
+        ScriptedPlanner([near_action, winning_action], name="contract_teacher"),
+        config=teacher_config,
+        student_planner_factory=student_factory,
+    ).run(teacher_case)
+    checks["teacher_beam_mechanical_scoring"] = (
+        teacher_report.get("outcome") == "student_replay"
+        and teacher_report["teacher"]["generations"][0]["candidate_count"] == 2
+        and teacher_report["teacher"]["winner"]["action"].get("candidate_id") == "winner"
+        and teacher_report["mechanical_diagnostics"]["finite_countermodel_search_allowed"]
+    )
+    checks["teacher_student_load_bearing_promotion"] = (
+        teacher_report["student"]["load_bearing"] is True
+        and teacher_report["student"]["no_lesson"]["accepted"] is False
+        and teacher_report["student"]["with_lesson"]["accepted"] is True
+        and teacher_report["minimization"]["mechanical_replay_episode"]["accepted"] is True
+        and teacher_report["artifact"]["kind"] == "teacher_student_lesson"
+    )
+    unsolved_report = TeacherStudentSearch(
+        teacher_runner,
+        ScriptedPlanner([near_action], name="contract_teacher_unsolved"),
+        config=TeacherSearchConfig(
+            beam_width=1,
+            proposals_per_branch=1,
+            max_depth=1,
+            branch_rounds=1,
+            student_rounds=1,
+        ),
+    ).run(teacher_case)
+    checks["teacher_unsolved_outcome"] = (
+        unsolved_report.get("outcome") == "teacher_unsolved"
+        and unsolved_report.get("artifact") is None
+        and len(unsolved_report.get("resume_state", {}).get("beam") or []) == 1
+    )
+    resumed_teacher_contexts: list[dict] = []
+
+    def resumed_teacher_plan(context):
+        resumed_teacher_contexts.append(context)
+        return {**near_action, "candidate_id": "near_resumed"}
+
+    resumed_teacher_report = TeacherStudentSearch(
+        teacher_runner,
+        FunctionPlanner(resumed_teacher_plan, name="contract_resumed_teacher"),
+        config=TeacherSearchConfig(
+            beam_width=1,
+            proposals_per_branch=1,
+            max_depth=2,
+            branch_rounds=1,
+            student_rounds=1,
+            focus="finite_symbolic",
+        ),
+    ).run(teacher_case, resume_from=unsolved_report)
+    checks["teacher_beam_resume"] = (
+        resumed_teacher_report.get("outcome") == "teacher_unsolved"
+        and len(resumed_teacher_report["teacher"]["generations"]) == 2
+        and resumed_teacher_contexts[0]["teacher_search"]["depth"] == 2
+        and resumed_teacher_contexts[0]["teacher_search"]["parent_action"].get("candidate_id")
+        == "near"
+    )
+
+    def failing_student_factory(lesson):
+        del lesson
+        return ScriptedPlanner([near_action], name="contract_failing_student")
+
+    non_distillable_report = TeacherStudentSearch(
+        teacher_runner,
+        ScriptedPlanner([winning_action], name="contract_teacher_only"),
+        config=TeacherSearchConfig(
+            beam_width=1,
+            proposals_per_branch=1,
+            max_depth=1,
+            branch_rounds=1,
+            student_rounds=1,
+        ),
+        student_planner_factory=failing_student_factory,
+    ).run(teacher_case)
+    checks["teacher_solved_not_distillable_outcome"] = (
+        non_distillable_report.get("outcome") == "teacher_solved_not_distillable"
+        and non_distillable_report.get("artifact") is None
+    )
+    repair_contexts: list[dict] = []
+
+    def cumulative_repair_plan(context):
+        repair_contexts.append(context)
+        return {
+            **near_action,
+            "candidate_id": f"near_depth_{context['teacher_search']['depth']}",
+        }
+
+    TeacherStudentSearch(
+        teacher_runner,
+        FunctionPlanner(cumulative_repair_plan, name="contract_cumulative_repair"),
+        config=TeacherSearchConfig(
+            beam_width=1,
+            proposals_per_branch=1,
+            max_depth=2,
+            branch_rounds=1,
+            student_rounds=1,
+            focus="finite_symbolic",
+        ),
+    ).run(teacher_case)
+    checks["teacher_parent_action_feedback"] = (
+        len(repair_contexts) == 2
+        and repair_contexts[1]["teacher_search"]["parent_action"].get("candidate_id")
+        == "near_depth_1"
+        and repair_contexts[1]["recent_observations"][0].get("repair_class")
+        == "repair_h_preserve_g"
+        and repair_contexts[1]["recent_observations"][0]
+        .get("h_profile", {})
+        .get("failures_observed")
+        == 3
+    )
+
+    class InfiniteRepairVerifier:
+        def verify(self, problem, execution, *, profile="research") -> VerificationRecord:
+            del problem
+            repaired = bool(
+                execution.infinite_code
+                and "repaired_marker" in execution.infinite_code
+            )
+            return VerificationRecord(
+                status="accepted" if repaired else "incorrect",
+                accepted=repaired,
+                verdict="false",
+                profile=profile,
+                message=None if repaired else "structured proof failed",
+                error_code=None if repaired else "lean_elaboration_error",
+                details={
+                    "stderr": (
+                        ""
+                        if repaired
+                        else "unknown identifier first_attempt in hypothesis_proof"
+                    ),
+                },
+            )
+
+    infinite_repair_contexts: list[dict] = []
+    first_structured_plan = {
+        "kind": "infinite_model_plan",
+        "model_name": "model",
+        "carrier": "ℕ",
+        "operation": "fun x y ↦ x",
+        "setup": [],
+        "hypothesis_proof": "intro x y z\nexact first_attempt",
+        "counterexample_proof": "exact first_counterexample",
+    }
+
+    def infinite_repair_plan(context):
+        infinite_repair_contexts.append(context)
+        if context["teacher_search"]["depth"] == 1:
+            return first_structured_plan
+        return {
+            "kind": "infinite_model_patch",
+            "set": {
+                "hypothesis_proof": "intro x y z\nexact repaired_marker",
+            },
+        }
+
+    infinite_repair_case = CurriculumCase(
+        case_id="contract_structured_infinite_repair",
+        problem=ProblemSpec(
+            id="contract_structured_infinite_repair",
+            eq1_id=1167,
+            eq2_id=1763,
+            equation1="x = x",
+            equation2="x = x",
+            answer=False,
+        ),
+        actions=(),
+        expected_verdict="false",
+        verification_profile="research",
+        max_rounds=2,
+    )
+    infinite_repair_runner = ResearchEpisodeRunner(
+        semantics=semantics,
+        executor=MechanicalExecutor(),
+        verifier=InfiniteRepairVerifier(),
+    )
+    infinite_repair_report = TeacherStudentSearch(
+        infinite_repair_runner,
+        FunctionPlanner(infinite_repair_plan, name="contract_infinite_repair"),
+        config=TeacherSearchConfig(
+            beam_width=1,
+            proposals_per_branch=1,
+            max_depth=2,
+            branch_rounds=1,
+            student_rounds=2,
+            focus="infinite_model",
+        ),
+    ).run(infinite_repair_case)
+    repaired_action = infinite_repair_report["teacher"]["winner"]["action"]
+    checks["structured_infinite_model_repair_loop"] = (
+        infinite_repair_report.get("outcome") == "teacher_solved_not_distillable"
+        and len(infinite_repair_contexts) == 2
+        and "unknown identifier first_attempt"
+        in infinite_repair_contexts[1]["recent_observations"][0]
+        .get("verification", {})
+        .get("details", {})
+        .get("stderr", "")
+        and repaired_action.get("operation") == first_structured_plan.get("operation")
+        and "repaired_marker" in repaired_action.get("hypothesis_proof", "")
+        and infinite_repair_report["minimization"]["minimized_action_count"] == 1
+    )
+    augmented_contexts: list[dict] = []
+    augmented = ContextAugmentingPlanner(
+        FunctionPlanner(
+            lambda context: augmented_contexts.append(context) or near_action,
+            name="contract_context_sink",
+        ),
+        {"teacher_lesson": {"kind": "verified_teacher_trajectory"}},
+    )
+    augmented.next_action({"problem": teacher_case.problem.to_mapping()})
+    checks["teacher_lesson_context_adapter"] = (
+        augmented_contexts[0]["teacher_lesson"]["kind"] == "verified_teacher_trajectory"
+    )
+
     class DagExecutor:
         name = "fake_dag_executor"
 
@@ -753,12 +1180,24 @@ def main() -> int:
             "closest_pairs": [{"left": "x", "right": "y"}],
         },
         "budget_allocation": {"policy_id": "contract", "events": [{"event": "grant"}]},
+        "repair_class": "repair_h_preserve_g",
+        "family_summary": {"carrier_size": 3, "rule_count": 2},
+        "h_profile": {
+            "failures_observed": 2,
+            "examples": [{"env": {"x": 0}, "cells": [[0, 1]]}],
+        },
+        "g_profile": {"failures_observed": 1},
+        "errors": [{"code": "contract_schema_error"}],
     })
     checks["compact_system2_feedback"] = (
         compact.get("need_hint") == "propose a bridge"
         and "stderr" not in compact
         and compact.get("goal_search", {}).get("target") == "x = y"
         and compact.get("budget_allocation", {}).get("policy_id") == "contract"
+        and compact.get("repair_class") == "repair_h_preserve_g"
+        and compact.get("h_profile", {}).get("failures_observed") == 2
+        and compact.get("g_profile", {}).get("failures_observed") == 1
+        and compact.get("errors", [{}])[0].get("code") == "contract_schema_error"
     )
 
     with tempfile.TemporaryDirectory(prefix="sair-research-contract-") as tmp:

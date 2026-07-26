@@ -27,6 +27,36 @@ per-action mechanical consumer should remain close to the submission contract.
 This keeps the harvested lesson about choosing a better action instead of
 silently buying a much larger standalone mechanical proof.
 
+## 2026-07-26 Execution Checkpoint
+
+The teacher platform is now implemented rather than only planned:
+
+- mechanically ranked bounded beams with concurrent independent proposals;
+- parent-action and exact failure feedback on every continuation;
+- resumable beam checkpoints with full action lineage;
+- finite carrier lower bounds from exact propagation probes;
+- trajectory minimization by mechanical replay;
+- ordinary-student no-lesson and with-lesson attribution controls;
+- promotion only when mechanical replay and lesson-aware student replay pass
+  while the no-lesson control fails.
+
+The first long finite-family search on `hard2_0093` did not solve the case.
+Exact propagation eliminated carrier sizes 2 through 5. At size 6 the teacher
+produced a goal-breaking family with 9 hypothesis failures among 36 checked
+assignments, but no countermodel. After 63 unique actions and 12 cumulative
+depth levels, this lane hit its stop condition. The next experiment should add
+a mechanically assisted multiobjective table fitter or a richer family
+language; repeating the same conversational beam is not the next action.
+
+The structured infinite lane did reach its first attribution milestone. A
+known `ℕ` model was assembled from five typed parts and accepted by the official
+research-profile judge. After injecting a broken theorem identifier into the
+hypothesis proof, the teacher used exact Lean feedback to repair that part while
+preserving the model, setup, and counterexample proof. A fresh ordinary model
+failed twice without the verified lesson and passed in one round with it. See
+[`../evidence/case_study_structured_infinite_repair.md`](../evidence/case_study_structured_infinite_repair.md).
+This is exact-case distillation, not yet held-out transfer or model discovery.
+
 ## Phase 1: Finite Symbolic Countermodel Families
 
 Promote `false_model_family` from a research sidecar to a first-class solver
@@ -82,6 +112,10 @@ family, and mechanical failure signature.
 Promotion milestone: at least one finite-false teacher discovery becomes a
 load-bearing normal-budget student solve, with a no-lesson counterfactual.
 
+Current status: platform complete; finite-false discovery milestone not yet
+met. The `hard2_0093` run produced useful measured near-model progress and a
+clear next consumer hypothesis, but no lesson was promoted.
+
 ## Phase 3: Retrieval and Coalescing
 
 Maintain three separate artifacts:
@@ -130,6 +164,9 @@ Promotion milestone: reconstruct one known infinite countermodel from
 structured parts, repair at least one rejected obligation, and obtain a
 judge-accepted final artifact.
 
+Current status: met for exact-case repair and replay. Held-out transfer and
+operation-family discovery remain open.
+
 ## Phase 5: Explicit Recursive Obligations
 
 Promote midpoint attain and consume legs from the packed worker into persistent
@@ -163,9 +200,13 @@ midpoint is introduced on a blocked leg, and the final nested proof verifies.
 
 ## Immediate Execution Order
 
-1. Wire finite `false_model_family` through the production tool contract.
-2. Add successful and failed-family contract fixtures and prompt examples.
-3. Run compiled-submission and official-proxy smoke tests.
-4. Build the first teacher/student finite-family probe.
-5. Generalize infinite artifacts into persistent construction obligations.
+1. Finish compiled-submission validation for the new contracts.
+2. Add a mechanically assisted multiobjective repair operator for finite
+   near-models, preserving both H progress and a concrete G-breaking witness.
+3. Run the finite teacher on one fresh residual before returning to
+   `hard2_0093`.
+4. Test structured infinite-model lesson transfer on a distinct known
+   construction.
+5. Begin carrier/operation discovery prompts only after repair transfer is
+   stable.
 6. Promote midpoint attain/consume into explicit recursive graph nodes.
