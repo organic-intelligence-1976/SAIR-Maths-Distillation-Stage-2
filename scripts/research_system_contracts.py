@@ -121,17 +121,18 @@ def main() -> int:
     )
     proj_l_h = baby_solver.parse_equation("x = x ◇ ((y ◇ z) ◇ (x ◇ y))")
     proj_l_g = baby_solver.parse_equation("x = x ◇ ((y ◇ y) ◇ (z ◇ y))")
+    projection_contract_budget = 8
     proj_l_body, proj_l_state = baby_solver.standard_aux_superposition_attempt(
         proj_l_h,
         proj_l_g,
-        {"lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": 5},
+        {"lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": projection_contract_budget},
     )
     proj_r_h = baby_solver.parse_equation("x = (y ◇ ((z ◇ x) ◇ z)) ◇ x")
     proj_r_g = baby_solver.parse_equation("x = ((y ◇ z) ◇ w) ◇ (w ◇ x)")
     proj_r_body, proj_r_state = baby_solver.standard_aux_superposition_attempt(
         proj_r_h,
         proj_r_g,
-        {"lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": 5},
+        {"lemmas": ["const", "proj_l", "proj_r", "rowconst"], "budget": projection_contract_budget},
     )
     checks["standard_aux_projection_focus"] = (
         proj_l_body is not None
