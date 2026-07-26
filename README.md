@@ -44,7 +44,10 @@ workbench.
 The most useful orientation documents are:
 
 - [`docs/project_overview.md`](docs/project_overview.md): motivation, architecture, and evidence;
-- [`docs/research_system_architecture.md`](docs/research_system_architecture.md): modular research harness and competition compilation.
+- [`docs/research_system_architecture.md`](docs/research_system_architecture.md): modular research harness and competition compilation;
+- [`docs/teacher_student_symbolic_model_plan.md`](docs/teacher_student_symbolic_model_plan.md):
+  active roadmap for verified teacher-student distillation and symbolic
+  countermodels.
 
 ## Repository map
 

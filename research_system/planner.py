@@ -178,6 +178,7 @@ class OpenAICompatiblePlanner:
             '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"helper","equation":"<new universal helper equation>"}]}',
             '{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8}',
             '{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["model_finder_v2:n=6"],"budget":8}',
+            '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}',
             '{"kind":"false_table","counterexample_table":[[0,1],[1,0]]}',
             "Angle-bracket text above is schema notation only; replace it with actual mathematics.",
             "Return exactly one JSON object and no markdown.",
@@ -191,9 +192,12 @@ class OpenAICompatiblePlanner:
             or "https://openrouter.ai/api/v1"
         ).rstrip("/")
         key_env = self.config.get("api_key_env")
-        api_key = os.environ.get(key_env, "") if key_env else (
-            os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
-        )
+        if key_env:
+            api_key = os.environ.get(key_env, "")
+        elif "openrouter.ai" in base_url:
+            api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
         if not api_key:
             self.last_response = {"error": f"{key_env or 'OPENAI_API_KEY/OPENROUTER_API_KEY'} not set"}
             self.last_trace = {

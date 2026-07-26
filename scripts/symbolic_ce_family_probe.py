@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import baby_solver as solver  # noqa: E402
-from scripts.feedback_uptake_probe import call_chat, load_config, load_first_problem  # noqa: E402
+from scripts.feedback_uptake_probe import call_chat, load_config  # noqa: E402
 
 
 BIN_OPS = {
@@ -189,46 +189,30 @@ def eval_with_cells(term: Any, env: dict[str, int], table: list[list[int]], cell
 
 
 def check_candidate(h_eq: dict[str, Any], g_eq: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    try:
-        table, table_meta = table_from_candidate(candidate)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "candidate": candidate}
-    n = len(table)
-    h_violations = 0
-    g_failures = 0
-    examples_h: list[dict[str, Any]] = []
-    examples_g: list[dict[str, Any]] = []
-    hot_h: Counter[tuple[int, int]] = Counter()
-    hot_g: Counter[tuple[int, int]] = Counter()
-
-    for vals in product(range(n), repeat=len(h_eq["variables"])):
-        env = dict(zip(h_eq["variables"], vals))
-        cells: Counter[tuple[int, int]] = Counter()
-        lhs = eval_with_cells(h_eq["lhs"], env, table, cells)
-        rhs = eval_with_cells(h_eq["rhs"], env, table, cells)
-        if lhs != rhs:
-            h_violations += 1
-            hot_h.update(cells)
-            if len(examples_h) < 5:
-                examples_h.append({"env": env, "lhs": lhs, "rhs": rhs, "cells": [list(c) for c in cells]})
-
-    for vals in product(range(n), repeat=len(g_eq["variables"])):
-        env = dict(zip(g_eq["variables"], vals))
-        cells = Counter()
-        lhs = eval_with_cells(g_eq["lhs"], env, table, cells)
-        rhs = eval_with_cells(g_eq["rhs"], env, table, cells)
-        if lhs != rhs:
-            g_failures += 1
-            hot_g.update(cells)
-            if len(examples_g) < 5:
-                examples_g.append({"env": env, "lhs": lhs, "rhs": rhs, "cells": [list(c) for c in cells]})
-
+    action = {
+        **candidate,
+        "kind": "false_model_family",
+        "budget": float(candidate.get("budget") or 8.0),
+    }
+    found, state = solver.false_model_family_attempt(h_eq, g_eq, action)
+    if state.get("status") == "invalid_family":
+        errors = state.get("errors") or []
+        return {
+            "ok": False,
+            "error": errors[0].get("message") if errors else "invalid family",
+            "candidate": candidate,
+            "mechanical_state": state,
+        }
+    h_profile = state.get("h_profile") or {}
+    g_profile = state.get("g_profile") or {}
+    family_summary = state.get("family_summary") or {}
+    n = int(family_summary.get("carrier_size") or candidate.get("carrier_size") or 0)
     return {
         "ok": True,
-        "is_counterexample": h_violations == 0 and g_failures > 0,
-        "h_violations": h_violations,
-        "g_failures": g_failures,
-        "table_meta": table_meta,
+        "is_counterexample": found is not None,
+        "h_violations": h_profile.get("failures_observed", 0),
+        "g_failures": g_profile.get("failures_observed", 0),
+        "table_meta": family_summary,
         "candidate_summary": {
             "carrier_size": n,
             "default": candidate.get("default"),
@@ -236,11 +220,13 @@ def check_candidate(h_eq: dict[str, Any], g_eq: dict[str, Any], candidate: dict[
             "patch_count": len(candidate.get("patches") or []),
             "why": candidate.get("why"),
         },
-        "h_examples": examples_h,
-        "g_examples": examples_g,
-        "hot_h_cells": [{"cell": list(k), "count": v} for k, v in hot_h.most_common(10)],
-        "hot_g_cells": [{"cell": list(k), "count": v} for k, v in hot_g.most_common(10)],
-        "table": table if n <= 12 else None,
+        "h_examples": h_profile.get("examples") or [],
+        "g_examples": g_profile.get("examples") or [],
+        "hot_h_cells": h_profile.get("hot_cells") or [],
+        "hot_g_cells": g_profile.get("hot_cells") or [],
+        "repair_class": state.get("repair_class"),
+        "mechanical_state": state,
+        "table": found[1] if found is not None and n <= 12 else None,
     }
 
 
@@ -264,6 +250,24 @@ def built_in_candidates() -> list[dict[str, Any]]:
     return candidates
 
 
+def load_problem(path: Path, problem_id: str | None = None) -> dict[str, Any]:
+    first: dict[str, Any] | None = None
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if first is None:
+                first = row
+            if problem_id and row.get("id") == problem_id:
+                return row
+    if problem_id:
+        raise ValueError(f"{path}: problem id {problem_id!r} not found")
+    if first is None:
+        raise ValueError(f"{path}: no JSONL rows found")
+    return first
+
+
 def build_prompt(problem: dict[str, Any], feedback: list[dict[str, Any]], max_candidates: int) -> str:
     compact = [
         {
@@ -272,6 +276,7 @@ def build_prompt(problem: dict[str, Any], feedback: list[dict[str, Any]], max_ca
             "rules": row.get("candidate_summary", {}).get("rules"),
             "h_violations": row.get("h_violations"),
             "g_failures": row.get("g_failures"),
+            "repair_class": row.get("repair_class"),
             "hot_h_cells": row.get("hot_h_cells", [])[:4],
             "hot_g_cells": row.get("hot_g_cells", [])[:4],
             "h_examples": row.get("h_examples", [])[:2],
@@ -285,6 +290,16 @@ def build_prompt(problem: dict[str, Any], feedback: list[dict[str, Any]], max_ca
         f"Problem id: {problem.get('id')}",
         f"H must hold universally: {problem.get('equation1')}",
         f"G must fail for at least one assignment: {problem.get('equation2')}",
+        "Mechanically computed strict invariant families:",
+        json.dumps(
+            solver.symbolic_invariant_report(
+                solver.parse_equation(problem["equation1"]),
+                solver.parse_equation(problem["equation2"]),
+            ),
+            indent=2,
+            ensure_ascii=False,
+        ),
+        "If a strict family has separates_goal=true, return its action before inventing a more complicated family.",
         "Candidate DSL:",
         json.dumps({
             "kind": "false_model_family_candidates",
@@ -312,19 +327,24 @@ def build_prompt(problem: dict[str, Any], feedback: list[dict[str, Any]], max_ca
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--problem-file", type=Path, default=ROOT / ".artifacts" / "hard2_0027_only.jsonl")
+    parser.add_argument("--problem-id")
     parser.add_argument("--config", type=Path, default=ROOT / ".artifacts" / "openrouter_fast_config.json")
     parser.add_argument("--output", type=Path, default=ROOT / ".artifacts" / "symbolic_ce_family_probe.json")
     parser.add_argument("--llm-rounds", type=int, default=1)
     parser.add_argument("--max-candidates", type=int, default=6)
+    parser.add_argument("--skip-builtins", action="store_true")
     parser.add_argument("--timeout", type=float, default=90.0)
     args = parser.parse_args()
 
-    problem = load_first_problem(args.problem_file)
+    problem = load_problem(args.problem_file, args.problem_id)
     h_eq = solver.parse_equation(problem["equation1"])
     g_eq = solver.parse_equation(problem["equation2"])
     started = time.monotonic()
 
-    checked: list[dict[str, Any]] = [check_candidate(h_eq, g_eq, cand) for cand in built_in_candidates()]
+    checked: list[dict[str, Any]] = (
+        [] if args.skip_builtins
+        else [check_candidate(h_eq, g_eq, cand) for cand in built_in_candidates()]
+    )
     llm_rounds: list[dict[str, Any]] = []
     config = load_config(args.config)
 

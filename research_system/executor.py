@@ -71,6 +71,39 @@ class MechanicalExecutor:
                 seconds=time.monotonic() - started,
             )
 
+        if baby_solver.is_false_model_family_payload(normalized):
+            gate = baby_solver.capability_gate_state("false_model_family", capability_mask)
+            if gate is not None:
+                return ExecutionResult(
+                    status="capability_withheld",
+                    normalized_action=normalized,
+                    submitted_action=normalized,
+                    state=gate,
+                    adapter_state=adapter_state,
+                    seconds=time.monotonic() - started,
+                )
+            if semantic_context and not baby_solver.finite_countermodel_search_allowed(semantic_context):
+                state = baby_solver.semantic_status_state(semantic_context)
+                return ExecutionResult(
+                    status="artifact_rejected",
+                    normalized_action=normalized,
+                    submitted_action=normalized,
+                    state=state,
+                    adapter_state=adapter_state,
+                    seconds=time.monotonic() - started,
+                )
+            found, state = baby_solver.false_model_family_attempt(h_eq, g_eq, normalized)
+            table = found[1] if found is not None else None
+            return ExecutionResult(
+                status="candidate_ready" if table is not None else "mechanical_stuck",
+                normalized_action=normalized,
+                submitted_action=normalized,
+                finite_table=table,
+                state=state,
+                adapter_state=adapter_state,
+                seconds=time.monotonic() - started,
+            )
+
         if normalized.get("kind") == "false_table" or normalized.get("verdict") == "false":
             table = normalized.get("counterexample_table") or normalized.get("table")
             valid = isinstance(table, list) and baby_solver.is_counterexample(h_eq, g_eq, table)

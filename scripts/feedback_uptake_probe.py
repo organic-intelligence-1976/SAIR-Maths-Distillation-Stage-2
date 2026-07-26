@@ -41,9 +41,12 @@ def call_chat(prompt: str, config: dict[str, Any], timeout: float) -> dict[str, 
     llm = config.get("llm") or {}
     base_url = (llm.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
     api_key_env = llm.get("api_key_env")
-    api_key = os.environ.get(api_key_env, "") if api_key_env else (
-        os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
-    )
+    if api_key_env:
+        api_key = os.environ.get(api_key_env, "")
+    elif "openrouter.ai" in base_url:
+        api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
     if not api_key:
         return {"error": f"{api_key_env or 'OPENAI_API_KEY/OPENROUTER_API_KEY'} not set"}
 

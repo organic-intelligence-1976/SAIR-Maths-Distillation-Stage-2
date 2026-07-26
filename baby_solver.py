@@ -13,6 +13,7 @@ The file is self-contained and uses only the Solo stdin/stdout protocol.
 
 from __future__ import annotations
 
+import ast
 import json
 import random
 import re
@@ -65,8 +66,10 @@ Few-shot tool-call guidance:
 Current collaboration goal:
 {solver.collaboration_goal}
 
-Return exactly one JSON object under 600 characters, no prose, no markdown, no
-chain-of-thought. Prefer the simplest concrete tool call or hint.
+Return exactly one JSON object, no prose, no markdown, no chain-of-thought.
+Keep ordinary actions under 600 characters. When the phase explicitly enables
+kind=infinite_model, its complete Lean code may use the 10,000-byte artifact
+envelope. Prefer the simplest concrete tool call or hint.
 
 Allowed responses:
 There is no tool named "true_midpoint"; true-side bridges must use
@@ -93,6 +96,7 @@ There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"structured_ce","routes":["structured_ce:max_n=7"],"budget":8}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}
+{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}
 {"kind":"goal_proof","proof":"intro x y\\nhave h1 := h x x x\\ngrind"}
 {"kind":"false_table","counterexample_table":[[0,1],[1,0]]}
 
@@ -100,8 +104,9 @@ The equations in midpoint, midpoint_chain, and lemma_chain are untrusted hints.
 The solver tries to prove each helper from H before using it. Bad hints are
 ignored. If mechanical_feedback reports that a tool call or midpoint failed, do
 not repeat the exact same call; repair it or switch strategy.
-Do not write Lean unless you return kind=goal_proof. Prefer tool_call, midpoint,
-midpoint_chain, lemma_hint, lemma_chain, or false_table.
+Do not write Lean unless you return kind=goal_proof or kind=infinite_model.
+Prefer tool_call, midpoint, midpoint_chain, lemma_hint, lemma_chain,
+false_model_family, or false_table.
 """
 
 
@@ -675,6 +680,15 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": ["countermodel_search", "finite_model_search", "local_search", "model_finder", "model_finder_v2", "poly_ce", "cp_sat", "sympy_sat", "structured_ce"],
         "description": "Search for finite countermodels. Supports deterministic structured families, local search, propagation model finding, goal-directed search, optional CP-SAT, and polynomial routes.",
     },
+    "false_model_family": {
+        "domain": "false",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collab_protocol",
+        "aliases": ["symbolic_countermodel", "symbolic_model", "finite_model_family"],
+        "description": "Expand and verify an LLM-proposed finite symbolic operation family, returning exact H/G near-miss diagnostics or a finite certificate.",
+    },
     "infinite_model_artifact": {
         "domain": "false",
         "scope": "whole_goal",
@@ -818,6 +832,7 @@ CAPABILITY_DEPENDENCIES: dict[str, list[str]] = {
     "goal_superposition": ["primitive:proof_carrying_superposition"],
     "standard_aux_superposition": ["primitive:proof_carrying_superposition"],
     "false_model_search": ["primitive:finite_model_search"],
+    "false_model_family": ["primitive:symbolic_family_evaluator", "primitive:finite_model_search"],
     "infinite_model_artifact": ["artifact:infinite_model", "primitive:lean_verifier"],
 }
 
@@ -833,6 +848,10 @@ PRIMITIVE_CAPABILITIES: dict[str, dict[str, Any]] = {
     "primitive:finite_model_search": {
         "kind": "primitive",
         "description": "Finite-table countermodel routes and validation.",
+    },
+    "primitive:symbolic_family_evaluator": {
+        "kind": "primitive",
+        "description": "Validate compact finite operation schemas, expand them to tables, and report universal H/G diagnostics.",
     },
     "primitive:lean_verifier": {
         "kind": "verifier",
@@ -1020,6 +1039,118 @@ def term_var_count(t: Term, var: str) -> int:
     if t[0] == "var":
         return 1 if t[1] == var else 0
     return term_var_count(t[1], var) + term_var_count(t[2], var)
+
+
+def term_leaf_sequence(t: Term) -> tuple[str, ...]:
+    if t[0] == "var":
+        return (t[1],)
+    return term_leaf_sequence(t[1]) + term_leaf_sequence(t[2])
+
+
+def term_occurrence_signature(t: Term, modulus: int | None = None) -> tuple[tuple[str, int], ...]:
+    counts = Counter(term_leaf_sequence(t))
+    if modulus is None:
+        return tuple(sorted((var, int(count)) for var, count in counts.items()))
+    return tuple(sorted(
+        (var, int(count) % modulus)
+        for var, count in counts.items()
+        if int(count) % modulus
+    ))
+
+
+def term_left_path_depth(t: Term) -> int:
+    return 0 if t[0] == "var" else 1 + term_left_path_depth(t[1])
+
+
+def term_right_path_depth(t: Term) -> int:
+    return 0 if t[0] == "var" else 1 + term_right_path_depth(t[2])
+
+
+def equation_signature_holds(eq: dict[str, Any], signature) -> bool:
+    return signature(eq["lhs"]) == signature(eq["rhs"])
+
+
+def symbolic_invariant_report(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Stage-1-style strict witnesses exposed as finite family routing facts."""
+    rows: list[dict[str, Any]] = []
+    seen_actions: set[str] = set()
+
+    def add(
+        family: str,
+        signature,
+        action: dict[str, Any] | None,
+        reason: str,
+    ) -> None:
+        h_holds = equation_signature_holds(h_eq, signature)
+        if not h_holds:
+            return
+        g_holds = equation_signature_holds(g_eq, signature)
+        action_key = json.dumps(action, sort_keys=True) if action is not None else family
+        if action_key in seen_actions:
+            return
+        seen_actions.add(action_key)
+        rows.append({
+            "family": family,
+            "h_holds": True,
+            "g_holds": g_holds,
+            "separates_goal": not g_holds,
+            "reason": reason,
+            "action": action,
+        })
+
+    add(
+        "left_projection",
+        lambda term: term_leaf_sequence(term)[0],
+        {"kind": "false_model_family", "carrier_size": 2, "default": {"kind": "left"}, "budget": 3},
+        "terms evaluate to their leftmost leaf",
+    )
+    add(
+        "right_projection",
+        lambda term: term_leaf_sequence(term)[-1],
+        {"kind": "false_model_family", "carrier_size": 2, "default": {"kind": "right"}, "budget": 3},
+        "terms evaluate to their rightmost leaf",
+    )
+    add(
+        "set_semilattice",
+        lambda term: frozenset(term_leaf_sequence(term)),
+        {"kind": "false_model_family", "carrier_size": 2, "default": {"kind": "max"}, "budget": 3},
+        "the two-element join semilattice evaluates a term by the set of variables assigned 1",
+    )
+    add(
+        "free_semigroup_leaf_sequence",
+        term_leaf_sequence,
+        None,
+        "H preserves exact leaf order; a finite semigroup quotient may separate a different goal word",
+    )
+    for modulus in (2, 3, 5, 7):
+        add(
+            f"occurrence_counts_mod_{modulus}",
+            lambda term, modulus=modulus: term_occurrence_signature(term, modulus),
+            {
+                "kind": "false_model_family",
+                "carrier_size": modulus,
+                "default": {"kind": "affine", "params": [1, 1, 0]},
+                "budget": 3,
+            },
+            f"addition modulo {modulus} evaluates occurrence-count vectors",
+        )
+    add(
+        "left_successor_mod_3",
+        lambda term: (term_leaf_sequence(term)[0], term_left_path_depth(term) % 3),
+        {"kind": "false_model_family", "carrier_size": 3, "default": {"kind": "left_successor"}, "budget": 3},
+        "a ◇ b = a+1 mod 3 tracks the leftmost variable and left-path depth",
+    )
+    add(
+        "right_successor_mod_3",
+        lambda term: (term_leaf_sequence(term)[-1], term_right_path_depth(term) % 3),
+        {"kind": "false_model_family", "carrier_size": 3, "default": {"kind": "right_successor"}, "budget": 3},
+        "a ◇ b = b+1 mod 3 tracks the rightmost variable and right-path depth",
+    )
+    rows.sort(key=lambda row: (not row["separates_goal"], row["family"]))
+    return rows[:8]
 
 
 def one_sided_variables(eq: dict[str, Any]) -> list[str]:
@@ -1261,6 +1392,377 @@ def trace_eval(t: Term, env: dict[str, int], table: list[list[int]], touched: li
     b = trace_eval(t[2], env, table, touched)
     touched.append((a, b))
     return table[a][b]
+
+
+def safe_model_family_expr(text: str, env: dict[str, int]) -> int | bool:
+    """Evaluate the deliberately small expression language used by model families."""
+    source = str(text).strip().replace("&&", " and ").replace("||", " or ")
+    if not source or len(source) > 160:
+        raise ValueError("family expression must contain 1..160 characters")
+    parsed = ast.parse(source, mode="eval")
+    if sum(1 for _ in ast.walk(parsed)) > 80:
+        raise ValueError("family expression is too complex")
+
+    def walk(node: ast.AST) -> int | bool:
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, bool)):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in env:
+            return env[node.id]
+        if isinstance(node, ast.UnaryOp):
+            value = walk(node.operand)
+            if isinstance(node.op, ast.USub):
+                return -int(value)
+            if isinstance(node.op, ast.UAdd):
+                return int(value)
+            if isinstance(node.op, ast.Not):
+                return not bool(value)
+        if isinstance(node, ast.BinOp):
+            left = int(walk(node.left))
+            right = int(walk(node.right))
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.FloorDiv):
+                if right == 0:
+                    raise ValueError("division by zero in family expression")
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                if right == 0:
+                    raise ValueError("modulo by zero in family expression")
+                return left % right
+        if isinstance(node, ast.BoolOp):
+            values = [bool(walk(value)) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        if isinstance(node, ast.Compare):
+            left = int(walk(node.left))
+            for op, right_node in zip(node.ops, node.comparators):
+                right = int(walk(right_node))
+                if isinstance(op, ast.Eq):
+                    ok = left == right
+                elif isinstance(op, ast.NotEq):
+                    ok = left != right
+                elif isinstance(op, ast.Lt):
+                    ok = left < right
+                elif isinstance(op, ast.LtE):
+                    ok = left <= right
+                elif isinstance(op, ast.Gt):
+                    ok = left > right
+                elif isinstance(op, ast.GtE):
+                    ok = left >= right
+                else:
+                    raise ValueError("unsupported comparison in family expression")
+                if not ok:
+                    return False
+                left = right
+            return True
+        raise ValueError(f"unsupported family expression node: {type(node).__name__}")
+
+    return walk(parsed)
+
+
+def symbolic_family_default_value(spec: Any, i: int, j: int, n: int) -> int:
+    if isinstance(spec, str):
+        kind = spec.strip().lower()
+        params: list[int] = []
+    elif isinstance(spec, dict):
+        kind = str(spec.get("kind") or spec.get("name") or "right").strip().lower()
+        raw_params = spec.get("params") or []
+        if not isinstance(raw_params, list) or len(raw_params) > 8:
+            raise ValueError("default params must be a list of at most 8 integers")
+        params = [int(value) for value in raw_params]
+    else:
+        raise ValueError("default operation must be a string or object")
+    if kind in {"right", "proj_r", "second"}:
+        return j % n
+    if kind in {"left", "proj_l", "first"}:
+        return i % n
+    if kind in {"constant", "const"}:
+        return (params[0] if params else 0) % n
+    if kind == "affine":
+        a, b, c = (params + [0, 1, 0])[:3]
+        return (a * i + b * j + c) % n
+    if kind == "bilinear":
+        a, b, c, d = (params + [0, 1, 0, 0])[:4]
+        return (a * i + b * j + c * i * j + d) % n
+    if kind == "quadratic":
+        a, b, c, d, e, f = (params + [0, 1, 0, 0, 0, 0])[:6]
+        return (a * i + b * j + c * i * j + d * i * i + e * j * j + f) % n
+    if kind == "min":
+        return min(i, j)
+    if kind == "max":
+        return max(i, j)
+    if kind in {"left_successor", "succ_left"}:
+        return (i + (params[0] if params else 1)) % n
+    if kind in {"right_successor", "succ_right"}:
+        return (j + (params[0] if params else 1)) % n
+    raise ValueError(f"unsupported default operation kind: {kind}")
+
+
+def symbolic_family_rule_applies(rule: dict[str, Any], i: int, j: int, n: int) -> bool:
+    condition = rule.get("when", rule.get("if", rule.get("condition")))
+    if isinstance(condition, str):
+        return bool(safe_model_family_expr(condition, {"i": i, "j": j, "n": n}))
+    if not isinstance(condition, dict):
+        raise ValueError("each family rule needs a string or object `when` condition")
+    kind = str(condition.get("kind") or "").strip().lower()
+    if kind in {"diagonal", "diag"}:
+        return i == j
+    if kind in {"off_diagonal", "offdiag"}:
+        return i != j
+    if kind in {"same_mod", "same_residue"}:
+        modulus = max(1, int(condition.get("mod") or 2))
+        return (i - j) % modulus == 0
+    if kind in {"different_mod", "different_residue"}:
+        modulus = max(1, int(condition.get("mod") or 2))
+        return (i - j) % modulus != 0
+    if kind in {"left_residue", "left_mod"}:
+        modulus = max(1, int(condition.get("mod") or 2))
+        residue = int(condition.get("residue") or 0)
+        return i % modulus == residue % modulus
+    if kind in {"right_residue", "right_mod"}:
+        modulus = max(1, int(condition.get("mod") or 2))
+        residue = int(condition.get("residue") or 0)
+        return j % modulus == residue % modulus
+    if kind in {"cell", "patch"}:
+        return i == int(condition.get("i")) and j == int(condition.get("j"))
+    raise ValueError(f"unsupported family rule condition: {kind}")
+
+
+def symbolic_family_rule_value(rule: dict[str, Any], i: int, j: int, n: int) -> int:
+    value = rule.get("value", rule.get("then"))
+    if isinstance(value, int):
+        return value % n
+    if isinstance(value, str):
+        return int(safe_model_family_expr(value, {"i": i, "j": j, "n": n})) % n
+    if isinstance(value, dict):
+        return symbolic_family_default_value(value, i, j, n)
+    raise ValueError("family rule value must be an integer, expression, or operation object")
+
+
+def normalize_symbolic_family_payload(data: dict[str, Any]) -> dict[str, Any]:
+    source = data.get("family") if isinstance(data.get("family"), dict) else data
+    out = dict(source)
+    operation = out.get("operation")
+    if isinstance(operation, dict) and any(key in operation for key in ("default", "rules", "patches")):
+        if "default" not in out and "default" in operation:
+            out["default"] = operation.get("default")
+        if "rules" not in out and "rules" in operation:
+            out["rules"] = operation.get("rules")
+        if "patches" not in out and "patches" in operation:
+            out["patches"] = operation.get("patches")
+    elif operation is not None and "default" not in out:
+        out["default"] = operation
+    if "n" in out and "carrier_size" not in out:
+        out["carrier_size"] = out.get("n")
+    return out
+
+
+def table_from_symbolic_family(data: dict[str, Any]) -> tuple[list[list[int]], dict[str, Any]]:
+    family = normalize_symbolic_family_payload(data)
+    n = int(family.get("carrier_size") or 0)
+    if n < 2 or n > 40:
+        raise ValueError(f"carrier_size must be in 2..40, got {n}")
+    default = family.get("default", {"kind": "right"})
+    rules = family.get("rules") or []
+    patches = family.get("patches") or []
+    if not isinstance(rules, list) or len(rules) > 16:
+        raise ValueError("rules must be a list of at most 16 objects")
+    if not isinstance(patches, list) or len(patches) > 64:
+        raise ValueError("patches must be a list of at most 64 cells")
+    table: list[list[int]] = []
+    touched: set[tuple[int, int]] = set()
+    for i in range(n):
+        row: list[int] = []
+        for j in range(n):
+            value = symbolic_family_default_value(default, i, j, n)
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    raise ValueError("every family rule must be an object")
+                if symbolic_family_rule_applies(rule, i, j, n):
+                    value = symbolic_family_rule_value(rule, i, j, n)
+                    touched.add((i, j))
+            row.append(value % n)
+        table.append(row)
+    for patch in patches:
+        if isinstance(patch, (list, tuple)) and len(patch) == 3:
+            i, j, value = (int(patch[0]), int(patch[1]), int(patch[2]))
+        elif isinstance(patch, dict):
+            i, j, value = int(patch["i"]), int(patch["j"]), int(patch["value"])
+        else:
+            raise ValueError("each patch must be [i,j,value] or an object with i/j/value")
+        if not (0 <= i < n and 0 <= j < n):
+            raise ValueError(f"patch cell {(i, j)} is outside Fin {n}")
+        table[i][j] = value % n
+        touched.add((i, j))
+    default_summary = (
+        default
+        if isinstance(default, str)
+        else {
+            "kind": default.get("kind") or default.get("name"),
+            "params": list(default.get("params") or []),
+        }
+    )
+    return table, {
+        "carrier_size": n,
+        "default": default_summary,
+        "rule_count": len(rules),
+        "patch_count": len(patches),
+        "rule_touched_cells": len(touched),
+    }
+
+
+def symbolic_equation_scan(
+    eq: dict[str, Any],
+    table: list[list[int]],
+    *,
+    deadline: float,
+    assignment_cap: int,
+    violation_cap: int,
+) -> dict[str, Any]:
+    n = len(table)
+    total = n ** len(eq["variables"])
+    checked = 0
+    failures = 0
+    examples: list[dict[str, Any]] = []
+    hot_cells: Counter[tuple[int, int]] = Counter()
+    stop_reason = "complete"
+    for vals in product(range(n), repeat=len(eq["variables"])):
+        if checked >= assignment_cap:
+            stop_reason = "assignment_cap"
+            break
+        if time.monotonic() >= deadline:
+            stop_reason = "time_budget"
+            break
+        env = dict(zip(eq["variables"], vals))
+        touched: list[tuple[int, int]] = []
+        lhs = trace_eval(eq["lhs"], env, table, touched)
+        rhs = trace_eval(eq["rhs"], env, table, touched)
+        checked += 1
+        if lhs == rhs:
+            continue
+        failures += 1
+        hot_cells.update(touched)
+        if len(examples) < 5:
+            examples.append({
+                "env": env,
+                "lhs": lhs,
+                "rhs": rhs,
+                "cells": [list(cell) for cell in unique(touched)[:12]],
+            })
+        if failures >= violation_cap:
+            stop_reason = "violation_cap"
+            break
+    return {
+        "assignments_total": total,
+        "assignments_checked": checked,
+        "complete": checked == total,
+        "failures_observed": failures,
+        "stop_reason": stop_reason,
+        "examples": examples,
+        "hot_cells": [
+            {"cell": list(cell), "count": count}
+            for cell, count in hot_cells.most_common(8)
+        ],
+    }
+
+
+def false_model_family_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    data: dict[str, Any],
+) -> tuple[tuple[int, list[list[int]]] | None, dict[str, Any]]:
+    """Expand and fully verify one untrusted finite symbolic model family."""
+    budget = max(0.5, min(30.0, float(data.get("budget") or data.get("time_budget") or 8.0)))
+    assignment_cap = max(1_000, min(5_000_000, int(data.get("assignment_cap") or 2_000_000)))
+    try:
+        table, family_summary = table_from_symbolic_family(data)
+    except Exception as exc:
+        return None, protocol_state(
+            "FalseModelFamilyState",
+            "invalid_family",
+            "false_model_family",
+            tool="false_model_family",
+            errors=[ProtocolIssue("invalid_family_schema", short_text(str(exc), 500)).to_dict()],
+            need_hint="Repair the carrier/default/rules schema. Use only supported compact arithmetic or residue/diagonal conditions.",
+        )
+
+    started = time.monotonic()
+    h_deadline = started + budget * 0.75
+    final_deadline = started + budget
+    h_profile = symbolic_equation_scan(
+        h_eq,
+        table,
+        deadline=h_deadline,
+        assignment_cap=assignment_cap,
+        violation_cap=64,
+    )
+    g_profile = symbolic_equation_scan(
+        g_eq,
+        table,
+        deadline=final_deadline,
+        assignment_cap=assignment_cap,
+        violation_cap=8,
+    )
+    h_holds = bool(h_profile["complete"] and h_profile["failures_observed"] == 0)
+    g_fails = bool(g_profile["failures_observed"] > 0)
+
+    if h_holds and g_fails:
+        status = "found"
+        repair_class = "verified_countermodel"
+        need_hint = None
+    elif h_profile["failures_observed"] > 0 and g_fails:
+        status = "h_violated"
+        repair_class = "repair_h_preserve_g"
+        need_hint = (
+            "The family already breaks G but violates H. Repair the operation regions "
+            "listed in h_profile.hot_cells while preserving the G-breaking example."
+        )
+    elif h_holds and g_profile["complete"]:
+        status = "goal_also_holds"
+        repair_class = "break_g_preserve_h"
+        need_hint = (
+            "H holds universally, but G also holds. Add a coherent residue, block, "
+            "diagonal, or affine-region change that breaks the displayed goal assignment "
+            "without disturbing H."
+        )
+    elif not h_profile["complete"]:
+        status = "h_check_incomplete"
+        repair_class = "reduce_or_symbolically_justify"
+        need_hint = (
+            "Universal H checking exceeded the bounded assignment/time contract. "
+            "Reduce the carrier, simplify the family, or provide a structure whose H law "
+            "can later be discharged symbolically."
+        )
+    else:
+        status = "g_check_incomplete"
+        repair_class = "target_goal_break"
+        need_hint = (
+            "H holds on the completed scan, but no G-breaking assignment was found before "
+            "the G scan cap. Change the family toward a concrete goal-breaking witness."
+        )
+
+    state = protocol_state(
+        "FalseModelFamilyState",
+        status,
+        "false_model_family",
+        tool="false_model_family",
+        family_summary=family_summary,
+        h_profile=h_profile,
+        g_profile=g_profile,
+        repair_class=repair_class,
+        elapsed_seconds=round(time.monotonic() - started, 4),
+        trust_boundary="The LLM family is untrusted; only complete universal H validation plus a concrete G failure can produce a certificate.",
+        need_hint=need_hint,
+    )
+    return ((len(table), table) if status == "found" else None), state
 
 
 def local_search_route(h_eq: dict[str, Any], g_eq: dict[str, Any], n: int, seed: int, budget: float):
@@ -7010,6 +7512,11 @@ def run_tool_call_detailed(
         body, state = hint_payload_attempt(call, h_eq, g_eq, capability_mask=capability_mask)
         state = state or {}
         return body, protocolize_state(state, "generic_midpoint_chain", status="proved" if body else state.get("status", "stuck"))
+    if tool == "false_model_family":
+        found, state = false_model_family_attempt(h_eq, g_eq, call)
+        state = dict(state or {})
+        state["candidate_ready"] = found is not None
+        return None, state
     if tool == "infinite_model_artifact":
         _code, state = validate_infinite_model_payload(call)
         return None, state
@@ -7018,7 +7525,7 @@ def run_tool_call_detailed(
         "unsupported_tool",
         "tool_registry",
         tool=raw_tool,
-        need_hint="Choose one supported tool from the registry, or return a midpoint/lemma_chain/false_model_search action.",
+        need_hint="Choose one supported tool from the registry, or return a midpoint/lemma_chain/false_model_search/false_model_family action.",
     )
 
 
@@ -7059,7 +7566,7 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         advice.append("H matches rowconst_certificates.")
     if square_rowconst_h(h_eq):
         advice.append("H matches grounding_derived square-rowconst: derive a ◇ b = a ◇ a and close explicitly.")
-    advice.append("If false, use false_model_search. Strong routes: structured_ce:max_n=7 for deterministic named/structured/dual families, model_finder_v2:n=k for goal-directed constraint search, sympy_sat:n=k for sandbox-legal exact SAT at n≥5, optional cp_sat:n=k for exact finite-domain search when OR-Tools is available, poly_ce:tier=2:nmax=13 for polynomial magmas, then local_search/model_finder fallbacks.")
+    advice.append("If false, use false_model_search for fixed routes or false_model_family for a compact LLM-proposed finite operation. Family proposals are expanded and checked mechanically; failed families return H violations, G failures, and hot operation cells.")
     return "\n".join(advice)
 
 
@@ -7074,6 +7581,10 @@ def problem_analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         f"`h {h_args}` has type: {h_eq['text']}",
         f"schematically, h {' '.join(schema_args)} gives: {schema_lhs} = {schema_rhs}",
         "goal subterms worth bridging: " + ", ".join(goal_terms(g_eq, 8)),
+        "strict symbolic-family prefilter: " + json.dumps(
+            symbolic_invariant_report(h_eq, g_eq),
+            ensure_ascii=False,
+        ),
     ]
     return "\n".join(lines)
 
@@ -7166,11 +7677,26 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}',
         "If false may need a structured larger witness, ask for polynomial magma search:",
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}',
+        "If fixed routes are exhausted, propose one coherent finite operation family. Prefer residue/block/diagonal/affine rules over arbitrary patches:",
+        '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}',
+        "If family feedback says repair_h_preserve_g, keep the G-breaking example and change rules touching h_profile.hot_cells. If it says break_g_preserve_h, preserve the default law and add one coherent region that separates the goal.",
     ])
 
 
 def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool = False) -> str:
     ranked = []
+    for invariant in symbolic_invariant_report(h_eq, g_eq):
+        action = invariant.get("action")
+        if invariant.get("separates_goal") and isinstance(action, dict):
+            ranked.append({
+                "tool": "false_model_family",
+                "score": 100,
+                "why": (
+                    f"Strict {invariant['family']} invariant satisfies H and separates G: "
+                    f"{invariant['reason']}."
+                ),
+                "call": action,
+            })
     for item in goal_generalization_actions(h_eq, g_eq):
         action = item["action"]
         ranked.append({
@@ -7247,6 +7773,18 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
         else ["model_finder_v2:n=5", "local_search:n=6:seed=2", "poly_ce:tier=2:nmax=13", "structured_ce:max_n=7"]
     )
     ranked.append({"tool": "false_model_search", "score": 94 if prefer_false else 40, "why": "Prefer concrete finite-countermodel routes now; true-side tools have already failed or are low-confidence." if prefer_false else "Try bounded finite countermodel routes if false is plausible; model_finder_v2 gives goal-directed Skolem feedback and poly_ce can find structured larger witnesses.", "call": {"kind": "tool_call", "tool": "false_model_search", "target": "goal", "routes": false_routes, "budget": 12 if prefer_false else 8}})
+    ranked.append({
+        "tool": "false_model_family",
+        "score": 92 if prefer_false else 35,
+        "why": "Propose a compact finite operation family when fixed routes are exhausted; the consumer returns exact H/G repair diagnostics.",
+        "call": {
+            "kind": "false_model_family",
+            "carrier_size": 8,
+            "default": {"kind": "affine", "params": [1, 0, 0]},
+            "rules": [{"when": {"kind": "diagonal"}, "value": "i + 1"}],
+            "budget": 8,
+        },
+    })
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return json.dumps({
         "kind": "tool_recommendations",
@@ -7404,6 +7942,20 @@ def is_false_model_payload(data: dict[str, Any]) -> bool:
             "structured_ce",
             "ce_engine",
             "witness_families",
+        }
+    )
+
+
+def is_false_model_family_payload(data: dict[str, Any]) -> bool:
+    tool = TOOL_ALIASES.get(str(data.get("tool") or "").strip(), data.get("tool"))
+    kind = str(data.get("kind") or "").strip()
+    return bool(
+        tool == "false_model_family"
+        or kind in {
+            "false_model_family",
+            "symbolic_countermodel",
+            "symbolic_model",
+            "finite_model_family",
         }
     )
 
@@ -7614,7 +8166,10 @@ def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, d
                 "tool",
             ).to_dict())
 
-    if is_infinite_model_payload(out):
+    if is_false_model_family_payload(out):
+        out["kind"] = "tool_call"
+        out["tool"] = "false_model_family"
+    elif is_infinite_model_payload(out):
         out["kind"] = "tool_call"
         out["tool"] = "infinite_model_artifact"
     elif is_false_model_payload(out):
@@ -7646,7 +8201,7 @@ def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, d
             "llm_adapter",
             errors=errors,
             raw_kind=data.get("kind"),
-            need_hint="Return a supported action: tool_call, midpoint, midpoint_chain, lemma_chain, false_model_search, infinite_model, false_table, or goal_proof.",
+            need_hint="Return a supported action: tool_call, midpoint, midpoint_chain, lemma_chain, false_model_search, false_model_family, infinite_model, false_table, or goal_proof.",
         )
     if repairs:
         return out, protocol_state(
@@ -7730,11 +8285,11 @@ def llm_context(
         )
         advice_prefer_false = False
     elif prefer_false is True:
-        phase_directive = "This is a false-preferred recovery pass. Return false_model_search, false_model_hint, false_table, or a concrete midpoint/lemma_chain only. Prefer recommended_next_call when present. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition in this pass; those true-side routes were already tried or are low-confidence."
+        phase_directive = "This is a false-preferred recovery pass. Return false_model_search, false_model_family, false_table, or a concrete midpoint/lemma_chain only. Prefer recommended_next_call when present. If fixed routes are exhausted, propose a coherent symbolic family rather than arbitrary table patches. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition in this pass; those true-side routes were already tried or are low-confidence."
         advice_prefer_false = True
     elif prefer_false == "balanced":
         if false_strategy_cards(mechanical_feedback):
-            phase_directive = "This is a balanced pre-child recovery pass with concrete false-route telemetry. Return the false_model_search recommended_next_call, a concrete false_table, or a real midpoint/lemma_chain only. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition while a false continuation card is available."
+            phase_directive = "This is a balanced pre-child recovery pass with concrete false-route telemetry. Return the false_model_search recommended_next_call, a coherent false_model_family, a concrete false_table, or a real midpoint/lemma_chain only. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition while a false continuation card is available."
         else:
             phase_directive = "This is a balanced pre-child recovery pass after native true and false tools failed. Prefer a concrete midpoint/lemma_chain that repairs the failed true-side attempts. Use false_model_search only if the feedback gives a specific untried countermodel route; never repeat stale false routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration."
         advice_prefer_false = False
@@ -7782,6 +8337,15 @@ def compact_tool_signature(data: dict[str, Any]) -> str:
             "seeds": data.get("seeds") or [],
             "template": data.get("template"),
         }, sort_keys=True)
+    if is_false_model_family_payload(data):
+        family = normalize_symbolic_family_payload(data)
+        return json.dumps({
+            "tool": "false_model_family",
+            "carrier_size": family.get("carrier_size"),
+            "default": family.get("default"),
+            "rules": family.get("rules") or [],
+            "patches": family.get("patches") or [],
+        }, sort_keys=True, ensure_ascii=False)[:2000]
     if is_hint_payload(data):
         return json.dumps({
             "kind": data.get("kind"),
@@ -7852,13 +8416,64 @@ def try_llm_collaboration(
                 "parse_failed",
                 "llm_adapter",
                 errors=[ProtocolIssue("no_json_object", "No JSON object could be extracted from the LLM response").to_dict()],
-                need_hint="Return exactly one JSON object containing a midpoint, midpoint_chain, tool_call, proof, or false_table.",
+                need_hint="Return exactly one JSON object containing a midpoint, midpoint_chain, tool_call, false_model_family, proof, or false_table.",
             ))
             continue
         data, adapter_state = normalize_llm_action(data)
         if adapter_state is not None:
             mechanical_feedback.append(adapter_state)
         if not data:
+            continue
+        if is_false_model_family_payload(data):
+            sig = compact_tool_signature(data)
+            gate_state = capability_gate_state("false_model_family", capability_mask)
+            if gate_state is not None:
+                mechanical_feedback.append(gate_state)
+                failed_signatures.add(sig)
+                continue
+            if not finite_search_allowed:
+                mechanical_feedback.append(semantic_status_state(semantic_context or {}))
+                failed_signatures.add(sig)
+                continue
+            if sig in failed_signatures:
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "duplicate_failed_call",
+                    "scheduler",
+                    tool="false_model_family",
+                    need_hint="Do not repeat this exact failed symbolic family; repair its H/G diagnostics or change representation.",
+                ))
+                continue
+            found, family_state = false_model_family_attempt(h_eq, g_eq, data)
+            if found is not None:
+                n, table = found
+                emit_attribution_attempt(
+                    "llm:false_model_family:table",
+                    "false",
+                    source="llm_symbolic_family",
+                    detail={
+                        "signature": sig,
+                        "family_summary": family_state.get("family_summary"),
+                    },
+                )
+                result = call_judge("false", make_false_code(n, table))
+                if result.get("status") == "accepted":
+                    return "accepted_false_model_family_llm"
+                mechanical_feedback.append(protocol_state(
+                    "FalseModelFamilyState",
+                    "judge_rejected",
+                    "lean_judge",
+                    tool="false_model_family",
+                    family_state=family_state,
+                    errors=[ProtocolIssue(
+                        "judge_rejected_false_model_family",
+                        short_text(result.get("stderr") or result.get("message") or "", 1000),
+                    ).to_dict()],
+                    need_hint="The family passed Python H/G validation but its Lean certificate was rejected; repair using the exact judge diagnostic.",
+                ))
+            else:
+                mechanical_feedback.append(family_state)
+            failed_signatures.add(sig)
             continue
         if is_infinite_model_payload(data):
             sig = compact_tool_signature(data)
@@ -7913,12 +8528,15 @@ def try_llm_collaboration(
                 return "accepted_false_llm"
         false_cards_available = bool(false_strategy_cards(mechanical_feedback))
         false_phase_active = prefer_false is True or (prefer_false == "balanced" and false_cards_available)
-        if false_phase_active and not is_false_model_payload(data):
+        if false_phase_active and not (
+            is_false_model_payload(data) or is_false_model_family_payload(data)
+        ):
             top_action = top_false_recommended_action(mechanical_feedback)
             raw_tool = str(data.get("tool") or "").strip()
             tool = TOOL_ALIASES.get(raw_tool, raw_tool)
             off_phase_tool = data.get("kind") == "tool_call" and tool not in {
                 "false_model_search",
+                "false_model_family",
                 "lemma_chain",
                 "lemma_hint",
                 "midpoint",
@@ -8010,7 +8628,7 @@ def try_llm_collaboration(
         if (prefer_false is True or (prefer_false == "balanced" and false_cards_available)) and data.get("kind") == "tool_call":
             raw_tool = str(data.get("tool") or "").strip()
             tool = TOOL_ALIASES.get(raw_tool, raw_tool)
-            if tool not in {"false_model_search", "lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
+            if tool not in {"false_model_search", "false_model_family", "lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
                 mechanical_feedback.append(protocol_state(
                     "MechanicalResponse",
                     "suppressed_in_false_preferred_pass",
@@ -8121,12 +8739,13 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                 h_eq,
                 g_eq,
                 remaining,
-                max_rounds=1,
+                max_rounds=3,
                 collaboration_goal=(
                     "Audited semantics say finite countermodels are impossible "
                     "but the unrestricted implication is false. Do not search "
-                    "finite tables. If possible, return a complete compact Lean "
-                    "infinite_model artifact defining `submission : Goal`."
+                    "finite tables. Return a complete compact Lean infinite_model "
+                    "artifact defining `submission : Goal`. If a prior artifact "
+                    "was rejected, repair it using the exact Lean diagnostics."
                 ),
                 initial_feedback=[semantic_state],
                 prefer_false=True,

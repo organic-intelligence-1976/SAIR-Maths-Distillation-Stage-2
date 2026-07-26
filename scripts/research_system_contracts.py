@@ -192,6 +192,126 @@ def main() -> int:
     checks["capability_manifest"] = any(
         row.get("capability") == "tool:right_square_chain" for row in manifest["tools"]
     )
+    family_h = baby_solver.parse_equation("x ◇ y = x")
+    family_g = baby_solver.parse_equation("x ◇ y = y")
+    family_action, family_adapter = baby_solver.normalize_llm_action({
+        "kind": "symbolic_model",
+        "carrier_size": 3,
+        "default": {"kind": "left"},
+        "budget": 2,
+    })
+    assert family_action is not None
+    family_found, family_state = baby_solver.false_model_family_attempt(
+        family_h,
+        family_g,
+        family_action,
+    )
+    near_found, near_state = baby_solver.false_model_family_attempt(
+        family_h,
+        family_g,
+        {
+            "kind": "false_model_family",
+            "carrier_size": 3,
+            "default": {"kind": "constant", "params": [0]},
+            "budget": 2,
+        },
+    )
+    unsafe_found, unsafe_state = baby_solver.false_model_family_attempt(
+        family_h,
+        family_g,
+        {
+            "kind": "false_model_family",
+            "carrier_size": 3,
+            "default": {"kind": "left"},
+            "rules": [{"when": "i == j", "value": "__import__('os').system('true')"}],
+            "budget": 2,
+        },
+    )
+    family_gate = baby_solver.capability_gate_state(
+        "false_model_family",
+        {"disabled": ["primitive:symbolic_family_evaluator"]},
+    )
+    invariant_rows = baby_solver.symbolic_invariant_report(family_h, family_g)
+    checks["finite_symbolic_family_contract"] = (
+        family_action.get("kind") == "tool_call"
+        and family_action.get("tool") == "false_model_family"
+        and family_adapter is None
+        and family_found is not None
+        and family_found[0] == 3
+        and baby_solver.is_counterexample(family_h, family_g, family_found[1])
+        and family_state.get("status") == "found"
+        and family_state.get("h_profile", {}).get("complete") is True
+        and family_state.get("g_profile", {}).get("failures_observed", 0) > 0
+        and invariant_rows[0].get("family") == "left_projection"
+        and invariant_rows[0].get("separates_goal") is True
+        and invariant_rows[0].get("action", {}).get("tool") is None
+        and invariant_rows[0].get("action", {}).get("kind") == "false_model_family"
+    )
+    checks["finite_symbolic_family_repair_feedback"] = (
+        near_found is None
+        and near_state.get("status") == "h_violated"
+        and near_state.get("repair_class") == "repair_h_preserve_g"
+        and bool(near_state.get("h_profile", {}).get("examples"))
+        and bool(near_state.get("g_profile", {}).get("examples"))
+        and unsafe_found is None
+        and unsafe_state.get("status") == "invalid_family"
+        and family_gate is not None
+        and family_gate.get("status") == "withheld_for_curriculum"
+    )
+    original_call_llm = baby_solver.call_llm
+    original_judge_infinite = baby_solver.judge_infinite_model_artifact_attributed
+    infinite_contexts: list[dict] = []
+    infinite_judges: list[str] = []
+    infinite_responses = [
+        {
+            "kind": "infinite_model",
+            "code": "import JudgeProblem\n\ndef submission : Goal := by\n  exact first_attempt",
+        },
+        {
+            "kind": "infinite_model",
+            "code": "import JudgeProblem\n\ndef submission : Goal := by\n  exact repaired_attempt",
+        },
+    ]
+    try:
+        def fake_call_llm(context):
+            infinite_contexts.append(context)
+            response = infinite_responses[min(len(infinite_contexts) - 1, 1)]
+            return {"response": json.dumps(response)}
+
+        def fake_judge_infinite(route, code, **kwargs):
+            del route, kwargs
+            infinite_judges.append(code)
+            if len(infinite_judges) == 1:
+                return {"status": "incorrect", "stderr": "unknown identifier first_attempt"}
+            return {"status": "accepted"}
+
+        baby_solver.call_llm = fake_call_llm
+        baby_solver.judge_infinite_model_artifact_attributed = fake_judge_infinite
+        infinite_status = baby_solver.try_llm_collaboration(
+            baby_solver.parse_equation("x = x"),
+            baby_solver.parse_equation("x = y"),
+            30,
+            max_rounds=3,
+            collaboration_goal="repair a complete infinite model",
+            prefer_false=True,
+            semantic_context={
+                "semantic_class": "contract_infinite",
+                "general_status": "false",
+                "finite_status": "true",
+                "certificate_class": "infinite_model",
+            },
+            allow_infinite_model_artifacts=True,
+        )
+    finally:
+        baby_solver.call_llm = original_call_llm
+        baby_solver.judge_infinite_model_artifact_attributed = original_judge_infinite
+    checks["infinite_model_multi_round_repair"] = (
+        infinite_status == "accepted_false_infinite_model_llm"
+        and len(infinite_contexts) == 2
+        and len(infinite_judges) == 2
+        and "judge_rejected_infinite_model" in infinite_contexts[1].get("mechanical_feedback", "")
+        and "10,000-byte artifact" in baby_solver.PROMPT
+    )
 
     signature = canonical_equation_signature("x ◇ y = y ◇ y")
     checks["alpha_canonicalization"] = signature == canonical_equation_signature("b ◇ b = a ◇ b")

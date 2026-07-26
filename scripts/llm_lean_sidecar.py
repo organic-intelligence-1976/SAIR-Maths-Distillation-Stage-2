@@ -8085,7 +8085,10 @@ def call_sidecar_llm(
         if not api_key:
             return {"error": f"{api_key_env} not set"}
     else:
-        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
+        if "openrouter.ai" in base_url:
+            api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
         if not api_key:
             return {"error": "OPENAI_API_KEY or OPENROUTER_API_KEY not set"}
 

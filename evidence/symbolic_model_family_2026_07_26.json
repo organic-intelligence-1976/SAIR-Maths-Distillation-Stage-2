@@ -1,0 +1,72 @@
+{
+  "schema_version": "sair-symbolic-family-evidence-v1",
+  "date": "2026-07-26",
+  "capability": "LLM-proposed finite symbolic countermodel family",
+  "production_contract": {
+    "action_kind": "false_model_family",
+    "consumer": "baby_solver.false_model_family_attempt",
+    "trust_boundary": [
+      "schema is validated without executing arbitrary code",
+      "operation is expanded to a finite table",
+      "H is checked universally",
+      "a concrete G-breaking assignment is required",
+      "the generated false certificate is accepted only by the Lean judge"
+    ],
+    "failed_family_feedback": [
+      "repair_class",
+      "H violation examples",
+      "G failure examples",
+      "hot operation cells",
+      "assignment and time completion status"
+    ]
+  },
+  "live_control": {
+    "problem_id": "evaluation_order5_0005",
+    "model": "openai/gpt-oss-120b",
+    "provider": "deepinfra/bf16",
+    "built_in_families_disabled": true,
+    "before_strict_invariant_card": {
+      "found_counterexample": false,
+      "llm_candidate_count": 3,
+      "summary": "The model invented three complicated affine/piecewise families; each violated H."
+    },
+    "after_strict_invariant_card": {
+      "found_counterexample": true,
+      "llm_candidate_count": 3,
+      "winning_action": {
+        "kind": "false_model_family",
+        "carrier_size": 2,
+        "default": {
+          "kind": "right"
+        }
+      },
+      "mechanical_status": "found",
+      "counterexample_size": 2,
+      "lean_judge_status": "accepted",
+      "second_verified_family": {
+        "carrier_size": 3,
+        "default": {
+          "kind": "right_successor"
+        }
+      }
+    },
+    "attribution": "The no-builtins control failed before the machine-computed strict family card and succeeded after the card; the LLM supplied the family action and the mechanical consumer plus Lean established validity."
+  },
+  "hard_frontier_probe": {
+    "problem_id": "hard2_0093",
+    "llm_rounds": 2,
+    "llm_candidate_count": 6,
+    "found_counterexample": false,
+    "useful_states": [
+      {
+        "repair_class": "break_g_preserve_h",
+        "summary": "An affine family satisfied H universally but also satisfied G."
+      },
+      {
+        "repair_class": "repair_h_preserve_g",
+        "summary": "Residue-class families broke G but still violated H."
+      }
+    ],
+    "interpretation": "The action language and feedback are live, but the current prompt/model did not repair a hard symbolic near miss in two rounds."
+  }
+}
