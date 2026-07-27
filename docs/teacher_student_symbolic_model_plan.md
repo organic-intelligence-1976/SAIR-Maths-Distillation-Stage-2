@@ -58,6 +58,15 @@ correction reprompt handles ignored primary repairs. This is a verified
 collaboration result, though `hard2_0125` was already solvable by broad
 mechanical CP-SAT and the first skew action was deliberately seeded.
 
+The equal-fiber constructor has since crossed the packed-solver coverage
+boundary. A generic native `skew_product:QxF` false-search route solved
+`hard1_0009`, which the prior packed solver missed at both 12 and 90 seconds.
+The official judge accepted the six-element `2x3` expansion; the same
+12-second 27-case audit moved from 25/27 to 27/27. A mechanically infeasible
+`2x2` attempt emits `2x3` as the next protocol action. This is a native
+mechanical win with useful System-2 feedback, not an LLM-attributed solve. See
+[`../evidence/case_study_native_skew_hard1_0009.md`](../evidence/case_study_native_skew_hard1_0009.md).
+
 The structured infinite lane did reach its first attribution milestone. A
 known `ℕ` model was assembled from five typed parts and accepted by the official
 research-profile judge. After injecting a broken theorem identifier into the

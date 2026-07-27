@@ -1,0 +1,99 @@
+{
+  "schema_version": "sair-native-skew-evidence-v1",
+  "generated_at": "2026-07-26",
+  "problem": {
+    "id": "hard1_0009",
+    "eq1_id": 2656,
+    "eq2_id": 2863,
+    "equation1": "x = ((x ◇ x) ◇ (y ◇ z)) ◇ y",
+    "equation2": "x = ((x ◇ (y ◇ x)) ◇ x) ◇ y",
+    "answer": false
+  },
+  "before": {
+    "twelve_second_run": {
+      "solved": false,
+      "elapsed_seconds": 11.58,
+      "llm_calls": 0,
+      "judge_calls": 1
+    },
+    "ninety_second_run": {
+      "solved": false,
+      "elapsed_seconds": 90.11,
+      "llm_calls": 1,
+      "judge_calls": 7,
+      "diagnosis": "The packed scheduler spent its observed judge attempts on rejected true certificates and never reached a successful false route."
+    }
+  },
+  "after": {
+    "twelve_second_run": {
+      "solved": true,
+      "verdict": "false",
+      "elapsed_seconds": 6.88,
+      "llm_calls": 0,
+      "judge_calls": 1,
+      "winning_route": "native:false:skew_product_early:table",
+      "judge_status": "accepted",
+      "backend": "pure_python_enumeration",
+      "environment": "approved-sandbox dependency simulation with OR-Tools disabled"
+    },
+    "optional_ortools_accelerated_run": {
+      "solved": true,
+      "verdict": "false",
+      "elapsed_seconds": 5.5,
+      "judge_status": "accepted"
+    },
+    "candidate_sweep": {
+      "budget_seconds_per_problem": 12,
+      "before_solved": 25,
+      "after_solved": 27,
+      "candidate_count": 27,
+      "before_total_elapsed_seconds": 87.74,
+      "after_total_elapsed_seconds": 75.41,
+      "optional_ortools_after_total_elapsed_seconds": 74.51,
+      "new_skew_accepts": [
+        "hard1_0009",
+        "hard1_0037"
+      ]
+    }
+  },
+  "symbolic_model": {
+    "factorization": {
+      "control_size": 2,
+      "fiber_size": 3,
+      "carrier_size": 6
+    },
+    "control_table": [
+      [0, 0],
+      [1, 1]
+    ],
+    "table": [
+      [2, 2, 2, 2, 2, 2],
+      [0, 0, 0, 0, 0, 0],
+      [1, 1, 1, 1, 1, 1],
+      [3, 5, 4, 4, 4, 4],
+      [5, 4, 3, 5, 5, 5],
+      [4, 3, 5, 3, 3, 3]
+    ],
+    "construction": "Each quotient cell selects an affine binary map on a three-element fiber. The approved-sandbox backend enumerates low-description-complexity maps first; optional CP-SAT uses CEGIS as an accelerator. Both backends expand candidates and mechanically require H universally plus a concrete G failure."
+  },
+  "feedback_ladder": {
+    "failed_route": "skew_product:2x2",
+    "mechanical_status": "family_infeasible",
+    "recommended_next_call": {
+      "kind": "tool_call",
+      "tool": "false_model_search",
+      "target": "goal",
+      "routes": [
+        "skew_product:2x3"
+      ],
+      "budget": 4.0
+    },
+    "next_route_result": "verified_countermodel"
+  },
+  "trust_boundary": {
+    "llm_load_bearing": false,
+    "mechanical_table_check": true,
+    "lean_judge_check": true,
+    "note": "This is a native mechanical coverage win whose route and failure feedback are available to the LLM. It is not counted as a load-bearing LLM solve."
+  }
+}

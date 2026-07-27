@@ -359,6 +359,77 @@ def main() -> int:
             )
         )
     )
+    packed_skew_h = baby_solver.parse_equation(
+        "x = ((x ◇ x) ◇ (y ◇ z)) ◇ y"
+    )
+    packed_skew_g = baby_solver.parse_equation(
+        "x = ((x ◇ (y ◇ x)) ◇ x) ◇ y"
+    )
+    packed_skew_found, packed_skew_state = baby_solver.false_model_search_detailed(
+        packed_skew_h,
+        packed_skew_g,
+        {
+            "template": "skew_product",
+            "routes": ["skew_product:2x3"],
+            "budget": 4,
+        },
+        4,
+    )
+    packed_small_skew_found, packed_small_skew_state = (
+        baby_solver.false_model_search_detailed(
+            packed_skew_h,
+            packed_skew_g,
+            {
+                "routes": ["skew_product:2x2"],
+                "budget": 4,
+            },
+            4,
+        )
+    )
+    packed_cp_available = baby_solver._CP_SAT_AVAILABLE
+    try:
+        baby_solver._CP_SAT_AVAILABLE = False
+        packed_pure_skew_found, packed_pure_skew_state = (
+            baby_solver.false_model_search_detailed(
+                packed_skew_h,
+                packed_skew_g,
+                {
+                    "routes": ["skew_product:2x3"],
+                    "budget": 4,
+                },
+                4,
+            )
+        )
+    finally:
+        baby_solver._CP_SAT_AVAILABLE = packed_cp_available
+    packed_pure_trial = packed_pure_skew_state.get("trials", [{}])[-1]
+    checks["packed_skew_product_route_contract"] = (
+        packed_skew_found is not None
+        and len(packed_skew_found[1]) == 6
+        and baby_solver.is_counterexample(
+            packed_skew_h,
+            packed_skew_g,
+            packed_skew_found[1],
+        )
+        and packed_skew_state.get("status") == "found"
+        and packed_skew_state.get("witness_style")
+        == "quotient_fiber_skew_product"
+        and packed_small_skew_found is None
+        and packed_small_skew_state.get("trials", [{}])[-1].get("status")
+        == "family_infeasible"
+        and packed_small_skew_state.get("recommended_next_call", {}).get(
+            "routes"
+        )
+        == ["skew_product:2x3"]
+        and packed_pure_skew_found is not None
+        and baby_solver.is_counterexample(
+            packed_skew_h,
+            packed_skew_g,
+            packed_pure_skew_found[1],
+        )
+        and packed_pure_trial.get("backend")
+        == "pure_python_enumeration"
+    )
     bundle_h = baby_solver.parse_equation(
         "x = ((x ◇ (y ◇ z)) ◇ z) ◇ x"
     )

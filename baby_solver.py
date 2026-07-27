@@ -95,6 +95,7 @@ There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"structured_ce","routes":["structured_ce:max_n=7"],"budget":8}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}
+{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"skew_product","routes":["skew_product:2x3"],"budget":4}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}
 {"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}
 {"kind":"goal_proof","proof":"intro x y\\nhave h1 := h x x x\\ngrind"}
@@ -677,8 +678,8 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "cost": "expensive",
         "feedback_quality": "rich",
         "native_import": "native_false_routes",
-        "aliases": ["countermodel_search", "finite_model_search", "local_search", "model_finder", "model_finder_v2", "poly_ce", "cp_sat", "sympy_sat", "structured_ce"],
-        "description": "Search for finite countermodels. Supports deterministic structured families, local search, propagation model finding, goal-directed search, optional CP-SAT, and polynomial routes.",
+        "aliases": ["countermodel_search", "finite_model_search", "local_search", "model_finder", "model_finder_v2", "poly_ce", "cp_sat", "sympy_sat", "structured_ce", "skew_product"],
+        "description": "Search for finite countermodels. Supports deterministic families, local/propagation search, exact CP-SAT, polynomial routes, and compact quotient-by-fiber skew products.",
     },
     "false_model_family": {
         "domain": "false",
@@ -2384,6 +2385,588 @@ def cp_sat_counterexample_search(
     }
 
 
+def affine_skew_fiber_library(size: int) -> list[dict[str, Any]]:
+    """Compact binary maps used inside quotient-by-fiber countermodels."""
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, ...]] = set()
+    for a, b, c in product(range(size), repeat=3):
+        table = tuple(
+            (a * left + b * right + c) % size
+            for left in range(size)
+            for right in range(size)
+        )
+        if table in seen:
+            continue
+        seen.add(table)
+        rows.append({"params": [a, b, c], "table": table})
+    return rows
+
+
+def skew_cp_eval(
+    model: Any,
+    term: Term,
+    env: dict[str, Any],
+    flat_operation: list[Any],
+    carrier_size: int,
+    counter: list[int],
+    prefix: str,
+) -> Any:
+    if term[0] == "var":
+        return env[term[1]]
+    left = skew_cp_eval(
+        model, term[1], env, flat_operation, carrier_size, counter, prefix
+    )
+    right = skew_cp_eval(
+        model, term[2], env, flat_operation, carrier_size, counter, prefix
+    )
+    if isinstance(left, int) and isinstance(right, int):
+        return flat_operation[left * carrier_size + right]
+    index = model.NewIntVar(
+        0,
+        carrier_size * carrier_size - 1,
+        f"{prefix}_index_{counter[0]}",
+    )
+    value = model.NewIntVar(
+        0,
+        carrier_size - 1,
+        f"{prefix}_value_{counter[0]}",
+    )
+    counter[0] += 1
+    model.Add(index == left * carrier_size + right)
+    model.AddElement(index, flat_operation, value)
+    return value
+
+
+def skew_equation_failure(
+    equation: dict[str, Any],
+    table: list[list[int]],
+    deadline: float,
+) -> dict[str, int] | None:
+    for values in product(
+        range(len(table)), repeat=len(equation["variables"])
+    ):
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        env = dict(zip(equation["variables"], values))
+        if (
+            eval_term(equation["lhs"], env, table)
+            != eval_term(equation["rhs"], env, table)
+        ):
+            return {key: int(value) for key, value in env.items()}
+    return None
+
+
+def pure_python_skew_product_search(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    control_size: int,
+    fiber_size: int,
+    time_budget: float,
+    *,
+    require_quotient_goal: bool,
+) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+    """Dependency-free compact search for the official solver sandbox."""
+    started = time.monotonic()
+    deadline = started + max(0.5, float(time_budget))
+    carrier_size = control_size * fiber_size
+    library = affine_skew_fiber_library(fiber_size)
+
+    # Low-description-complexity maps first: projections and shifted
+    # projections precede genuinely binary affine maps. This is a semantic
+    # search order over the family, not a problem-specific selector tuple.
+    selector_order = sorted(
+        range(len(library)),
+        key=lambda index: (
+            (
+                0
+                if library[index]["params"][:2] == [1, 0]
+                else 1
+                if library[index]["params"][:2] == [0, 1]
+                else 2
+                if (
+                    library[index]["params"][0] != 0
+                    and library[index]["params"][1] == 0
+                )
+                else 3
+                if library[index]["params"][:2] == [0, 0]
+                else 4
+                if library[index]["params"][0] == 0
+                else 5
+            ),
+            library[index]["params"][2],
+            library[index]["params"][0],
+            library[index]["params"][1],
+        ),
+    )
+    quotient_tables_checked = 0
+    quotient_candidates = 0
+    selector_tuples_checked = 0
+
+    try:
+        for flat_control in product(
+            range(control_size),
+            repeat=control_size * control_size,
+        ):
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            quotient_tables_checked += 1
+            control_table = [
+                list(
+                    flat_control[
+                        row * control_size : (row + 1) * control_size
+                    ]
+                )
+                for row in range(control_size)
+            ]
+            if skew_equation_failure(h_eq, control_table, deadline) is not None:
+                continue
+            if (
+                require_quotient_goal
+                and skew_equation_failure(
+                    g_eq, control_table, deadline
+                )
+                is not None
+            ):
+                continue
+            quotient_candidates += 1
+
+            for selectors in product(
+                selector_order,
+                repeat=control_size * control_size,
+            ):
+                selector_tuples_checked += 1
+                if (
+                    (selector_tuples_checked & 255) == 0
+                    and time.monotonic() >= deadline
+                ):
+                    raise TimeoutError
+                table: list[list[int]] = []
+                for left in range(carrier_size):
+                    left_control, left_fiber = divmod(left, fiber_size)
+                    row = []
+                    for right in range(carrier_size):
+                        right_control, right_fiber = divmod(right, fiber_size)
+                        selector = selectors[
+                            left_control * control_size + right_control
+                        ]
+                        fiber_value = library[selector]["table"][
+                            left_fiber * fiber_size + right_fiber
+                        ]
+                        row.append(
+                            control_table[left_control][right_control]
+                            * fiber_size
+                            + int(fiber_value)
+                        )
+                    table.append(row)
+
+                goal_witness = skew_equation_failure(g_eq, table, deadline)
+                if goal_witness is None:
+                    continue
+                if skew_equation_failure(h_eq, table, deadline) is not None:
+                    continue
+                return "found", table, {
+                    "template": "skew_product",
+                    "status": "verified_countermodel",
+                    "backend": "pure_python_enumeration",
+                    "control_size": control_size,
+                    "fiber_size": fiber_size,
+                    "carrier_size": carrier_size,
+                    "quotient_tables_checked": quotient_tables_checked,
+                    "quotient_candidates": quotient_candidates,
+                    "selector_tuples_checked": selector_tuples_checked,
+                    "control_table": control_table,
+                    "fiber_parameters": {
+                        f"{left},{right}": list(
+                            library[
+                                selectors[left * control_size + right]
+                            ]["params"]
+                        )
+                        for left in range(control_size)
+                        for right in range(control_size)
+                    },
+                    "goal_witness": goal_witness,
+                    "seconds": round(time.monotonic() - started, 3),
+                }
+    except TimeoutError:
+        return "budget", None, {
+            "template": "skew_product",
+            "status": "search_incomplete",
+            "backend": "pure_python_enumeration",
+            "control_size": control_size,
+            "fiber_size": fiber_size,
+            "carrier_size": carrier_size,
+            "quotient_tables_checked": quotient_tables_checked,
+            "quotient_candidates": quotient_candidates,
+            "selector_tuples_checked": selector_tuples_checked,
+            "seconds": round(time.monotonic() - started, 3),
+            "suggested_factorizations": [
+                [fiber_size, control_size],
+                [control_size, min(8, fiber_size + 1)],
+            ],
+        }
+    return "infeasible", None, {
+        "template": "skew_product",
+        "status": "family_infeasible",
+        "backend": "pure_python_enumeration",
+        "control_size": control_size,
+        "fiber_size": fiber_size,
+        "carrier_size": carrier_size,
+        "quotient_tables_checked": quotient_tables_checked,
+        "quotient_candidates": quotient_candidates,
+        "selector_tuples_checked": selector_tuples_checked,
+        "seconds": round(time.monotonic() - started, 3),
+        "suggested_factorizations": [
+            [fiber_size, control_size],
+            [control_size, min(8, fiber_size + 1)],
+        ],
+    }
+
+
+def skew_product_counterexample_search(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    control_size: int = 2,
+    fiber_size: int = 3,
+    time_budget: float = 4.0,
+    *,
+    require_quotient_goal: bool = True,
+    max_iterations: int = 64,
+    violation_batch: int = 12,
+    workers: int = 8,
+    seed: int = 0,
+) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
+    """Synthesize a compact quotient-by-fiber model.
+
+    Each element is `(q, f)`. The quotient operation is synthesized, while
+    every quotient cell selects one affine binary map on the fiber. Requiring
+    the quotient to satisfy both H and G means a found counterexample is
+    created by the extension rather than inherited from a smaller table.
+    The approved sandbox uses dependency-free enumeration; optional CP-SAT
+    accelerates the same family with CEGIS when available.
+    """
+    control_size = max(1, min(6, int(control_size)))
+    fiber_size = max(2, min(8, int(fiber_size)))
+    carrier_size = control_size * fiber_size
+    if carrier_size > 40:
+        return "invalid_factorization", None, {
+            "template": "skew_product",
+            "control_size": control_size,
+            "fiber_size": fiber_size,
+            "carrier_size": carrier_size,
+            "reason": "compact skew search is limited to 40 elements",
+        }
+    if not cp_sat_available():
+        return pure_python_skew_product_search(
+            h_eq,
+            g_eq,
+            control_size,
+            fiber_size,
+            time_budget,
+            require_quotient_goal=require_quotient_goal,
+        )
+
+    from ortools.sat.python import cp_model
+
+    started = time.monotonic()
+    deadline = started + max(0.5, float(time_budget))
+    library = affine_skew_fiber_library(fiber_size)
+    model = cp_model.CpModel()
+    control = {
+        (left, right): model.NewIntVar(
+            0, control_size - 1, f"skew_control_{left}_{right}"
+        )
+        for left in range(control_size)
+        for right in range(control_size)
+    }
+    selectors = {
+        (left, right): model.NewIntVar(
+            0, len(library) - 1, f"skew_selector_{left}_{right}"
+        )
+        for left in range(control_size)
+        for right in range(control_size)
+    }
+    operation = {
+        (left, right): model.NewIntVar(
+            0, carrier_size - 1, f"skew_operation_{left}_{right}"
+        )
+        for left in range(carrier_size)
+        for right in range(carrier_size)
+    }
+    flat_control = [
+        control[(left, right)]
+        for left in range(control_size)
+        for right in range(control_size)
+    ]
+    flat_operation = [
+        operation[(left, right)]
+        for left in range(carrier_size)
+        for right in range(carrier_size)
+    ]
+
+    for left in range(carrier_size):
+        left_control, left_fiber = divmod(left, fiber_size)
+        for right in range(carrier_size):
+            right_control, right_fiber = divmod(right, fiber_size)
+            fiber_value = model.NewIntVar(
+                0, fiber_size - 1, f"skew_fiber_value_{left}_{right}"
+            )
+            outputs = [
+                int(row["table"][left_fiber * fiber_size + right_fiber])
+                for row in library
+            ]
+            model.AddElement(
+                selectors[(left_control, right_control)],
+                outputs,
+                fiber_value,
+            )
+            model.Add(
+                operation[(left, right)]
+                == control[(left_control, right_control)] * fiber_size
+                + fiber_value
+            )
+
+    quotient_aux = [0]
+    quotient_obligations = 0
+
+    def add_quotient_equation(equation: dict[str, Any], label: str) -> None:
+        nonlocal quotient_obligations
+        for values in product(
+            range(control_size), repeat=len(equation["variables"])
+        ):
+            env = dict(zip(equation["variables"], values))
+            left = skew_cp_eval(
+                model,
+                equation["lhs"],
+                env,
+                flat_control,
+                control_size,
+                quotient_aux,
+                f"skew_quotient_{label}",
+            )
+            right = skew_cp_eval(
+                model,
+                equation["rhs"],
+                env,
+                flat_control,
+                control_size,
+                quotient_aux,
+                f"skew_quotient_{label}",
+            )
+            model.Add(left == right)
+            quotient_obligations += 1
+
+    add_quotient_equation(h_eq, "h")
+    if require_quotient_goal:
+        add_quotient_equation(g_eq, "g")
+
+    goal_aux = [0]
+    goal_env = {
+        variable: model.NewIntVar(
+            0, carrier_size - 1, f"skew_goal_witness_{variable}"
+        )
+        for variable in g_eq["variables"]
+    }
+    goal_left = skew_cp_eval(
+        model,
+        g_eq["lhs"],
+        goal_env,
+        flat_operation,
+        carrier_size,
+        goal_aux,
+        "skew_goal",
+    )
+    goal_right = skew_cp_eval(
+        model,
+        g_eq["rhs"],
+        goal_env,
+        flat_operation,
+        carrier_size,
+        goal_aux,
+        "skew_goal",
+    )
+    model.Add(goal_left != goal_right)
+
+    h_constraints: set[tuple[int, ...]] = set()
+    lifted_aux = [0]
+
+    def add_h_assignment(values: tuple[int, ...]) -> None:
+        if values in h_constraints:
+            return
+        h_constraints.add(values)
+        env = dict(zip(h_eq["variables"], values))
+        left = skew_cp_eval(
+            model,
+            h_eq["lhs"],
+            env,
+            flat_operation,
+            carrier_size,
+            lifted_aux,
+            "skew_lifted_h",
+        )
+        right = skew_cp_eval(
+            model,
+            h_eq["rhs"],
+            env,
+            flat_operation,
+            carrier_size,
+            lifted_aux,
+            "skew_lifted_h",
+        )
+        model.Add(left == right)
+
+    for values in product(
+        range(control_size), repeat=len(h_eq["variables"])
+    ):
+        add_h_assignment(tuple(value * fiber_size for value in values))
+    for value in range(carrier_size):
+        add_h_assignment(tuple(value for _ in h_eq["variables"]))
+
+    events: list[dict[str, Any]] = []
+    assignments_checked = 0
+    for iteration in range(1, max(1, min(int(max_iterations), 500)) + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            break
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(0.05, remaining)
+        solver.parameters.num_search_workers = max(1, min(int(workers), 16))
+        solver.parameters.random_seed = int(seed) + iteration - 1
+        cp_status = solver.Solve(model)
+        event: dict[str, Any] = {
+            "iteration": iteration,
+            "cp_status": solver.StatusName(cp_status),
+            "wall_time": round(float(solver.WallTime()), 3),
+            "branches": int(solver.NumBranches()),
+            "conflicts": int(solver.NumConflicts()),
+            "lifted_h_constraints": len(h_constraints),
+        }
+        events.append(event)
+        if cp_status == cp_model.INFEASIBLE:
+            return "infeasible", None, {
+                "template": "skew_product",
+                "status": "family_infeasible",
+                "backend": "ortools_cp_sat_cegis",
+                "control_size": control_size,
+                "fiber_size": fiber_size,
+                "carrier_size": carrier_size,
+                "quotient_obligations": quotient_obligations,
+                "lifted_h_constraints": len(h_constraints),
+                "iterations": iteration,
+                "events": events[-6:],
+                "suggested_factorizations": [
+                    [fiber_size, control_size],
+                    [control_size, min(8, fiber_size + 1)],
+                ],
+            }
+        if cp_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            break
+
+        table = [
+            [
+                int(solver.Value(operation[(left, right)]))
+                for right in range(carrier_size)
+            ]
+            for left in range(carrier_size)
+        ]
+        witness_env = {
+            variable: int(solver.Value(value))
+            for variable, value in goal_env.items()
+        }
+        violations: list[tuple[int, ...]] = []
+        scan_complete = True
+        checked = 0
+        for values in product(
+            range(carrier_size), repeat=len(h_eq["variables"])
+        ):
+            if time.monotonic() >= deadline:
+                scan_complete = False
+                break
+            checked += 1
+            env = dict(zip(h_eq["variables"], values))
+            if (
+                eval_term(h_eq["lhs"], env, table)
+                == eval_term(h_eq["rhs"], env, table)
+            ):
+                continue
+            violations.append(tuple(int(value) for value in values))
+            if len(violations) >= max(1, min(int(violation_batch), 64)):
+                scan_complete = False
+                break
+        assignments_checked += checked
+        event.update({
+            "h_assignments_checked": checked,
+            "h_scan_complete": scan_complete,
+            "h_violations_found": len(violations),
+            "goal_witness": {
+                "env": witness_env,
+                "lhs": eval_term(g_eq["lhs"], witness_env, table),
+                "rhs": eval_term(g_eq["rhs"], witness_env, table),
+            },
+        })
+        if scan_complete and not violations:
+            if not is_counterexample(h_eq, g_eq, table):
+                return "internal_error", None, {
+                    "template": "skew_product",
+                    "status": "verification_mismatch",
+                    "backend": "ortools_cp_sat_cegis",
+                    "events": events[-6:],
+                }
+            selectors_out = {
+                f"{left},{right}": list(
+                    library[int(solver.Value(selectors[(left, right)]))]["params"]
+                )
+                for left in range(control_size)
+                for right in range(control_size)
+            }
+            control_table = [
+                [
+                    int(solver.Value(control[(left, right)]))
+                    for right in range(control_size)
+                ]
+                for left in range(control_size)
+            ]
+            return "found", table, {
+                "template": "skew_product",
+                "status": "verified_countermodel",
+                "backend": "ortools_cp_sat_cegis",
+                "control_size": control_size,
+                "fiber_size": fiber_size,
+                "carrier_size": carrier_size,
+                "quotient_obligations": quotient_obligations,
+                "lifted_h_constraints": len(h_constraints),
+                "iterations": iteration,
+                "h_assignments_checked_total": assignments_checked,
+                "control_table": control_table,
+                "fiber_parameters": selectors_out,
+                "goal_witness": event["goal_witness"],
+                "events": events[-6:],
+                "seconds": round(time.monotonic() - started, 3),
+            }
+        if not violations:
+            break
+        for values in violations:
+            add_h_assignment(values)
+
+    return "budget", None, {
+        "template": "skew_product",
+        "status": "search_incomplete",
+        "backend": "ortools_cp_sat_cegis",
+        "control_size": control_size,
+        "fiber_size": fiber_size,
+        "carrier_size": carrier_size,
+        "quotient_obligations": quotient_obligations,
+        "lifted_h_constraints": len(h_constraints),
+        "iterations": len(events),
+        "h_assignments_checked_total": assignments_checked,
+        "events": events[-6:],
+        "seconds": round(time.monotonic() - started, 3),
+        "suggested_factorizations": [
+            [fiber_size, control_size],
+            [control_size, min(8, fiber_size + 1)],
+        ],
+    }
+
+
 _SYMPY_SAT_AVAILABLE: bool | None = None
 
 
@@ -2769,6 +3352,13 @@ def false_route_continuations(trials: list[dict[str, Any]]) -> list[str]:
         if "seed" not in t and t.get("template") != "cp_sat" and isinstance(t.get("n"), int)
     })
     cp_ns = sorted({int(t["n"]) for t in trials if t.get("template") == "cp_sat" and isinstance(t.get("n"), int)})
+    skew_factors = [
+        (int(t["control_size"]), int(t["fiber_size"]))
+        for t in trials
+        if t.get("template") == "skew_product"
+        and isinstance(t.get("control_size"), int)
+        and isinstance(t.get("fiber_size"), int)
+    ]
     candidate_ns = unique(local_ns + [6] + [min(8, n + 1) for n in local_ns])
     out: list[str] = []
 
@@ -2782,6 +3372,16 @@ def false_route_continuations(trials: list[dict[str, Any]]) -> list[str]:
         for n in unique(cp_next + base_ns):
             if 2 <= n <= 9:
                 add(f"cp_sat:n={n}")
+    if skew_factors:
+        control, fiber = skew_factors[-1]
+        for next_control, next_fiber in (
+            (fiber, control),
+            (control, min(8, fiber + 1)),
+        ):
+            if next_control * next_fiber <= 40:
+                add(f"skew_product:{next_control}x{next_fiber}")
+    else:
+        add("skew_product:2x3")
     if sympy_sat_available():
         for n in (6, 7, 8):
             add(f"sympy_sat:n={n}")
@@ -2808,8 +3408,18 @@ def false_route_budget(routes: list[Any], requested_budget: float) -> float:
     cp_ns: list[int] = []
     sympy_ns: list[int] = []
     v2_ns: list[int] = []
+    skew_factors: list[tuple[int, int]] = []
     for route in routes:
         route_l = str(route).lower()
+        skew_match = re.search(
+            r"(?:skew_product|skew|block_model)(?::|:factor=|=)?(\d+)x(\d+)",
+            route_l,
+        )
+        if skew_match:
+            skew_factors.append(
+                (int(skew_match.group(1)), int(skew_match.group(2)))
+            )
+            continue
         m_model = re.search(r"n=?(\d+)", route_l)
         if not m_model:
             continue
@@ -2834,6 +3444,9 @@ def false_route_budget(routes: list[Any], requested_budget: float) -> float:
         # run; execution budgets are owned by the caller (see
         # false_model_search_detailed).
         budget = max(budget, 120.0)
+    if skew_factors:
+        largest = max(control * fiber for control, fiber in skew_factors)
+        budget = max(budget, 8.0 if largest > 8 else 4.0)
     return max(3.0, budget)
 
 
@@ -2861,6 +3474,7 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
     propagation_routes: list[dict[str, Any]] = []
     cp_sat_routes: list[dict[str, Any]] = []
     sympy_sat_routes: list[dict[str, Any]] = []
+    skew_routes: list[dict[str, Any]] = []
 
     for trial in trials:
         if not isinstance(trial, dict):
@@ -2913,6 +3527,26 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
                 "backend": trial.get("backend"),
                 "trials": trial.get("trials"),
             })
+        if template == "skew_product":
+            skew_routes.append({
+                "route": route,
+                "status": trial.get("status"),
+                "control_size": trial.get("control_size"),
+                "fiber_size": trial.get("fiber_size"),
+                "carrier_size": trial.get("carrier_size"),
+                "backend": trial.get("backend"),
+                "iterations": trial.get("iterations"),
+                "lifted_h_constraints": trial.get("lifted_h_constraints"),
+                "quotient_tables_checked": trial.get(
+                    "quotient_tables_checked"
+                ),
+                "quotient_candidates": trial.get("quotient_candidates"),
+                "selector_tuples_checked": trial.get(
+                    "selector_tuples_checked"
+                ),
+                "seconds": trial.get("seconds"),
+                "suggested_factorizations": trial.get("suggested_factorizations"),
+            })
 
         for item in trial.get("top_blocked_cells") or []:
             cell = item.get("cell") if isinstance(item, dict) else None
@@ -2945,6 +3579,8 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
         policy.append("An exact cp_sat route reached UNKNOWN rather than infeasible; retry the same carrier with more budget, then move carrier size if it remains unknown.")
     if any(row.get("status") in {"timeout", "unsat_or_timeout"} for row in sympy_sat_routes):
         policy.append("A sympy_sat exact route timed out; retry only one carrier size with a larger budget, or switch to model_finder_v2/local_search using the same carrier.")
+    if skew_routes and skew_routes[-1].get("status") in {"family_infeasible", "search_incomplete", "budget"}:
+        policy.append("The compact quotient-by-fiber family did not close; try its suggested transposed/larger factorization before abandoning structured extensions.")
     if not policy:
         policy.append("Return one untried false_model_search route or switch to a true-side midpoint/lemma_chain.")
 
@@ -2955,6 +3591,7 @@ def false_trial_highlights(trials: list[dict[str, Any]], continuations: list[str
         "propagation_route_summaries": propagation_routes[-4:],
         "cp_sat_route_summaries": cp_sat_routes[-3:],
         "sympy_sat_route_summaries": sympy_sat_routes[-3:],
+        "skew_route_summaries": skew_routes[-3:],
         "hot_blocked_cells": top_counter(blocked, limit=5),
         "hot_branch_cells": top_counter(branched, limit=5),
         "best_partial_progress": best_progress,
@@ -3057,6 +3694,10 @@ def false_model_search_detailed(
             routes = ["poly_ce:tier=2:nmax=13"]
         elif template in {"cp_sat", "cpsat", "constraint_sat"}:
             routes = [f"cp_sat:n={int(n)}" for n in sizes]
+        elif template in {"skew_product", "skew", "block_model"}:
+            control = int(call.get("control_size") or call.get("quotient_size") or 2)
+            fiber = int(call.get("fiber_size") or 3)
+            routes = [f"skew_product:{control}x{fiber}"]
         elif template in {"sympy_sat", "sympy", "cnf_sat", "dpll"}:
             routes = [f"sympy_sat:n={int(n)}" for n in sizes]
         elif template in {"structured_ce", "ce_engine", "witness_families"}:
@@ -3070,8 +3711,18 @@ def false_model_search_detailed(
     skipped_routes = [str(route) for route in routes[route_limit:]]
     cp_sat_ns = []
     sympy_sat_ns = []
+    skew_factors = []
     for route in active_routes:
         route_l = str(route).lower()
+        skew_match = re.search(
+            r"(?:skew_product|skew|block_model)(?::|:factor=|=)?(\d+)x(\d+)",
+            route_l,
+        )
+        if skew_match:
+            skew_factors.append(
+                (int(skew_match.group(1)), int(skew_match.group(2)))
+            )
+            continue
         m_model = re.search(r"n=?(\d+)", route_l)
         if not m_model:
             continue
@@ -3086,6 +3737,9 @@ def false_model_search_detailed(
             budget = max(budget, 24.0)
         elif max(cp_sat_ns) >= 7:
             budget = max(budget, 16.0)
+    if skew_factors:
+        largest = max(control * fiber for control, fiber in skew_factors)
+        budget = max(budget, 8.0 if largest > 8 else 4.0)
     # Deliberately no hidden budget floor for sympy_sat here: the caller owns
     # the time contract. solve()'s late portfolio grants the exact-route
     # window explicitly (bounded by remaining solve time), and the route
@@ -3095,6 +3749,42 @@ def false_model_search_detailed(
     for route in active_routes:
         route_s = str(route)
         route_l = route_s.lower()
+        skew_match = re.search(
+            r"(?:skew_product|skew|block_model)(?::|:factor=|=)?(\d+)x(\d+)",
+            route_l,
+        )
+        if skew_match:
+            control_size = int(skew_match.group(1))
+            fiber_size = int(skew_match.group(2))
+            status, table, meta = skew_product_counterexample_search(
+                h_eq,
+                g_eq,
+                control_size,
+                fiber_size,
+                per,
+            )
+            trials.append({
+                "route": route_s,
+                "status": status,
+                "template": "skew_product",
+                **meta,
+            })
+            if table is not None and is_counterexample(h_eq, g_eq, table):
+                return (len(table), table), protocolize_state({
+                    "kind": "FalseModelSearchState",
+                    "status": "found",
+                    "trials": trials,
+                    "counterexample_size": len(table),
+                    "source": route_s,
+                    "witness_style": "quotient_fiber_skew_product",
+                    "symbolic_parameters": {
+                        "control_size": meta.get("control_size"),
+                        "fiber_size": meta.get("fiber_size"),
+                        "control_table": meta.get("control_table"),
+                        "fiber_parameters": meta.get("fiber_parameters"),
+                    },
+                }, "false_model_search")
+            continue
         if "structured_ce" in route_l or "ce_engine" in route_l or "witness_families" in route_l:
             m_nmax = re.search(r"(?:max_n|nmax)=?(\d+)", route_l)
             max_n = int(m_nmax.group(1)) if m_nmax else 7
@@ -7743,6 +8433,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder_v2","routes":["model_finder_v2:n=6"],"budget":8}',
         "If exact finite-domain CP-SAT is available and small sizes need proof/witness search, ask for:",
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}',
+        "If ordinary table search stalls, try a compact quotient-by-fiber extension. A 2x3 route synthesizes a two-element quotient and affine local maps on three-element fibers; a failed state recommends changed factors:",
+        '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"skew_product","routes":["skew_product:2x3"],"budget":4}',
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}',
         "If false may need a structured larger witness, ask for polynomial magma search:",
         '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}',
@@ -7833,13 +8525,14 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
             "model_finder_v2:n=7",
             "model_finder_v2:n=8",
             "sympy_sat:n=6",
+            "skew_product:2x3",
             "cp_sat:n=5",
             "cp_sat:n=6",
             "poly_ce:tier=2:nmax=13",
             "structured_ce:max_n=7",
         ]
         if prefer_false
-        else ["model_finder_v2:n=5", "local_search:n=6:seed=2", "poly_ce:tier=2:nmax=13", "structured_ce:max_n=7"]
+        else ["model_finder_v2:n=5", "skew_product:2x3", "local_search:n=6:seed=2", "poly_ce:tier=2:nmax=13", "structured_ce:max_n=7"]
     )
     ranked.append({"tool": "false_model_search", "score": 94 if prefer_false else 40, "why": "Prefer concrete finite-countermodel routes now; true-side tools have already failed or are low-confidence." if prefer_false else "Try bounded finite countermodel routes if false is plausible; model_finder_v2 gives goal-directed Skolem feedback and poly_ce can find structured larger witnesses.", "call": {"kind": "tool_call", "tool": "false_model_search", "target": "goal", "routes": false_routes, "budget": 12 if prefer_false else 8}})
     ranked.append({
@@ -8008,6 +8701,9 @@ def is_false_model_payload(data: dict[str, Any]) -> bool:
             "cp_sat",
             "cpsat",
             "constraint_sat",
+            "skew_product",
+            "skew",
+            "block_model",
             "structured_ce",
             "ce_engine",
             "witness_families",
@@ -8846,6 +9542,32 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         return "accepted_false_v2"
     if not found and isinstance(false_state, dict):
         false_failure_feedback.append(false_state)
+
+    # Compact extensions are cheap enough to scout before the broad true
+    # battery, and occupy a different search language from arbitrary tables.
+    # Keeping this as an ordinary false_model_search route makes the exact
+    # state available to the LLM and lets later calls vary the factorization.
+    remaining = max(0.0, budget - (time.monotonic() - solve_started))
+    if remaining >= 6.0:
+        found, skew_state = false_model_search_detailed(
+            h_eq,
+            g_eq,
+            {
+                "routes": ["skew_product:2x3"],
+                "budget": min(4.0, remaining),
+            },
+            4,
+            semantic_context=semantic_context,
+        )
+        if found and try_false_artifact_attributed(
+            "native:false:skew_product_early",
+            found,
+            source="native_false_search",
+            detail={"factorization": "2x3"},
+        ):
+            return "accepted_false_skew_product"
+        if not found and isinstance(skew_state, dict):
+            false_failure_feedback.append(skew_state)
 
     # One-sided variables in H are a strong, cheap signal for collapse,
     # projection, or row-constancy.  Give those helpers a short native scout
