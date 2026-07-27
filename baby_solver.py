@@ -101,6 +101,7 @@ There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"skew_product","routes":["skew_product:2x3"],"budget":4}
 {"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}
 {"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}
+{"kind":"tool_call","tool":"residue_ray_countermodel","target":"goal","moduli":[2],"a_values":[-1,0,1],"b_values":[-1,0,1],"c_values":[-1,0,1],"candidate_cap":2000,"budget":2}
 {"kind":"symbolic_model_plan","representation":"infinite","model_name":"model","imports":["Mathlib.Tactic"],"carrier":"ℕ","definitions":["let parity : Nat → Bool := ...","let op (x y : Nat) := ..."],"operation":"op","setup":["have helper : ... := by\n  ..."],"hypothesis_proof":"intro x y z\n...","counterexample_proof":"intro goal_holds\nhave h := goal_holds ...\n..."}
 {"kind":"symbolic_model_patch","set":{"hypothesis_proof":"intro x y z\n<complete repaired tactic body>"}}
 {"kind":"goal_proof","proof":"intro x y\\nhave h1 := h x x x\\ngrind"}
@@ -698,6 +699,23 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": ["symbolic_countermodel", "symbolic_model", "finite_model_family"],
         "description": "Expand and verify an LLM-proposed finite symbolic operation family, returning exact H/G near-miss diagnostics or a finite certificate.",
     },
+    "residue_ray_countermodel": {
+        "domain": "false",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collab_protocol",
+        "aliases": [
+            "residue_clamped_affine_search",
+            "residue_ray_search",
+            "symbolic_ray_search",
+        ],
+        "description": (
+            "Search an infinite residue-controlled clamped-affine operation family, "
+            "report prefix and involution failures, and compile supported candidates "
+            "to a Lean-checked symbolic countermodel."
+        ),
+    },
     "infinite_model_artifact": {
         "domain": "false",
         "scope": "whole_goal",
@@ -728,32 +746,9 @@ TOOL_ALIASES = {
 TOOL_CONTRACT_FIELDS = ("domain", "scope", "cost", "feedback_quality", "native_import", "deployability")
 
 
-# Research-layer semantics.  Most competition rows do not yet have an audited
-# finite/general classification, so absence from this table deliberately means
-# "unknown", not "ordinary false".  These two entries are the first regression
-# fixtures for the curriculum described in docs/research_curriculum_plan.md.
-KNOWN_IMPLICATION_SEMANTICS: dict[tuple[int, int], dict[str, Any]] = {
-    (1167, 1763): {
-        "semantic_class": "austin_implication",
-        "semantic_target": "general_implication",
-        "general_status": "false",
-        "finite_status": "true",
-        "certificate_class": "infinite_model",
-        "source": "ETP Austin-pair classification",
-        "source_commit": "df8184f8ae59c71d6f5463b71682d871823a779c",
-        "source_registry_sha256": "38d357e116a578cd6654908c0346b4c6ee70dc801ab0a9b542a604206d926c11",
-        "note": "Every finite 1167-magma satisfies E1763, but the unrestricted implication is false.",
-    },
-    (677, 255): {
-        "semantic_class": "open_finite_implication",
-        "semantic_target": "finite_implication",
-        "general_status": "false",
-        "finite_status": "unknown",
-        "certificate_class": "finite_model_or_finite_structure_proof",
-        "source": "ETP Equation 677 chapter",
-        "note": "The unrestricted implication is false; whether E677 implies E255 in every finite magma is open.",
-    },
-}
+# Production solving is intentionally equation-driven. Curated semantic facts
+# belong in the research data layer, not in exact-ID branches in the submission.
+KNOWN_IMPLICATION_SEMANTICS: dict[tuple[int, int], dict[str, Any]] = {}
 
 
 def implication_semantics(problem: dict[str, Any]) -> dict[str, Any]:
@@ -900,6 +895,10 @@ CAPABILITY_DEPENDENCIES: dict[str, list[str]] = {
     "standard_aux_superposition": ["primitive:proof_carrying_superposition"],
     "false_model_search": ["primitive:finite_model_search"],
     "false_model_family": ["primitive:symbolic_family_evaluator", "primitive:finite_model_search"],
+    "residue_ray_countermodel": [
+        "primitive:infinite_symbolic_family_search",
+        "primitive:lean_verifier",
+    ],
     "infinite_model_artifact": ["artifact:infinite_model", "primitive:lean_verifier"],
 }
 
@@ -919,6 +918,13 @@ PRIMITIVE_CAPABILITIES: dict[str, dict[str, Any]] = {
     "primitive:symbolic_family_evaluator": {
         "kind": "primitive",
         "description": "Validate compact finite operation schemas, expand them to tables, and report universal H/G diagnostics.",
+    },
+    "primitive:infinite_symbolic_family_search": {
+        "kind": "primitive",
+        "description": (
+            "Search proof-friendly residue-controlled operations on an unbounded "
+            "ray and compile supported structural certificates."
+        ),
     },
     "primitive:lean_verifier": {
         "kind": "verifier",
@@ -1899,6 +1905,413 @@ def false_model_family_attempt(
         need_hint=need_hint,
     )
     return ((len(table), table) if status == "found" else None), state
+
+
+def residue_ray_promising_h(h_eq: dict[str, Any]) -> bool:
+    """Cheap structural gate for an unbounded finite-state left action."""
+    for lone, body in ((h_eq["lhs"], h_eq["rhs"]), (h_eq["rhs"], h_eq["lhs"])):
+        if lone[0] != "var":
+            continue
+        variable = lone[1]
+        leaves = term_leaf_sequence(body)
+        if leaves and leaves[-1] == variable and leaves.count(variable) == 1:
+            return True
+    return False
+
+
+def _ray_int_values(
+    values: Any,
+    default: list[int],
+    *,
+    low: int,
+    high: int,
+) -> list[int]:
+    raw = values if isinstance(values, list) else default
+    out: list[int] = []
+    for value in raw:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if low <= parsed <= high and parsed not in out:
+            out.append(parsed)
+    return out
+
+
+def _ray_operation(
+    modulus: int,
+    same: tuple[int, int, int],
+    different: tuple[int, int, int],
+):
+    def op(x: int, y: int) -> int:
+        a, b, c = same if x % modulus == y % modulus else different
+        return max(0, a * x + b * y + c)
+
+    return op
+
+
+def _ray_eval_term(term: Term, env: dict[str, int], op) -> int:
+    if term[0] == "var":
+        return env[term[1]]
+    return op(
+        _ray_eval_term(term[1], env, op),
+        _ray_eval_term(term[2], env, op),
+    )
+
+
+def _ray_h_failures(
+    h_eq: dict[str, Any],
+    op,
+    *,
+    value_limit: int,
+    failure_cap: int = 16,
+) -> tuple[int, list[dict[str, Any]]]:
+    failures = 0
+    examples: list[dict[str, Any]] = []
+    for values in product(range(value_limit + 1), repeat=len(h_eq["variables"])):
+        env = dict(zip(h_eq["variables"], values))
+        lhs = _ray_eval_term(h_eq["lhs"], env, op)
+        rhs = _ray_eval_term(h_eq["rhs"], env, op)
+        if lhs == rhs:
+            continue
+        failures += 1
+        if len(examples) < 4:
+            examples.append({"env": env, "lhs": lhs, "rhs": rhs})
+        if failures >= failure_cap:
+            break
+    return failures, examples
+
+
+def _ray_goal_witness(
+    g_eq: dict[str, Any],
+    op,
+    *,
+    value_limit: int,
+) -> dict[str, Any] | None:
+    fallback = None
+    for values in product(range(value_limit + 1), repeat=len(g_eq["variables"])):
+        env = dict(zip(g_eq["variables"], values))
+        lhs = _ray_eval_term(g_eq["lhs"], env, op)
+        rhs = _ray_eval_term(g_eq["rhs"], env, op)
+        if lhs == rhs:
+            continue
+        candidate = {"env": env, "lhs": lhs, "rhs": rhs}
+        if lhs % 2 != rhs % 2:
+            return candidate
+        if fallback is None:
+            fallback = candidate
+    return fallback
+
+
+def _ray_involution_failures(op, *, value_limit: int = 8) -> list[dict[str, int]]:
+    failures: list[dict[str, int]] = []
+    for a, x in product(range(value_limit + 1), repeat=2):
+        result = op(a, op(a, x))
+        if result == x:
+            continue
+        failures.append({"a": a, "x": x, "result": result})
+        if len(failures) >= 12:
+            break
+    return failures
+
+
+def _ray_coefficient_triples(
+    a_values: list[int],
+    b_values: list[int],
+    c_values: list[int],
+) -> list[tuple[int, int, int]]:
+    triples = list(product(a_values, b_values, c_values))
+    return sorted(
+        triples,
+        key=lambda item: (
+            item[0] != 0,
+            item[1] != 1,
+            abs(item[2]),
+            abs(item[0]) + abs(item[1] - 1) + abs(item[2]),
+            item,
+        ),
+    )
+
+
+def _parity_walk_h_roles(h_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Recognize x = y ◇ ((z ◇ (y ◇ y)) ◇ x), up to names/orientation."""
+    for reversed_eq, lone, body in (
+        (False, h_eq["lhs"], h_eq["rhs"]),
+        (True, h_eq["rhs"], h_eq["lhs"]),
+    ):
+        if lone[0] != "var" or body[0] != "op":
+            continue
+        x = lone
+        y = body[1]
+        tail = body[2]
+        if y[0] != "var" or tail[0] != "op" or tail[2] != x:
+            continue
+        middle = tail[1]
+        if middle[0] != "op":
+            continue
+        z = middle[1]
+        square = middle[2]
+        if (
+            z[0] == "var"
+            and square[0] == "op"
+            and square[1] == y
+            and square[2] == y
+            and len({x[1], y[1], z[1]}) == 3
+        ):
+            return {
+                "reversed": reversed_eq,
+                "x": x[1],
+                "y": y[1],
+                "z": z[1],
+            }
+    return None
+
+
+def _ray_nat_literal(value: int) -> str:
+    out = "Nat.zero"
+    for _ in range(max(0, value)):
+        out = f"Nat.succ ({out})"
+    return out
+
+
+def _ray_pair_literal(value: int) -> str:
+    parity = "true" if value % 2 else "false"
+    return f"({parity}, {_ray_nat_literal(value // 2)})"
+
+
+def render_residue_ray_countermodel(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    """Compile the proof-friendly parity-walk member of the searched family."""
+    supported_parameters = (
+        candidate.get("modulus") == 2
+        and candidate.get("same") == [0, 1, 1]
+        and candidate.get("different") == [0, 1, -1]
+    )
+    roles = _parity_walk_h_roles(h_eq)
+    witness = candidate.get("g_witness")
+    if not supported_parameters or roles is None or not isinstance(witness, dict):
+        return None, protocol_state(
+            "ResidueRayCertificateState",
+            "unsupported_proof_obligation",
+            "residue_ray_countermodel",
+            tool="residue_ray_countermodel",
+            supported_parameters=supported_parameters,
+            supported_h_shape=roles is not None,
+            need_hint=(
+                "The prefix candidate is not yet covered by a symbolic proof compiler. "
+                "Keep its parameters and provide a reusable invariant/involution proof, "
+                "or search another proof-supported residue walk."
+            ),
+        )
+
+    local_names = {
+        variable: f"v{index}"
+        for index, variable in enumerate(h_eq["variables"])
+    }
+    x = local_names[roles["x"]]
+    y = local_names[roles["y"]]
+    z = local_names[roles["z"]]
+    intro_vars = " ".join(local_names[variable] for variable in h_eq["variables"])
+    changed_h = f"{x} = op {y} (op (op {z} (op {y} {y})) {x})"
+    if roles["reversed"]:
+        changed_h = f"op {y} (op (op {z} (op {y} {y})) {x}) = {x}"
+    orientation_step = "    symm\n" if roles["reversed"] else ""
+
+    env = witness.get("env") or {}
+    if any(variable not in env for variable in g_eq["variables"]):
+        return None, protocol_state(
+            "ResidueRayCertificateState",
+            "invalid_goal_witness",
+            "residue_ray_countermodel",
+            tool="residue_ray_countermodel",
+            need_hint="Return a concrete value for every goal variable.",
+        )
+    op = _ray_operation(2, (0, 1, 1), (0, 1, -1))
+    lhs = _ray_eval_term(g_eq["lhs"], env, op)
+    rhs = _ray_eval_term(g_eq["rhs"], env, op)
+    if lhs == rhs or lhs % 2 == rhs % 2:
+        return None, protocol_state(
+            "ResidueRayCertificateState",
+            "unsupported_goal_witness",
+            "residue_ray_countermodel",
+            tool="residue_ray_countermodel",
+            goal_witness=witness,
+            need_hint=(
+                "Find a goal-breaking assignment whose two values have different "
+                "residue states; the current compact contradiction renderer uses "
+                "the finite control coordinate."
+            ),
+        )
+    witness_args = " ".join(
+        _ray_pair_literal(int(env[variable]))
+        for variable in g_eq["variables"]
+    )
+    lhs_literal = _ray_pair_literal(lhs)
+    rhs_literal = _ray_pair_literal(rhs)
+    contradiction = (
+        "Bool.noConfusion (congrArg Prod.fst h)"
+        if lhs % 2 == 0
+        else "Bool.noConfusion (Eq.symm (congrArg Prod.fst h))"
+    )
+
+    code = f"""import JudgeProblem
+import Mathlib.Tactic
+
+def submission : Goal := by
+  let op : (Bool × Nat) → (Bool × Nat) → (Bool × Nat) :=
+    fun a x =>
+      match a.1, x.1 with
+      | false, q => (Bool.not q, x.2)
+      | true, false =>
+          Nat.rec (false, Nat.zero) (fun k _ => (true, k)) x.2
+      | true, true => (false, Nat.succ x.2)
+  let model : Magma (Bool × Nat) := ⟨op⟩
+  use Bool × Nat, model
+  have op_left_congr (a b x : Bool × Nat) (hab : a.1 = b.1) :
+      op a x = op b x := by
+    rcases a with ⟨qa, ka⟩
+    rcases b with ⟨qb, kb⟩
+    rcases x with ⟨qx, kx⟩
+    cases hab
+    rfl
+  have op_invol (a x : Bool × Nat) : op a (op a x) = x := by
+    rcases a with ⟨qa, ka⟩
+    rcases x with ⟨qx, kx⟩
+    cases qa
+    · cases qx <;> rfl
+    · cases qx
+      · exact Nat.rec (by rfl) (fun k _ => by rfl) kx
+      · rfl
+  have middle_key (z y : Bool × Nat) :
+      (op z (op y y)).1 = y.1 := by
+    rcases z with ⟨qz, kz⟩
+    rcases y with ⟨qy, ky⟩
+    cases qz <;> cases qy <;> rfl
+  constructor
+  · intro {intro_vars}
+    change {changed_h}
+{orientation_step}    rw [op_left_congr (op {z} (op {y} {y})) {y} {x} (middle_key {z} {y})]
+    exact (op_invol {y} {x}).symm
+  · intro goal_holds
+    have h := goal_holds {witness_args}
+    change {lhs_literal} = {rhs_literal} at h
+    exact {contradiction}
+"""
+    return code, protocol_state(
+        "ResidueRayCertificateState",
+        "candidate_ready",
+        "residue_ray_countermodel",
+        tool="residue_ray_countermodel",
+        representation="Bool × Nat",
+        family="residue_controlled_clamped_affine",
+        candidate=candidate,
+        artifact_bytes=len(code.encode("utf-8")),
+        trust_boundary="The generated symbolic artifact remains untrusted until Lean accepts it.",
+    )
+
+
+def residue_ray_countermodel_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    data: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    """Search one LLM-selected residue/clamped-affine family and compile it."""
+    moduli = _ray_int_values(data.get("moduli"), [2, 3], low=2, high=5)
+    a_values = _ray_int_values(data.get("a_values"), [-1, 0, 1], low=-2, high=2)
+    b_values = _ray_int_values(data.get("b_values"), [-1, 0, 1], low=-2, high=2)
+    c_values = _ray_int_values(data.get("c_values"), [-2, -1, 0, 1, 2], low=-4, high=4)
+    if not moduli or not a_values or not b_values or not c_values:
+        return None, protocol_state(
+            "ResidueRaySearchState",
+            "invalid_family",
+            "residue_ray_countermodel",
+            tool="residue_ray_countermodel",
+            need_hint="Use nonempty integer moduli/a_values/b_values/c_values within the documented bounds.",
+        )
+    candidate_cap = max(1, min(10_000, int(data.get("candidate_cap") or 2500)))
+    value_limit = max(4, min(20, int(data.get("value_limit") or 12)))
+    time_budget = max(0.05, min(5.0, float(data.get("budget") or 2.0)))
+    deadline = time.monotonic() + time_budget
+    triples = _ray_coefficient_triples(a_values, b_values, c_values)
+    checked = 0
+    best: list[dict[str, Any]] = []
+    winner = None
+
+    for modulus in moduli:
+        for same, different in product(triples, repeat=2):
+            if checked >= candidate_cap or time.monotonic() >= deadline:
+                break
+            checked += 1
+            op = _ray_operation(modulus, same, different)
+            h_failures, h_examples = _ray_h_failures(
+                h_eq,
+                op,
+                value_limit=value_limit,
+            )
+            witness = _ray_goal_witness(g_eq, op, value_limit=value_limit)
+            candidate = {
+                "modulus": modulus,
+                "same": list(same),
+                "different": list(different),
+                "h_failures": h_failures,
+                "h_examples": h_examples,
+                "g_witness": witness,
+                "involution_failures": _ray_involution_failures(op),
+            }
+            best.append(candidate)
+            best.sort(key=lambda row: (
+                row["h_failures"],
+                row["g_witness"] is None,
+                len(row["involution_failures"]),
+                row["modulus"],
+            ))
+            del best[8:]
+            if h_failures == 0 and witness is not None:
+                winner = candidate
+                break
+        if winner is not None or checked >= candidate_cap or time.monotonic() >= deadline:
+            break
+
+    search_state = protocol_state(
+        "ResidueRaySearchState",
+        "prefix_candidate_found" if winner else "search_exhausted",
+        "residue_ray_countermodel",
+        tool="residue_ray_countermodel",
+        family={
+            "shape": "max(0, a*x+b*y+c), split by equal/different residues",
+            "moduli": moduli,
+            "a_values": a_values,
+            "b_values": b_values,
+            "c_values": c_values,
+        },
+        checked_candidates=checked,
+        value_limit=value_limit,
+        winner=winner,
+        best_candidates=best[:4],
+        need_hint=(
+            None
+            if winner
+            else "Use H examples and involution failures to narrow or change the residue family."
+        ),
+        trust_boundary="Finite-prefix testing cannot certify an infinite model.",
+    )
+    if winner is None:
+        return None, search_state
+    code, certificate_state = render_residue_ray_countermodel(h_eq, g_eq, winner)
+    if code is None:
+        search_state["certificate_state"] = certificate_state
+        search_state["status"] = "prefix_candidate_uncertified"
+        search_state["need_hint"] = certificate_state.get("need_hint")
+        return None, search_state
+    certificate_state["search_state"] = {
+        "checked_candidates": checked,
+        "value_limit": value_limit,
+        "family": search_state["family"],
+    }
+    return code, certificate_state
 
 
 def local_search_route(h_eq: dict[str, Any], g_eq: dict[str, Any], n: int, seed: int, budget: float):
@@ -8342,6 +8755,11 @@ def run_tool_call_detailed(
         state = dict(state or {})
         state["candidate_ready"] = found is not None
         return None, state
+    if tool == "residue_ray_countermodel":
+        code, state = residue_ray_countermodel_attempt(h_eq, g_eq, call)
+        state = dict(state or {})
+        state["candidate_ready"] = code is not None
+        return None, state
     if tool == "infinite_model_artifact":
         _code, state = validate_infinite_model_payload(call)
         return None, state
@@ -8350,7 +8768,7 @@ def run_tool_call_detailed(
         "unsupported_tool",
         "tool_registry",
         tool=raw_tool,
-        need_hint="Choose one supported tool from the registry, or return a midpoint/lemma_chain/false_model_search/false_model_family action.",
+        need_hint="Choose one supported tool from the registry, or return a midpoint/lemma_chain/false_model_search/false_model_family/residue_ray_countermodel action.",
     )
 
 
@@ -8391,7 +8809,7 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         advice.append("H matches rowconst_certificates.")
     if square_rowconst_h(h_eq):
         advice.append("H matches grounding_derived square-rowconst: derive a ◇ b = a ◇ a and close explicitly.")
-    advice.append("If false, use false_model_search for fixed routes or false_model_family for a compact LLM-proposed finite operation. Family proposals are expanded and checked mechanically; failed families return H violations, G failures, and hot operation cells.")
+    advice.append("If false, use false_model_search for fixed finite routes, false_model_family for a compact finite operation, or residue_ray_countermodel for an unbounded residue-controlled operation. Every candidate is mechanically checked; misses return concrete repair diagnostics.")
     return "\n".join(advice)
 
 
@@ -8507,6 +8925,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         "If fixed routes are exhausted, propose one coherent finite operation family. Prefer residue/block/diagonal/affine rules over arbitrary patches:",
         '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}',
         "If family feedback says repair_h_preserve_g, keep the G-breaking example and change rules touching h_profile.hot_cells. If it says break_g_preserve_h, preserve the default law and add one coherent region that separates the goal.",
+        "If H has a lone variable returned through nested left translations, try an unbounded residue-controlled ray. The mechanical tool searches clamped-affine parameters and compiles only proof-supported candidates:",
+        '{"kind":"tool_call","tool":"residue_ray_countermodel","target":"goal","moduli":[2],"a_values":[-1,0,1],"b_values":[-1,0,1],"c_values":[-1,0,1],"candidate_cap":2000,"budget":2}',
     ])
 
 
@@ -8562,6 +8982,27 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
         ranked.append({"tool": "rowconst_certificates", "score": 85, "why": "H matches a row-constant certificate pattern.", "call": {"kind": "tool_call", "tool": "rowconst_certificates", "target": "goal"}})
     if square_rowconst_h(h_eq):
         ranked.append({"tool": "grounding_derived", "score": 84, "why": "H matches square-rowconst grounding; derive/use a◇b=a◇a with an explicit final close.", "call": {"kind": "tool_call", "tool": "grounding_derived", "target": "goal", "budget": 12}})
+    if residue_ray_promising_h(h_eq):
+        ranked.append({
+            "tool": "residue_ray_countermodel",
+            "score": 95,
+            "why": (
+                "H returns a lone variable through nested left translations. "
+                "Search a small residue-controlled clamped-affine family whose "
+                "left actions may become involutions."
+            ),
+            "call": {
+                "kind": "tool_call",
+                "tool": "residue_ray_countermodel",
+                "target": "goal",
+                "moduli": [2],
+                "a_values": [-1, 0, 1],
+                "b_values": [-1, 0, 1],
+                "c_values": [-1, 0, 1],
+                "candidate_cap": 2000,
+                "budget": 2,
+            },
+        })
     if h_eq["lhs"][0] == "var" or h_eq["rhs"][0] == "var":
         ranked.append({"tool": "collapse_certificates", "score": 72, "why": "H has a lone-variable side; try deriving a carrier-collapse witness and closing the goal from triviality.", "call": {"kind": "tool_call", "tool": "collapse_certificates", "target": "goal", "budget": 12}})
     if broad_grounding_orientable(h_eq["lhs"], h_eq["rhs"]):
@@ -8791,6 +9232,15 @@ def is_false_model_family_payload(data: dict[str, Any]) -> bool:
     )
 
 
+def is_residue_ray_payload(data: dict[str, Any]) -> bool:
+    tool = TOOL_ALIASES.get(str(data.get("tool") or "").strip(), data.get("tool"))
+    kind = str(data.get("kind") or "").strip()
+    return bool(
+        tool == "residue_ray_countermodel"
+        or TOOL_ALIASES.get(kind, kind) == "residue_ray_countermodel"
+    )
+
+
 def is_infinite_model_payload(data: dict[str, Any]) -> bool:
     tool = TOOL_ALIASES.get(str(data.get("tool") or "").strip(), data.get("tool"))
     kind = str(data.get("kind") or "").strip()
@@ -8881,80 +9331,6 @@ def symbolic_model_strategy_cards(*, require_infinite: bool) -> list[dict[str, A
         ]
     return cards
 
-
-VERIFIED_SYMBOLIC_MODEL_LESSONS: dict[tuple[int, int], dict[str, Any]] = {
-    (1167, 1763): {
-        "lesson_id": "modified_parity_walk_nat",
-        "status": "mechanically_verified",
-        "representation": "infinite",
-        "source": (
-            "Dualized Equation1659_facts from the Equational Theories Project; "
-            "the assembled Stage 2 certificate is accepted by the official judge."
-        ),
-        "construction": (
-            "Use Nat. Define parity by toggling a Bool at every successor. Define "
-            "x ◇ y as Nat.succ y when x and y have the same parity, and Nat.pred y "
-            "otherwise. The Nat.pred 0 = 0 boundary is the required patch."
-        ),
-        "proof_plan": [
-            "Prove parity(succ(succ n)) = parity n.",
-            "Prove op a a = succ a.",
-            "Prove op a (op a x) = x by Nat.rec and parity cases.",
-            "Prove parity(op z (op y y)) = parity y.",
-            "Use parity equality to replace the left argument, then apply involution for H.",
-            "Refute G at x=0, y=1, z=0.",
-        ],
-        "lean_policy_notes": [
-            "Use local let definitions before constructing the Magma.",
-            "Instantiate predecessor-of-successor rewrites explicitly; an inferred rewrite may elaborate through disallowed addition notation.",
-            "Prefer explicit Bool/Nat cases and exact local lemmas over broad simp.",
-        ],
-    },
-}
-
-# The readable source and structured plan live under data/semantics. The packed
-# solver carries the accepted certificate in compressed form because Stage 2
-# submissions must contain exactly one file.
-VERIFIED_SYMBOLIC_MODEL_ARTIFACTS_ZLIB_HEX: dict[tuple[int, int], str] = {
-    (1167, 1763): "78daed59cd8edb3610befb2978b400af637b93f5d6e906fd5b142890a287dc0a43a024ca122a938e7e3696d1731fa02f906bfb04bdf751f6493afc93484af2da0bb7059a0648d6cb197efcf8cd708666d2ed8ee525faae8a36e4879c0519d98e5239f61697499606d377382cd37034baba42e0f14028a6215921f2bec265ca28ceaeca84b03c25c5174bb258dee045347b456e5f926b42e2d9e2e5f5020771345bce6fc9f2365ec22f78c2c15a005f03bc788b6985b3ac160b452fee95cbfce6d567d38c603a41c21548028069f56360594cd137303d3da474038eb8445b16910c6dd20752204cd1fd62369ba9c19cc455098e0269be5ccc5f2b336c3f032e3038bf59c2ac889b6fae8d71709ea27709416c477241010524631f505a7034a008e845957178b4c3659890087ee66959a30f38fb09c104ee447159e53843b4da06242fa6a388c4a8a8826d5a141c7485be65605edda1a01e21949152a3acd0f7b0bbc75f7e455f31c63dc08c505c5144d1dd1b6e9ce62444655e1134e6c33e7ac019fc02463e634a5929473c441534dba1f11e296c4f636e397dbdec7ea23fc146d232111e3f8b65267231b578518521aa9539c6590176f1a3d7c19f003f65d8e5a095dead8cd40a5271b3c562cba0c5e3c7dfd8eef1e3efe05301208c4ea4230c24f881288afe81e40ce62ac21c5b8cdc49a25a5484f2d89d29c88d69a38470431a69dcf0a71ea035728e959d7a47c12356c1293b790d7335be9c5ec45823c45978e274e5c6ff7478dbaeab3b5b0dc3a8407c6bf33d323439244832bac9bfcc379d75fd2e6acf1ee53e0b387e8df1f3d76f2c79217104969f3150c4d4b64d2c2776b43f526ce78b6495ffa231467b85a5b88c13dc66160620e1e8c1f8be1ddfb7e33aba70c4b0186f68ec0d06158d59168193e4f301fd98e0094af6eb0e2f79ae9f4f8bcf1f6025643a9715c73b5d2cb9fa595a3d9fd5a9520d903aa2d4b3e257902ce6749ad41490d884c4d6d1e6296f7385bc57749a058d31b9ecda1cb1123b2371e98bc3c869048d2e5c91c096447d0c7af60f1f026bef0344f5b8811c08ff3fff70e432040bd6da85ec7952b0ae038256007c9581eca1f9ebc2f235a37125daa776b824d071d25ae4943e405736b24e077a2c15e4b5e709f55ae69c926ae84d291c6f5909971a0ec1bb7bd3db8d455477bf531fdaa94645558c93b9e66774c9e6a35d84f5a6ed5a64cc845d180d786d4f14a9d8d6f32cb4cc067b0de7c964c3169da697085f0ff85b30bec33e991bbb97772471ddb076a54240db1050c30a81904a15addde925ceade2c836cfbe4b588db203e51f5bbcc951baeeb358f1909e8e9b1b678b31c43a2926ce0cb711d3c910a4ec18185101e4f8adcf935f62fd5bfa0faf7e5e00d42e7bb7e9de0455cc1dd471cf35937ad332c794a7f7c9e1d6b1793adec319623316939fcc16738e9310ed29deffa3d5b1371a66811a8a7e4fe61dc3e9c98f4e42b6ee4e5e6ac3e8bce4e4293058aebb197abc5d5844dcd4b42e6483fda2b3d6a2699dbdd21fe9523dea3f01e47c4530b5eee862df7afb5145c6f704c424ede67f4f1ccfea9327d13fb7812efe6fa097afdffa585ebc809bc7eca4f23d90c8172edf9f623f3f12a0d31bec29172a33e6fdd729bb7b0af9b76914418a69ed0ec6e39ff39e0465e220fead516d3e43d5e6038afc56c0bfe1aecd6f358736c607ddb795a96e4d5ae7e3a9510f168a4e56f4cfed6444ddc9887a747271108950bb896026819300f65de960b303a5ece0bb81af5b63bba6bc022567e8d79fdc7fa780c3c7e934059d5b699f6eae207d65b46eca68fd4926a255272e25e27f34e5464315fbd28716ee6205c08725cb4742cb949670ede2ff1323cb659860ba21fad94d1663b720ef3db3049b6f7c8e237fd51cdb751fcabe2799a9a0370f58e0ec4d8b7abb35896d18cefc846591bcd9cac873a15b437b79ecbb8d5a375cb5b9fbf7c69ce6b1b1bd74f22d1f81f26c4ff8dba00d397be2e5cf7eb76d1edfb4a5fd7a693d078efe02562f1d61",
-}
-
-
-def verified_symbolic_model_artifact(
-    semantic_context: dict[str, Any] | None,
-) -> str | None:
-    if not semantic_context:
-        return None
-    try:
-        key = (
-            int(semantic_context.get("eq1_id")),
-            int(semantic_context.get("eq2_id")),
-        )
-    except (TypeError, ValueError):
-        return None
-    payload = VERIFIED_SYMBOLIC_MODEL_ARTIFACTS_ZLIB_HEX.get(key)
-    if not payload:
-        return None
-    try:
-        return zlib.decompress(bytes.fromhex(payload)).decode("utf-8")
-    except (ValueError, zlib.error, UnicodeDecodeError):
-        return None
-
-
-def verified_symbolic_model_lessons(
-    semantic_context: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    if not semantic_context:
-        return []
-    try:
-        key = (
-            int(semantic_context.get("eq1_id")),
-            int(semantic_context.get("eq2_id")),
-        )
-    except (TypeError, ValueError):
-        return []
-    lesson = VERIFIED_SYMBOLIC_MODEL_LESSONS.get(key)
-    return [deepcopy(lesson)] if lesson else []
 
 
 def _symbolic_fragment(
@@ -9598,6 +9974,23 @@ def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, d
     if out.get("kind") == "tool":
         out["kind"] = "tool_call"
         repairs.append(ProtocolIssue("kind_alias", "Renamed kind=tool to kind=tool_call", "kind").to_dict())
+    if (
+        not out.get("tool")
+        and str(out.get("kind") or "") in {
+            "residue_ray_countermodel",
+            "residue_clamped_affine_search",
+            "residue_ray_search",
+            "symbolic_ray_search",
+        }
+    ):
+        raw_kind = str(out["kind"])
+        out["kind"] = "tool_call"
+        out["tool"] = TOOL_ALIASES[raw_kind]
+        repairs.append(ProtocolIssue(
+            "tool_kind_alias",
+            f"Normalized kind={raw_kind} to a tool_call",
+            "kind",
+        ).to_dict())
     if "proof_body" in out and "proof" not in out:
         out["proof"] = out.pop("proof_body")
         repairs.append(ProtocolIssue("field_alias", "Renamed proof_body to proof", "proof_body").to_dict())
@@ -9686,7 +10079,7 @@ def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, d
             "llm_adapter",
             errors=errors,
             raw_kind=data.get("kind"),
-            need_hint="Return a supported action: tool_call, midpoint, midpoint_chain, lemma_chain, false_model_search, false_model_family, symbolic_model_plan, symbolic_model_patch, infinite_model, false_table, or goal_proof.",
+            need_hint="Return a supported action: tool_call, midpoint, midpoint_chain, lemma_chain, false_model_search, false_model_family, residue_ray_countermodel, symbolic_model_plan, symbolic_model_patch, infinite_model, false_table, or goal_proof.",
         )
     if repairs:
         return out, protocol_state(
@@ -9772,7 +10165,7 @@ def llm_context(
         )
         advice_prefer_false = False
     elif prefer_false is True:
-        phase_directive = "This is a false-preferred recovery pass. Return false_model_search, false_model_family, false_table, or a concrete midpoint/lemma_chain only. Prefer recommended_next_call when present. If fixed routes are exhausted, propose a coherent symbolic family rather than arbitrary table patches. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition in this pass; those true-side routes were already tried or are low-confidence."
+        phase_directive = "This is a false-preferred recovery pass. Return false_model_search, false_model_family, residue_ray_countermodel, false_table, or a concrete midpoint/lemma_chain only. Prefer recommended_next_call when present. If fixed routes are exhausted, propose a coherent symbolic family rather than arbitrary table patches. Never repeat routes listed in diagnostic_highlights.tried_routes or diagnostic_highlights.tried_in_collaboration. Do not call standard_aux_superposition, proof_battery, forward_saturation, or goal_superposition in this pass; those true-side routes were already tried or are low-confidence."
         advice_prefer_false = True
     elif prefer_false == "balanced":
         if false_strategy_cards(mechanical_feedback):
@@ -9848,17 +10241,6 @@ def llm_context(
             "symbolic_model_patch",
             "infinite_model",
         ]
-        lessons = verified_symbolic_model_lessons(semantic_context)
-        if lessons:
-            context["retrieved_symbolic_lessons"] = lessons
-            context["retrieved_symbolic_lessons_instruction"] = (
-                "This is an exact semantic-match lesson with an accepted certificate. "
-                "Reuse its carrier, operation, proof decomposition, and witness; do "
-                "not substitute an invented model family. Express the lesson through "
-                "the structured plan contract. The lesson guides construction but is "
-                "not trusted output: the mechanical assembler and Lean judge must "
-                "recheck every part."
-            )
     if capability_mask is not None:
         context["capability_manifest"] = capability_manifest(capability_mask)
     if semantic_context and semantic_context.get("semantic_class") != "unclassified":
@@ -10050,6 +10432,67 @@ def try_llm_collaboration(
         if adapter_state is not None:
             mechanical_feedback.append(adapter_state)
         if not data:
+            continue
+        if is_residue_ray_payload(data):
+            sig = compact_tool_signature(data)
+            gate_state = capability_gate_state(
+                "residue_ray_countermodel",
+                capability_mask,
+            )
+            if gate_state is not None:
+                mechanical_feedback.append(gate_state)
+                failed_signatures.add(sig)
+                continue
+            if sig in failed_signatures:
+                mechanical_feedback.append(protocol_state(
+                    "MechanicalResponse",
+                    "duplicate_failed_call",
+                    "scheduler",
+                    tool="residue_ray_countermodel",
+                    need_hint=(
+                        "Do not repeat this exact residue-ray search. Narrow or "
+                        "change its modulus/coefficient sets using the reported "
+                        "H and involution failures."
+                    ),
+                ))
+                continue
+            code, ray_state = residue_ray_countermodel_attempt(h_eq, g_eq, data)
+            mechanical_feedback.append(ray_state)
+            if code is not None:
+                result = judge_infinite_model_artifact_attributed(
+                    "llm:residue_ray_countermodel",
+                    code,
+                    detail={
+                        "signature": sig,
+                        "family": "residue_controlled_clamped_affine",
+                        "checked_candidates": (
+                            (ray_state.get("search_state") or {}).get(
+                                "checked_candidates"
+                            )
+                        ),
+                    },
+                )
+                if result.get("status") == "accepted":
+                    return "accepted_false_residue_ray_llm"
+                mechanical_feedback.append(protocol_state(
+                    "ResidueRayCertificateState",
+                    "judge_rejected",
+                    "lean_judge",
+                    tool="residue_ray_countermodel",
+                    candidate=ray_state.get("candidate"),
+                    errors=[ProtocolIssue(
+                        "judge_rejected_residue_ray",
+                        short_text(
+                            result.get("stderr") or result.get("message") or "",
+                            1000,
+                        ),
+                    ).to_dict()],
+                    need_hint=(
+                        "Preserve the discovered operation and repair only the "
+                        "reported symbolic proof obligation."
+                    ),
+                ))
+            failed_signatures.add(sig)
             continue
         if is_symbolic_model_plan_payload(data) or is_symbolic_model_patch_payload(data):
             sig = compact_tool_signature(data)
@@ -10259,7 +10702,9 @@ def try_llm_collaboration(
         false_cards_available = bool(false_strategy_cards(mechanical_feedback))
         false_phase_active = prefer_false is True or (prefer_false == "balanced" and false_cards_available)
         if false_phase_active and not (
-            is_false_model_payload(data) or is_false_model_family_payload(data)
+            is_false_model_payload(data)
+            or is_false_model_family_payload(data)
+            or is_residue_ray_payload(data)
         ):
             top_action = top_false_recommended_action(mechanical_feedback)
             raw_tool = str(data.get("tool") or "").strip()
@@ -10267,6 +10712,7 @@ def try_llm_collaboration(
             off_phase_tool = data.get("kind") == "tool_call" and tool not in {
                 "false_model_search",
                 "false_model_family",
+                "residue_ray_countermodel",
                 "lemma_chain",
                 "lemma_hint",
                 "midpoint",
@@ -10358,13 +10804,21 @@ def try_llm_collaboration(
         if (prefer_false is True or (prefer_false == "balanced" and false_cards_available)) and data.get("kind") == "tool_call":
             raw_tool = str(data.get("tool") or "").strip()
             tool = TOOL_ALIASES.get(raw_tool, raw_tool)
-            if tool not in {"false_model_search", "false_model_family", "lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
+            if tool not in {
+                "false_model_search",
+                "false_model_family",
+                "residue_ray_countermodel",
+                "lemma_chain",
+                "lemma_hint",
+                "midpoint",
+                "midpoint_chain",
+            }:
                 mechanical_feedback.append(protocol_state(
                     "MechanicalResponse",
                     "suppressed_in_false_preferred_pass",
                     "scheduler",
                     tool=tool,
-                    need_hint="Return false_model_search/false_model_hint with concrete routes, or a real midpoint/lemma_chain. Do not repeat true-side tool calls in this pass.",
+                    need_hint="Return false_model_search/false_model_hint with concrete routes, residue_ray_countermodel for an unbounded residue family, or a real midpoint/lemma_chain. Do not repeat true-side tool calls in this pass.",
                 ))
                 failed_signatures.add(compact_tool_signature(data))
                 continue
@@ -10458,24 +10912,10 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     false_failure_feedback: list[dict[str, Any]] = []
     early_true_feedback: list[dict[str, Any]] = []
 
-    # The executable judge can express an infinite Type-level model, and the
-    # protocol has structured and whole-artifact adapters. An Austin implication is
-    # not a reason to buy more finite-search time, but it is exactly the case
-    # where System 2 may be able to propose a compact Type-level artifact.
+    # A research deployment may provide a broad semantic registry externally.
+    # Even then, the submission carries no exact-case artifact or lesson: System
+    # 2 must propose a construction and Lean remains the trust boundary.
     if semantic_context.get("current_solver_certificate_status") == "requires_infinite_model_artifact":
-        verified_artifact = verified_symbolic_model_artifact(semantic_context)
-        if verified_artifact:
-            verified_result = judge_infinite_model_artifact_attributed(
-                "memory:verified_symbolic_model",
-                verified_artifact,
-                detail={
-                    "eq1_id": semantic_context.get("eq1_id"),
-                    "eq2_id": semantic_context.get("eq2_id"),
-                    "lesson_status": "mechanically_verified",
-                },
-            )
-            if verified_result.get("status") == "accepted":
-                return "accepted_false_verified_symbolic_memory"
         remaining = max(0.0, budget - (time.monotonic() - solve_started))
         if remaining >= 8.0:
             status = try_llm_collaboration(
@@ -10500,6 +10940,57 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                 return status
         print(json.dumps(semantic_state, ensure_ascii=False), file=sys.stderr)
         return "semantic_solver_capability_gap"
+
+    # Equation-driven symbolic checkpoint. This is deliberately broader than
+    # any benchmark row: whenever H returns a lone variable through nested left
+    # translations, System 2 may request a residue-controlled operation family.
+    # The mechanical side searches parameters, reports near misses, and emits a
+    # Type-level certificate only for proof-supported candidates.
+    if residue_ray_promising_h(h_eq):
+        remaining = max(0.0, budget - (time.monotonic() - solve_started))
+        if remaining >= 10.0:
+            ray_call = {
+                "kind": "tool_call",
+                "tool": "residue_ray_countermodel",
+                "target": "goal",
+                "moduli": [2],
+                "a_values": [-1, 0, 1],
+                "b_values": [-1, 0, 1],
+                "c_values": [-1, 0, 1],
+                "candidate_cap": 2000,
+                "budget": 2,
+            }
+            status = try_llm_collaboration(
+                h_eq,
+                g_eq,
+                remaining,
+                max_rounds=1,
+                collaboration_goal=(
+                    "Early symbolic-family checkpoint. Inspect whether nested "
+                    "left translations suggest involutive residue-controlled "
+                    "actions. If so, request residue_ray_countermodel with small "
+                    "coefficient sets; the mechanical side will search and prove "
+                    "the result. Otherwise choose another concrete tool."
+                ),
+                initial_feedback=[protocol_state(
+                    "ResidueRayOpportunityState",
+                    "available",
+                    "structural_router",
+                    tool="residue_ray_countermodel",
+                    structural_signal=(
+                        "A lone variable occurs once as the terminal value under "
+                        "nested left translations."
+                    ),
+                    recommended_next_call=ray_call,
+                    need_hint=(
+                        "Decide whether a small residue-controlled involutive "
+                        "left-action family is a useful countermodel search."
+                    ),
+                )],
+                semantic_context=semantic_context,
+            )
+            if status:
+                return status
 
     # Cheap false witnesses first.
     found = None

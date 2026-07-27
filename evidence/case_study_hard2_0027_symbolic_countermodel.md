@@ -1,103 +1,120 @@
-# Case Study: `hard2_0027` Symbolic Countermodel
+# Case Study: Equation-Driven Symbolic Countermodel
 
 Date: 2026-07-27
 
-## Result
+## Problem
 
-`hard2_0027` is E1167 -> E1763:
+The motivating implication is `hard2_0027`, E1167 -> E1763:
 
 ```text
 H: x = y ◇ ((z ◇ (y ◇ y)) ◇ x)
 G: x = (y ◇ z) ◇ ((x ◇ z) ◇ x)
 ```
 
-The implication is true for every finite magma but false for unrestricted
-magmas. Finite tables, formula-defined finite models, CP-SAT, and larger
-`Fin n` searches are therefore prohibited for this case.
+It holds in every finite magma but fails for unrestricted magmas. An ordinary
+`Fin n` search can therefore never find a countermodel.
 
-The repository now contains an official-judge-accepted infinite certificate:
+## Historical Construction
 
-- readable Lean:
-  `data/semantics/hard2_0027_modified_parity_model.lean`;
-- structured six-part plan:
-  `data/semantics/hard2_0027_modified_parity_model_plan.json`;
-- packed single-file cache:
-  `VERIFIED_SYMBOLIC_MODEL_ARTIFACTS_ZLIB_HEX` in `baby_solver.py`.
-
-The assembled structured plan is 7,127 bytes. The readable certificate is
-7,478 bytes and is accepted under the competition proof policy, not only the
-research profile.
-
-The compiled single-file solver replayed the verified certificate through the
-official pipeline in 7.2 seconds with one judge call and zero LLM calls.
-
-## Model
-
-The carrier is `Nat`. Let `parity` toggle a Boolean on every successor. Define
+The first accepted certificate used a modified parity walk on `Nat`:
 
 ```text
 x ◇ y = succ y    when parity x = parity y
 x ◇ y = pred y    otherwise
 ```
 
-with the natural-number boundary patch `pred 0 = 0`.
+with `pred 0 = 0`. Its readable Lean proof and structured plan remain in
+`data/semantics/` as research evidence. An earlier packed solver recognized the
+exact equation IDs and replayed a compressed copy of that proof. That path was
+useful for validating the symbolic-model interface, but it was benchmark
+memory rather than general solving and has been removed from `baby_solver.py`.
 
-The proof establishes:
+## Generalized Search
 
-1. parity is unchanged by two successors;
-2. `a ◇ a = succ a`;
-3. `a ◇ (a ◇ x) = x`;
-4. `parity (z ◇ (y ◇ y)) = parity y`.
+The replacement tool receives only H and G. It searches operations on `Nat`
+of the form
 
-The last two facts prove H. The tuple `x = 0`, `y = 1`, `z = 0` refutes G.
+```text
+max(0, a*x + b*y + c)
+```
+
+using one coefficient triple when `x` and `y` have the same residue modulo
+`m`, and another triple otherwise. No problem ID, semantic registry entry,
+stored lesson, or cached certificate participates.
+
+A live `gpt-oss-120b` call selected:
+
+```json
+{
+  "kind": "tool_call",
+  "tool": "residue_ray_countermodel",
+  "moduli": [2],
+  "a_values": [-1, 0, 1],
+  "b_values": [-1, 0, 1],
+  "c_values": [-1, 0, 1],
+  "candidate_cap": 2000,
+  "budget": 2
+}
+```
+
+The mechanical search checked 56 parameter pairs in 0.045 seconds and found:
+
+```text
+same residue:      (a,b,c) = (0,1, 1)
+different residue: (a,b,c) = (0,1,-1)
+```
+
+It independently found the goal-breaking assignment `x=0, y=1, z=0`.
+
+## Proof Compiler
+
+Finite-prefix agreement is not a certificate for an infinite model. The
+mechanical side therefore converts the discovered operation to an isomorphic,
+proof-friendly carrier `Bool × Nat`. The Boolean is the residue state and the
+natural number is the unbounded level. The two left actions become explicit
+finite-state involutions.
+
+The generated 1.4 KB Lean artifact proves:
+
+1. the operation depends only on the Boolean state of its left input;
+2. every left translation is an involution;
+3. the middle term `z ◇ (y ◇ y)` has the same Boolean state as `y`;
+4. these properties imply H;
+5. the mechanically discovered assignment refutes G.
+
+The official competition verifier accepted the artifact with no axioms. An
+end-to-end run used deliberately unrelated equation IDs, made one LLM call and
+one judge call, and completed in 14.4 seconds. This establishes that the solve
+does not depend on the benchmark identifier. A separately renamed and
+orientation-reversed form of H also produced an accepted certificate.
+
+The same structural checkpoint was also exercised on the previously solved
+true case `hard2_0193`. It spent one exploratory LLM call, produced no false
+certificate, and the existing true prover subsequently solved the problem in
+25.1 seconds. This is the expected scheduling cost of enabling a broader
+symbolic lane.
 
 ## Provenance
 
-The construction was traced to the dual of `Equation1659_facts` in the
-Equational Theories Project at commit
+The mathematical construction was traced to the dual of
+`Equation1659_facts` in the Equational Theories Project at commit
 `7e276a2d05e84e3eef02432abfd0718e78f7abfa`.
 
-The dual model satisfies E2000 and refutes E1721. The implication graph gives
-E2000 -> E1167 and E1763 -> E1721, so the same model satisfies E1167 and
-refutes E1763.
+The generalization, parameter search, `Bool × Nat` representation, protocol
+feedback, and competition-compatible proof compiler are implemented locally.
+The result should be attributed as an LLM-selected, mechanically searched and
+Lean-certified symbolic-family solve, not as independent LLM discovery of the
+underlying mathematical construction.
 
-## Protocol Improvements
+## Remaining Limits
 
-This case exposed and fixed general symbolic-model gaps:
+The search language already contains more operations than this one example,
+but the current proof compiler covers only a narrow involutive parity-walk
+certificate class. A finite-prefix candidate outside that class is returned as
+`prefix_candidate_uncertified`, together with H violations, a concrete
+G-witness when available, and involution failures.
 
-- semantic routing now distinguishes explicit tables, symbolic finite models,
-  and infinite models;
-- audited finite-valid/general-false cases suppress both table and symbolic
-  finite search;
-- structured plans now support pre-model local definitions;
-- compound carriers are parenthesized, so types such as `Fin 257`, `ZMod n`,
-  and products assemble correctly;
-- missing `operation` can be inferred from a local `op` definition;
-- a local `def` is repaired to `let`;
-- split tactic fragments after `:= by` are merged;
-- patches can replace `definitions[i]` and `setup[i]`;
-- every repair round receives the complete active plan;
-- exact Lean line ranges identify failed and preserved components;
-- the infinite-only lane suppresses conflicting ordinary tool advice.
-
-A separate `Fin 257` projection-model probe was accepted without constructing
-or submitting a 257-by-257 table. This confirms that `Fin n` is a carrier type,
-not necessarily an explicit-table representation.
-
-## LLM Attribution
-
-Live `gpt-oss-120b` probes without the verified lesson selected an infinite
-structured plan, but proposed an invalid operation. Mechanical normalization
-repaired its missing operation field and split setup block, and a subsequent
-LLM call returned a correctly scoped indexed patch after the lane was made
-exclusive.
-
-The current model did not rediscover the parity construction, even after a
-compact strategy lesson; it substituted unrelated operations. Therefore this
-is a mechanical/research-derived solve and a verified-memory replay, not a
-load-bearing LLM discovery.
-
-That negative result is useful: the consumer, repair protocol, and certificate
-format can handle the construction, while current-model strategy uptake remains
-the bottleneck. A stronger future model can use the same interface without any
-change to the trust boundary.
+The next generalization target is to compile arbitrary finite-state ray
+transducers on `Fin m × Nat`, followed by broader residue-controlled affine
+rules. Promotion should require a held-out implication, not merely another
+encoding of this case.

@@ -20,8 +20,11 @@ consumption result, and Lean judge outcome.
   assembly, exact Lean repair feedback, and load-bearing teacher-to-student
   replay.
 - `case_study_hard2_0027_symbolic_countermodel.md`: accepted modified-parity
-  infinite countermodel, representation routing, and honest live LLM
-  discovery/repair attribution.
+  infinite countermodel generalized into an equation-driven residue-family
+  search with honest LLM/mechanical attribution.
+- `residue_ray_countermodel_2026_07_27.json`: machine-readable clean-room
+  discovery, generated certificate, fake-ID end-to-end acceptance, and one
+  previously solved true-case scheduling regression.
 - `case_study_recursive_bundle_countermodel.md`: quotient/fiber decomposition,
   sparse symbolic finite-model synthesis, and a live two-step repair ladder
   accepted by the official judge.

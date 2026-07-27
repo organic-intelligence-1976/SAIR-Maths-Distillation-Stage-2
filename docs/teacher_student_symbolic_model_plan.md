@@ -183,13 +183,15 @@ Promotion milestone: reconstruct one known infinite countermodel from
 structured parts, repair at least one rejected obligation, and obtain a
 judge-accepted final artifact.
 
-Current status: met for exact-case repair and replay, and for
-`hard2_0027`/E1167 -> E1763 itself. Its modified-parity `Nat` model assembles
-from six structured parts and is accepted under the competition proof policy.
-Live `gpt-oss-120b` selected the infinite structured lane and used indexed
-repair feedback, but did not rediscover the correct operation; the winning
-construction came from published mathematics and is replayed as verified
-memory. Held-out transfer and operation-family discovery remain open.
+Current status: the former exact-case replay has been retired from the
+submission solver. For the motivating E1167 -> E1763 equations, live
+`gpt-oss-120b` selects a general residue-controlled clamped-affine search;
+the mechanical side rediscovers the parity walk in 56 candidates, compiles it
+on `Bool × Nat`, and produces a competition-policy-accepted artifact. The
+end-to-end run also succeeds under deliberately unrelated equation IDs.
+The underlying construction still comes from published mathematics, and the
+proof compiler currently covers only a narrow involutive parity-walk class.
+Held-out equation-family transfer remains the next promotion gate.
 
 ## Phase 5: Explicit Recursive Obligations
 

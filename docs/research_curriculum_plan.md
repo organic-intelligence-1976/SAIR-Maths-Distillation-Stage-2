@@ -369,9 +369,13 @@ are:
 - `data/semantics/hard2_0027_modified_parity_model.lean`;
 - `data/semantics/hard2_0027_modified_parity_model_plan.json`.
 
-The packed solver keeps a compressed copy because the submission contract is
-single-file. This is attributed as verified symbolic-memory replay, not as an
-LLM discovery.
+The original packed solver briefly kept a compressed exact-case copy to test
+the single-file interface. That shortcut has been removed. The current packed
+solver exposes a general residue/clamped-affine tool: live `gpt-oss-120b`
+selects the family, mechanical search rediscovers the parity walk, and a
+`Bool × Nat` proof compiler emits an official-judge-accepted certificate.
+The construction remains attributed to published mathematics rather than
+independent LLM discovery.
 
 The structured contract now has six parts: carrier, pre-model definitions,
 operation, setup lemmas, universal H proof, and concrete not-G proof. It also

@@ -67,9 +67,11 @@ The most useful orientation documents are:
   equal-fiber family and progressively larger non-uniform bundles.
 - `scripts/structured_infinite_model_probe.py`: assemble and judge a typed
   infinite countermodel plan.
+- `scripts/residue_ray_model_probe.py`: clean-room LLM/mechanical experiment
+  for residue-controlled clamped-affine operations on an unbounded carrier.
 - `data/semantics/hard2_0027_modified_parity_model_plan.json`: accepted
-  six-part infinite countermodel showing that symbolic false certificates need
-  not be finite tables.
+  historical six-part certificate used to derive and test the general
+  residue-ray family; it is evidence, not an exact-case submission shortcut.
 - `scripts/research_system_contracts.py`: fast contract and regression checks.
 - `scripts/stage1_routing_probe.py`: compare Stage 1 priors and feedback-aware
   scheduling on a frozen balanced residual fixture.

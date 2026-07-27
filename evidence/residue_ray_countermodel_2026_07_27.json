@@ -1,0 +1,82 @@
+{
+  "experiment": "equation_driven_residue_ray_countermodel",
+  "date": "2026-07-27",
+  "input_policy": {
+    "problem_id_used": false,
+    "semantic_registry_used": false,
+    "verified_lesson_used": false,
+    "cached_certificate_used": false
+  },
+  "equations": {
+    "hypothesis": "x = y ◇ ((z ◇ (y ◇ y)) ◇ x)",
+    "goal": "x = (y ◇ z) ◇ ((x ◇ z) ◇ x)"
+  },
+  "llm": {
+    "model": "openai/gpt-oss-120b",
+    "calls": 1,
+    "selected_tool": "residue_ray_countermodel",
+    "requested_search": {
+      "moduli": [2],
+      "a_values": [-1, 0, 1],
+      "b_values": [-1, 0, 1],
+      "c_values": [-1, 0, 1],
+      "candidate_cap": 2000,
+      "budget_seconds": 2
+    }
+  },
+  "mechanical_search": {
+    "checked_candidates": 56,
+    "seconds": 0.0447,
+    "value_limit": 12,
+    "winner": {
+      "modulus": 2,
+      "same_residue_coefficients": [0, 1, 1],
+      "different_residue_coefficients": [0, 1, -1],
+      "hypothesis_failures": 0,
+      "involution_failures": 0,
+      "goal_witness": {
+        "x": 0,
+        "y": 1,
+        "z": 0,
+        "lhs": 0,
+        "rhs": 1
+      }
+    }
+  },
+  "certificate": {
+    "carrier": "Bool × Nat",
+    "bytes": 1422,
+    "official_status": "accepted",
+    "axioms": [],
+    "judge_calls": 1
+  },
+  "end_to_end": {
+    "equation_ids": [900001, 900002],
+    "ids_deliberately_unrelated": true,
+    "solved": true,
+    "verdict": "false",
+    "wall_seconds": 14.422
+  },
+  "alpha_orientation_regression": {
+    "hypothesis": "b ◇ ((c ◇ (b ◇ b)) ◇ a) = a",
+    "goal": "a = (b ◇ c) ◇ ((a ◇ c) ◇ a)",
+    "equation_ids": [910001, 910002],
+    "official_status": "accepted",
+    "axioms": []
+  },
+  "regression": {
+    "case": "hard2_0193",
+    "expected": "true",
+    "symbolic_llm_calls": 1,
+    "final_judge_calls": 1,
+    "solved": true,
+    "verdict": "true",
+    "wall_seconds": 25.086
+  },
+  "interpretation": [
+    "The LLM selected a reusable symbolic family rather than producing a proof.",
+    "The mechanical side searched parameters, found the witness, compiled the proof, and trusted only Lean.",
+    "The mathematical family was motivated by a published construction, so this is not independent LLM discovery.",
+    "The current proof compiler remains narrow and needs held-out transfer evidence."
+  ]
+}

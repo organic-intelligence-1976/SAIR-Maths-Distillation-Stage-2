@@ -696,17 +696,58 @@ def main() -> int:
         and "Magma (Fin 257)" in large_finite_code
         and "counterexample_table" not in large_finite_code
     )
-    checks["verified_symbolic_artifact_cache"] = (
-        baby_solver.verified_symbolic_model_artifact({
-            "eq1_id": 1167,
-            "eq2_id": 1763,
-        })
-        == (
-            ROOT
-            / "data"
-            / "semantics"
-            / "hard2_0027_modified_parity_model.lean"
-        ).read_text(encoding="utf-8")
+    ray_h = baby_solver.parse_equation(
+        "x = y ◇ ((z ◇ (y ◇ y)) ◇ x)"
+    )
+    ray_g = baby_solver.parse_equation(
+        "x = (y ◇ z) ◇ ((x ◇ z) ◇ x)"
+    )
+    ray_code, ray_state = baby_solver.residue_ray_countermodel_attempt(
+        ray_h,
+        ray_g,
+        {
+            "kind": "tool_call",
+            "tool": "residue_ray_countermodel",
+            "moduli": [2],
+            "a_values": [-1, 0, 1],
+            "b_values": [-1, 0, 1],
+            "c_values": [-1, 0, 1],
+            "candidate_cap": 2000,
+            "budget": 2,
+        },
+    )
+    ray_alpha_code, ray_alpha_state = baby_solver.residue_ray_countermodel_attempt(
+        baby_solver.parse_equation("b ◇ ((c ◇ (b ◇ b)) ◇ a) = a"),
+        baby_solver.parse_equation("a = (b ◇ c) ◇ ((a ◇ c) ◇ a)"),
+        {
+            "kind": "tool_call",
+            "tool": "residue_ray_countermodel",
+            "moduli": [2],
+            "a_values": [-1, 0, 1],
+            "b_values": [-1, 0, 1],
+            "c_values": [-1, 0, 1],
+            "candidate_cap": 2000,
+            "budget": 2,
+        },
+    )
+    checks["equation_driven_residue_ray_certificate"] = (
+        ray_code is not None
+        and ray_state.get("status") == "candidate_ready"
+        and (ray_state.get("candidate") or {}).get("same") == [0, 1, 1]
+        and (ray_state.get("candidate") or {}).get("different") == [0, 1, -1]
+        and "Bool × Nat" in ray_code
+        and ray_alpha_code is not None
+        and ray_alpha_state.get("status") == "candidate_ready"
+        and "    symm\n" in ray_alpha_code
+    )
+    checks["submission_has_no_exact_case_replay"] = not any(
+        marker in solver_source
+        for marker in (
+            "hard2_0027",
+            "(1167, 1763)",
+            "VERIFIED_SYMBOLIC_MODEL_ARTIFACTS",
+            "verified_symbolic_model_artifact",
+        )
     )
 
     signature = canonical_equation_signature("x ◇ y = y ◇ y")
