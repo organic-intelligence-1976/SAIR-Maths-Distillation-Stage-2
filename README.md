@@ -48,6 +48,9 @@ The most useful orientation documents are:
 - [`docs/teacher_student_symbolic_model_plan.md`](docs/teacher_student_symbolic_model_plan.md):
   active roadmap for verified teacher-student distillation and symbolic
   countermodels.
+- [`docs/stage1_routing_experiment.md`](docs/stage1_routing_experiment.md):
+  controlled comparison of Stage 1 routing with and without mechanical
+  feedback.
 
 ## Repository map
 
@@ -65,6 +68,8 @@ The most useful orientation documents are:
 - `scripts/structured_infinite_model_probe.py`: assemble and judge a typed
   infinite countermodel plan.
 - `scripts/research_system_contracts.py`: fast contract and regression checks.
+- `scripts/stage1_routing_probe.py`: compare Stage 1 priors and feedback-aware
+  scheduling on a frozen balanced residual fixture.
 - `scripts/compile_submission.py`: compile the current system into a single
   competition-compatible `solver.py`.
 - `scripts/compiled_submission_smoke.py`: exercise a compiled solver through

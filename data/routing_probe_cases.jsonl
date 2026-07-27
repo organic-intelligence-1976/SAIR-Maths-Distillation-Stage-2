@@ -1,0 +1,10 @@
+{"id":"hard3_0210","eq1_id":1970,"eq2_id":2063,"equation1":"x = (y ◇ (z ◇ x)) ◇ (w ◇ x)","equation2":"x = ((x ◇ y) ◇ y) ◇ (y ◇ x)","answer":true}
+{"id":"hard2_0198","eq1_id":3396,"eq2_id":3846,"equation1":"x ◇ y = z ◇ (y ◇ (x ◇ x))","equation2":"x ◇ y = (z ◇ w) ◇ (z ◇ x)","answer":true}
+{"id":"hard3_0183","eq1_id":1642,"eq2_id":1432,"equation1":"x = (x ◇ x) ◇ ((y ◇ z) ◇ z)","equation2":"x = (x ◇ x) ◇ (y ◇ (x ◇ y))","answer":true}
+{"id":"hard3_0231","eq1_id":2105,"eq2_id":2300,"equation1":"x = ((y ◇ x) ◇ y) ◇ (z ◇ z)","equation2":"x = (y ◇ (x ◇ (y ◇ x))) ◇ x","answer":true}
+{"id":"hard2_0126","eq1_id":20126,"eq2_id":201260,"equation1":"x = ((y * (z * x)) * w) * x","equation2":"x * x = y * (x * x)","answer":true}
+{"id":"hard1_0009","eq1_id":2656,"eq2_id":2863,"equation1":"x = ((x ◇ x) ◇ (y ◇ z)) ◇ y","equation2":"x = ((x ◇ (y ◇ x)) ◇ x) ◇ y","answer":false}
+{"id":"hard2_0016","eq1_id":646,"eq2_id":4127,"equation1":"x = x ◇ (y ◇ ((y ◇ z) ◇ y))","equation2":"x ◇ y = ((x ◇ y) ◇ x) ◇ x","answer":false}
+{"id":"hard2_0125","eq1_id":2890,"eq2_id":2652,"equation1":"x = ((x ◇ (y ◇ z)) ◇ z) ◇ x","equation2":"x = ((x ◇ x) ◇ (y ◇ y)) ◇ x","answer":false}
+{"id":"hard2_0027","eq1_id":1167,"eq2_id":1763,"equation1":"x = y ◇ ((z ◇ (y ◇ y)) ◇ x)","equation2":"x = (y ◇ z) ◇ ((x ◇ z) ◇ x)","answer":false}
+{"id":"hard2_0093","eq1_id":1518,"eq2_id":3915,"equation1":"x = (y ◇ y) ◇ (x ◇ (y ◇ x))","equation2":"x ◇ y = (x ◇ (x ◇ x)) ◇ y","answer":false}
