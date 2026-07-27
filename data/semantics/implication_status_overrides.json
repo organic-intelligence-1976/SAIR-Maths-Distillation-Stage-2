@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "eq1_id": 677,
+      "eq2_id": 255,
+      "semantic_class": "open_finite_implication",
+      "semantic_target": "finite_implication",
+      "general_status": "false",
+      "finite_status": "unknown",
+      "certificate_class": "finite_model_or_finite_structure_proof",
+      "source": "Equational Theories Project, Equation 677 chapter",
+      "source_url": "https://teorth.github.io/equational_theories/blueprint/677-chapter.html",
+      "note": "The unrestricted implication is false; the finite implication remains open."
+    }
+  ]
+}

@@ -426,10 +426,10 @@ def discover_family_candidates(family: str, max_rows: int | None = None) -> dict
     shortlist.
     """
     if family == "right_square_chain":
-        predicate = lambda h_eq, g_eq: bool(solver.special_right_square_h(h_eq))
+        predicate = lambda h_eq, g_eq: bool(solver.right_square_h_roles(h_eq))
         focused_body = solver.generic_right_square_chain_body
     elif family == "square_sandwich_chain":
-        predicate = lambda h_eq, g_eq: bool(solver.square_sandwich_h(h_eq))
+        predicate = lambda h_eq, g_eq: bool(solver.square_sandwich_h_roles(h_eq))
         focused_body = solver.square_sandwich_chain_body
     else:
         raise ValueError(f"unsupported discovery family: {family}")

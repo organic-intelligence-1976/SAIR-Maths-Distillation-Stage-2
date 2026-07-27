@@ -37,7 +37,7 @@ official Lean verifier accepts the final artifact.
 | Component | File | Working v1 behavior |
 |---|---|---|
 | Protocol | `research_system/protocol.py` | Versioned problem, execution, verification, episode, and strategy-artifact records |
-| Semantics | `research_system/semantics.py` | Source-stamped Austin lookup, E677 special status, competition-row fallback |
+| Semantics | `research_system/semantics.py` | Source-stamped Austin lookup, data-driven status overrides, competition-row fallback |
 | Capabilities | `research_system/capabilities.py` | Manifests, masks, gates, and intervention eligibility audit |
 | Blackboard | `research_system/blackboard.py` | Immutable proved nodes and alpha-canonical small-model refutations |
 | Obligation graph | `research_system/obligations.py` | Approach families, executable dependencies, diverse alternatives, blocking, and novelty-gated reopening |

@@ -57,11 +57,15 @@ from research_system.teacher import (  # noqa: E402
     TeacherSearchConfig,
     TeacherStudentSearch,
 )
+from scripts.audit_submission_sanitization import audit_source  # noqa: E402
 
 
 def main() -> int:
     checks: dict[str, bool] = {}
     solver_source = (ROOT / "baby_solver.py").read_text(encoding="utf-8")
+    checks["submission_is_equation_driven"] = audit_source(
+        ROOT / "baby_solver.py"
+    )["passed"]
     checks["reference_baseline_fallback_retired"] = not any(
         marker in solver_source
         for marker in (
@@ -170,7 +174,7 @@ def main() -> int:
         {"chains": ["generic_right_square_absorption"], "budget": 12},
         budget=12,
     )
-    checks["helper_chain_portfolio_hard3_0204"] = (
+    checks["helper_chain_portfolio_repeated_absorption"] = (
         chain_body is not None
         and chain_state.get("winning_chain") == "generic_right_square_absorption"
         and [row.get("name") for row in chain_state.get("proved_lemmas", [])]
@@ -184,16 +188,63 @@ def main() -> int:
         {"chains": ["nested_tail_absorption"], "budget": 36},
         budget=36,
     )
-    checks["helper_chain_portfolio_hard3_0210"] = (
+    checks["helper_chain_portfolio_nested_tail_absorption"] = (
         nested_body is not None
         and nested_state.get("winning_chain") == "nested_tail_absorption"
         and [row.get("name") for row in nested_state.get("proved_lemmas", [])]
         == ["nested_absorb", "tail_any"]
     )
+    reversed_right_h = baby_solver.parse_equation(
+        "(b ◇ (b ◇ c)) ◇ (a ◇ a) = a"
+    )
+    reversed_right_g = baby_solver.parse_equation(
+        "a ◇ ((b ◇ (a ◇ b)) ◇ a) = a"
+    )
+    reversed_sandwich_h = baby_solver.parse_equation(
+        "((b ◇ a) ◇ b) ◇ (c ◇ c) = a"
+    )
+    reversed_sandwich_g = baby_solver.parse_equation(
+        "a ◇ (((a ◇ b) ◇ a) ◇ b) = a"
+    )
+    reversed_rowconst_h = baby_solver.parse_equation(
+        "b ◇ (c ◇ (b ◇ c)) = a ◇ b"
+    )
+    reversed_rowconst_g = baby_solver.parse_equation("a ◇ b = c ◇ a")
+    reversed_square_rowconst_h = baby_solver.parse_equation(
+        "(a ◇ a) ◇ ((b ◇ c) ◇ c) = a"
+    )
+    reversed_square_rowconst_g = baby_solver.parse_equation(
+        "(a ◇ a) ◇ (b ◇ (a ◇ b)) = a"
+    )
+    checks["focused_renderers_ignore_names_and_orientation"] = all((
+        (baby_solver.right_square_h_roles(reversed_right_h) or {}).get("reversed"),
+        baby_solver.right_square_chain_body(reversed_right_h, reversed_right_g)
+        is not None,
+        (baby_solver.square_sandwich_h_roles(reversed_sandwich_h) or {}).get(
+            "reversed"
+        ),
+        baby_solver.square_sandwich_chain_body(
+            reversed_sandwich_h,
+            reversed_sandwich_g,
+        )
+        is not None,
+        (baby_solver.rowconst_h_roles(reversed_rowconst_h) or {}).get("reversed"),
+        baby_solver.rowconst_body(reversed_rowconst_h, reversed_rowconst_g)
+        is not None,
+        (
+            baby_solver.square_rowconst_h_roles(reversed_square_rowconst_h)
+            or {}
+        ).get("reversed"),
+        baby_solver.grounding_derived_body(
+            reversed_square_rowconst_h,
+            reversed_square_rowconst_g,
+        )
+        is not None,
+    ))
     problem = ProblemSpec(
         id="contract",
-        eq1_id=1167,
-        eq2_id=1763,
+        eq1_id=900001,
+        eq2_id=900002,
         equation1="x = x",
         equation2="x = x",
         answer=False,
@@ -201,11 +252,46 @@ def main() -> int:
     checks["protocol_roundtrip"] = ProblemSpec.from_mapping(problem.to_mapping()) == problem
 
     semantics = SemanticService(ROOT / "data" / "semantics" / "austin_implications.json")
-    semantic = semantics.classify(problem)
+    registry_data = json.loads(
+        (ROOT / "data" / "semantics" / "austin_implications.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    registry_pair = registry_data["pairs"][0]
+    semantic = semantics.classify(ProblemSpec(
+        id="registry_contract",
+        eq1_id=int(registry_pair["eq1_id"]),
+        eq2_id=int(registry_pair["eq2_id"]),
+        equation1="x = x",
+        equation2="x = x",
+        answer=False,
+    ))
     checks["semantic_registry"] = (
         semantic.semantic_class == "austin_implication"
         and semantic.finite_status == "true"
         and not semantics.finite_search_allowed(semantic)
+    )
+    override_data = json.loads(
+        (
+            ROOT
+            / "data"
+            / "semantics"
+            / "implication_status_overrides.json"
+        ).read_text(encoding="utf-8")
+    )
+    override_row = override_data["records"][0]
+    override = semantics.classify(ProblemSpec(
+        id="override_contract",
+        eq1_id=int(override_row["eq1_id"]),
+        eq2_id=int(override_row["eq2_id"]),
+        equation1="x = x",
+        equation2="x = x",
+        answer=False,
+    ))
+    checks["semantic_status_overrides_are_data_driven"] = (
+        override.semantic_class == override_row["semantic_class"]
+        and override.finite_status == override_row["finite_status"]
+        and override.source == override_row["source"]
     )
 
     manifest = CapabilityService().manifest()
@@ -474,7 +560,7 @@ def main() -> int:
             )
         )
     )
-    hard2_0125_known_table = [
+    nonuniform_bundle_fixture = [
         [0, 5, 2, 3, 3, 3],
         [4, 1, 1, 4, 4, 4],
         [0, 2, 2, 3, 0, 5],
@@ -482,7 +568,7 @@ def main() -> int:
         [4, 1, 4, 4, 4, 4],
         [5, 2, 2, 5, 5, 5],
     ]
-    decomposition = analyze_congruence_decompositions(hard2_0125_known_table)
+    decomposition = analyze_congruence_decompositions(nonuniform_bundle_fixture)
     checks["congruence_decomposition_contract"] = (
         decomposition.get("status") == "complete"
         and decomposition.get("decomposition_count") == 1
@@ -740,16 +826,6 @@ def main() -> int:
         and ray_alpha_state.get("status") == "candidate_ready"
         and "    symm\n" in ray_alpha_code
     )
-    checks["submission_has_no_exact_case_replay"] = not any(
-        marker in solver_source
-        for marker in (
-            "hard2_0027",
-            "(1167, 1763)",
-            "VERIFIED_SYMBOLIC_MODEL_ARTIFACTS",
-            "verified_symbolic_model_artifact",
-        )
-    )
-
     signature = canonical_equation_signature("x ◇ y = y ◇ y")
     checks["alpha_canonicalization"] = signature == canonical_equation_signature("b ◇ b = a ◇ b")
     checks["indexed_feedback_variables"] = (

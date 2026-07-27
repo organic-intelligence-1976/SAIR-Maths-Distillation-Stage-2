@@ -73,6 +73,9 @@ The most useful orientation documents are:
   historical six-part certificate used to derive and test the general
   residue-ray family; it is evidence, not an exact-case submission shortcut.
 - `scripts/research_system_contracts.py`: fast contract and regression checks.
+- `scripts/audit_submission_sanitization.py`: reject benchmark names,
+  known-label reads, exact-case cache symbols, and identifier-driven branches
+  in the packed submission while permitting equation-structural routing.
 - `scripts/stage1_routing_probe.py`: compare Stage 1 priors and feedback-aware
   scheduling on a frozen balanced residual fixture.
 - `scripts/compile_submission.py`: compile the current system into a single

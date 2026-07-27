@@ -746,35 +746,23 @@ TOOL_ALIASES = {
 TOOL_CONTRACT_FIELDS = ("domain", "scope", "cost", "feedback_quality", "native_import", "deployability")
 
 
-# Production solving is intentionally equation-driven. Curated semantic facts
-# belong in the research data layer, not in exact-ID branches in the submission.
-KNOWN_IMPLICATION_SEMANTICS: dict[tuple[int, int], dict[str, Any]] = {}
-
-
 def implication_semantics(problem: dict[str, Any]) -> dict[str, Any]:
-    """Return an explicit finite/general status without guessing missing facts."""
-    try:
-        key = (int(problem.get("eq1_id")), int(problem.get("eq2_id")))
-    except (TypeError, ValueError):
-        key = (-1, -1)
-    known = KNOWN_IMPLICATION_SEMANTICS.get(key)
-    answer = problem.get("answer")
-    general_from_row = "true" if answer is True else "false" if answer is False else "unknown"
+    """Return the submission's label-blind default semantic status.
+
+    Curated identifiers and known labels belong in the research data layer.
+    The packed submission deliberately does not inspect them.
+    """
     out: dict[str, Any] = {
-        "eq1_id": None if key[0] < 0 else key[0],
-        "eq2_id": None if key[1] < 0 else key[1],
         "semantic_class": "unclassified",
         "semantic_target": "general_implication",
-        "general_status": general_from_row,
+        "general_status": "unknown",
         "finite_status": "unknown",
         "certificate_class": "finite_model",
         "competition_policy": "prose_finite_vs_judge_general",
         "current_solver_false_artifacts": ["finite_table", "llm_infinite_model_artifact"],
         "research_solver_false_artifacts": ["finite_table", "infinite_model_artifact"],
-        "source": "competition row only",
+        "source": "label-blind submission default",
     }
-    if known:
-        out.update(known)
     if out["general_status"] == "false" and out["finite_status"] == "true":
         out["judge_certificate_status"] = "expressible_as_infinite_lean_model"
         out["current_solver_certificate_status"] = "requires_infinite_model_artifact"
@@ -7847,46 +7835,62 @@ def is_square(t: Term):
     return t[1] if t[0] == "op" and t[1] == t[2] else None
 
 
-def special_right_square_h(h_eq: dict[str, Any]):
-    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
-    if lhs[0] != "var" or rhs[0] != "op":
-        return None
-    x = lhs[1]
-    if rhs[2] != sq(("var", x)):
-        return None
-    left = rhs[1]
-    if left[0] != "op" or left[1][0] != "var" or left[2][0] != "op":
-        return None
-    y = left[1][1]
-    yz = left[2]
-    if yz[1] != ("var", y) or yz[2][0] != "var":
-        return None
-    z = yz[2][1]
-    return (x, y, z) if len({x, y, z}) == 3 else None
+def right_square_h_roles(h_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Recognize the right-square source identity up to names and orientation."""
+    for reversed_eq, lone, body in (
+        (False, h_eq["lhs"], h_eq["rhs"]),
+        (True, h_eq["rhs"], h_eq["lhs"]),
+    ):
+        if lone[0] != "var" or body[0] != "op":
+            continue
+        x = lone[1]
+        if body[2] != sq(("var", x)):
+            continue
+        left = body[1]
+        if left[0] != "op" or left[1][0] != "var" or left[2][0] != "op":
+            continue
+        y = left[1][1]
+        yz = left[2]
+        if yz[1] != ("var", y) or yz[2][0] != "var":
+            continue
+        z = yz[2][1]
+        if len({x, y, z}) == 3:
+            return {"x": x, "y": y, "z": z, "reversed": reversed_eq}
+    return None
 
 
-def right_square_goal(g_eq: dict[str, Any]):
-    lhs, rhs = g_eq["lhs"], g_eq["rhs"]
-    if lhs[0] != "var" or rhs[0] != "op" or rhs[1] != lhs:
-        return None
-    inner = rhs[2]
-    if inner[0] != "op" or inner[2] != lhs or inner[1][0] != "op":
-        return None
-    b = inner[1][1]
-    if inner[1][2] != op(lhs, b):
-        return None
-    return term_to_str(lhs), term_to_str(b)
+def right_square_goal_roles(g_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Recognize the focused goal up to names and equation orientation."""
+    for reversed_eq, lone, body in (
+        (False, g_eq["lhs"], g_eq["rhs"]),
+        (True, g_eq["rhs"], g_eq["lhs"]),
+    ):
+        if lone[0] != "var" or body[0] != "op" or body[1] != lone:
+            continue
+        inner = body[2]
+        if inner[0] != "op" or inner[2] != lone or inner[1][0] != "op":
+            continue
+        b = inner[1][1]
+        if inner[1][2] != op(lone, b):
+            continue
+        return {
+            "x": term_to_str(lone),
+            "b": term_to_str(b),
+            "reversed": reversed_eq,
+        }
+    return None
 
 
 def right_square_helper_lines(h_eq: dict[str, Any]) -> list[str] | None:
-    m = special_right_square_h(h_eq)
-    if m is None:
+    roles = right_square_h_roles(h_eq)
+    if roles is None:
         return None
-    hx, hy, hz = m
+    hx, hy, hz = roles["x"], roles["y"], roles["z"]
 
     def h_call(x: str, y: str, z: str) -> str:
         mp = {hx: x, hy: y, hz: z}
-        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        proof = "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        return f"({proof}).symm" if roles["reversed"] else proof
 
     return [
         "have E4 : ∀ (v0 v1 v2 v3 v4 : G), ((v0 ◇ (v0 ◇ v1)) ◇ ((v2 ◇ (v2 ◇ v3)) ◇ ((v4 ◇ v4) ◇ (v4 ◇ v4)))) = v4 := by",
@@ -7918,22 +7922,37 @@ def right_square_helper_lines(h_eq: dict[str, Any]) -> list[str] | None:
 
 def right_square_chain_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
     helper = right_square_helper_lines(h_eq)
-    goal = right_square_goal(g_eq)
+    goal = right_square_goal_roles(g_eq)
     if helper is None or goal is None:
         return None
-    x, y = goal
+    x, y = goal["x"], goal["b"]
     xy = f"({x} ◇ {y})"
     yxy = f"({y} ◇ {xy})"
     inner = f"({yxy} ◇ {x})"
+    used_names = set(h_eq["variables"]) | set(g_eq["variables"]) | {"h"}
+
+    def fresh(base: str) -> str:
+        candidate = base
+        while candidate in used_names:
+            candidate += "_"
+        used_names.add(candidate)
+        return candidate
+
+    eq1 = fresh("rs_eq1")
+    eq2 = fresh("rs_eq2")
+    eq3 = fresh("rs_eq3")
+    eq4 = fresh("rs_eq4")
+    bridge_left = fresh("rs_bridge_left")
+    bridge_right = fresh("rs_bridge_right")
     lines = ["intro " + " ".join(g_eq["variables"])] + helper + [
-        f"have t1 : {yxy} = ({xy} ◇ {xy}) := right_square {y} {xy}",
-        f"have t2 : {inner} = ({x} ◇ {x}) := by",
-        f"  have a : {inner} = (({xy} ◇ {xy}) ◇ {x}) := congrArg (fun t => t ◇ {x}) t1",
-        f"  have b : (({xy} ◇ {xy}) ◇ {x}) = ({x} ◇ {x}) := right_square ({xy} ◇ {xy}) {x}",
-        "  exact a.trans b",
-        f"have t3 : {x} ◇ {inner} = {x} ◇ ({x} ◇ {x}) := congrArg (fun u => {x} ◇ u) t2",
-        f"have t4 : {x} ◇ ({x} ◇ {x}) = {x} := square_absorb {x} {x}",
-        "exact (t3.trans t4).symm",
+        f"have {eq1} : {yxy} = ({xy} ◇ {xy}) := right_square {y} {xy}",
+        f"have {eq2} : {inner} = ({x} ◇ {x}) := by",
+        f"  have {bridge_left} : {inner} = (({xy} ◇ {xy}) ◇ {x}) := congrArg (fun t => t ◇ {x}) {eq1}",
+        f"  have {bridge_right} : (({xy} ◇ {xy}) ◇ {x}) = ({x} ◇ {x}) := right_square ({xy} ◇ {xy}) {x}",
+        f"  exact {bridge_left}.trans {bridge_right}",
+        f"have {eq3} : {x} ◇ {inner} = {x} ◇ ({x} ◇ {x}) := congrArg (fun u => {x} ◇ u) {eq2}",
+        f"have {eq4} : {x} ◇ ({x} ◇ {x}) = {x} := square_absorb {x} {x}",
+        f"exact {eq3}.trans {eq4}" if goal["reversed"] else f"exact ({eq3}.trans {eq4}).symm",
     ]
     return "\n".join(lines)
 
@@ -7955,33 +7974,40 @@ def generic_right_square_chain_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) 
     return "\n".join(helper + [goal_body])
 
 
-def square_sandwich_h(h_eq: dict[str, Any]):
-    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
-    if lhs[0] != "var" or rhs[0] != "op":
-        return None
-    x = lhs[1]
-    left, square = rhs[1], rhs[2]
-    if left[0] != "op" or square[0] != "op":
-        return None
-    yx, y2 = left[1], left[2]
-    if yx[0] != "op" or yx[1][0] != "var" or yx[2] != ("var", x) or y2[0] != "var":
-        return None
-    y = yx[1][1]
-    if y2[1] != y or square[1][0] != "var" or square[2] != square[1]:
-        return None
-    z = square[1][1]
-    return (x, y, z) if len({x, y, z}) == 3 else None
+def square_sandwich_h_roles(h_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Recognize the square-sandwich source identity up to orientation."""
+    for reversed_eq, lone, body in (
+        (False, h_eq["lhs"], h_eq["rhs"]),
+        (True, h_eq["rhs"], h_eq["lhs"]),
+    ):
+        if lone[0] != "var" or body[0] != "op":
+            continue
+        x = lone[1]
+        left, square = body[1], body[2]
+        if left[0] != "op" or square[0] != "op":
+            continue
+        yx, y2 = left[1], left[2]
+        if yx[0] != "op" or yx[1][0] != "var" or yx[2] != ("var", x) or y2[0] != "var":
+            continue
+        y = yx[1][1]
+        if y2[1] != y or square[1][0] != "var" or square[2] != square[1]:
+            continue
+        z = square[1][1]
+        if len({x, y, z}) == 3:
+            return {"x": x, "y": y, "z": z, "reversed": reversed_eq}
+    return None
 
 
 def square_sandwich_helper_lines(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> list[str] | None:
-    m = square_sandwich_h(h_eq)
-    if m is None or not g_eq["variables"]:
+    roles = square_sandwich_h_roles(h_eq)
+    if roles is None or not g_eq["variables"]:
         return None
-    hx, hy, hz = m
+    hx, hy, hz = roles["x"], roles["y"], roles["z"]
 
     def h_call(x: str, y: str, z: str) -> str:
         mp = {hx: x, hy: y, hz: z}
-        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        proof = "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        return f"({proof}).symm" if roles["reversed"] else proof
 
     return [
         "intro " + " ".join(g_eq["variables"]),
@@ -8107,30 +8133,37 @@ def square_sandwich_chain_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> st
     return "\n".join(lines)
 
 
-def rowconst_h(h_eq: dict[str, Any]):
-    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
-    if lhs[0] != "op" or rhs[0] != "op":
-        return None
-    if lhs[1][0] != "var" or lhs[2][0] != "var" or rhs[1][0] != "var":
-        return None
-    x, y = lhs[1][1], lhs[2][1]
-    if rhs[1][1] != y or rhs[2][0] != "op" or rhs[2][1][0] != "var" or rhs[2][2][0] != "op":
-        return None
-    z = rhs[2][1][1]
-    if rhs[2][2] != op(("var", y), ("var", z)):
-        return None
-    return (x, y, z) if len({x, y, z}) == 3 else None
+def rowconst_h_roles(h_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Recognize the row-constant source identity up to orientation."""
+    for reversed_eq, lhs, rhs in (
+        (False, h_eq["lhs"], h_eq["rhs"]),
+        (True, h_eq["rhs"], h_eq["lhs"]),
+    ):
+        if lhs[0] != "op" or rhs[0] != "op":
+            continue
+        if lhs[1][0] != "var" or lhs[2][0] != "var" or rhs[1][0] != "var":
+            continue
+        x, y = lhs[1][1], lhs[2][1]
+        if rhs[1][1] != y or rhs[2][0] != "op" or rhs[2][1][0] != "var" or rhs[2][2][0] != "op":
+            continue
+        z = rhs[2][1][1]
+        if rhs[2][2] != op(("var", y), ("var", z)):
+            continue
+        if len({x, y, z}) == 3:
+            return {"x": x, "y": y, "z": z, "reversed": reversed_eq}
+    return None
 
 
 def rowconst_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
-    m = rowconst_h(h_eq)
-    if m is None or g_eq["lhs"][0] != "op" or g_eq["rhs"][0] != "op":
+    roles = rowconst_h_roles(h_eq)
+    if roles is None or g_eq["lhs"][0] != "op" or g_eq["rhs"][0] != "op":
         return None
-    hx, hy, hz = m
+    hx, hy, hz = roles["x"], roles["y"], roles["z"]
 
     def h_call(x: str, y: str, z: str) -> str:
         mp = {hx: x, hy: y, hz: z}
-        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        proof = "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        return f"({proof}).symm" if roles["reversed"] else proof
 
     lhs_l, lhs_r = term_to_str(g_eq["lhs"][1]), term_to_str(g_eq["lhs"][2])
     rhs_l, rhs_r = term_to_str(g_eq["rhs"][1]), term_to_str(g_eq["rhs"][2])
@@ -8155,22 +8188,28 @@ def rowconst_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
     ])
 
 
-def square_rowconst_h(h_eq: dict[str, Any]) -> tuple[str, str, str] | None:
-    lhs, rhs = h_eq["lhs"], h_eq["rhs"]
-    if lhs[0] != "var" or rhs[0] != "op":
-        return None
-    x = lhs[1]
-    left, right = rhs[1], rhs[2]
-    if left != sq(("var", x)):
-        return None
-    if right[0] != "op" or right[2][0] != "var":
-        return None
-    yz = right[1]
-    z = right[2][1]
-    if yz[0] != "op" or yz[1][0] != "var" or yz[2] != ("var", z):
-        return None
-    y = yz[1][1]
-    return (x, y, z) if len({x, y, z}) == 3 else None
+def square_rowconst_h_roles(h_eq: dict[str, Any]) -> dict[str, Any] | None:
+    """Recognize the square-row-constant source identity up to orientation."""
+    for reversed_eq, lone, body in (
+        (False, h_eq["lhs"], h_eq["rhs"]),
+        (True, h_eq["rhs"], h_eq["lhs"]),
+    ):
+        if lone[0] != "var" or body[0] != "op":
+            continue
+        x = lone[1]
+        left, right = body[1], body[2]
+        if left != sq(("var", x)):
+            continue
+        if right[0] != "op" or right[2][0] != "var":
+            continue
+        yz = right[1]
+        z = right[2][1]
+        if yz[0] != "op" or yz[1][0] != "var" or yz[2] != ("var", z):
+            continue
+        y = yz[1][1]
+        if len({x, y, z}) == 3:
+            return {"x": x, "y": y, "z": z, "reversed": reversed_eq}
+    return None
 
 
 def grounding_derived_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | None:
@@ -8180,13 +8219,21 @@ def grounding_derived_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | 
     shape but used to fail at a trailing `grind`. This packed version emits the
     final `calc` explicitly.
     """
-    m = square_rowconst_h(h_eq)
-    if m is None:
+    roles = square_rowconst_h_roles(h_eq)
+    if roles is None:
         return None
-    hx, hy, hz = m
-    lhs, rhs = g_eq["lhs"], g_eq["rhs"]
-    if lhs[0] != "var" or rhs[0] != "op" or rhs[1] != sq(lhs):
+    hx, hy, hz = roles["x"], roles["y"], roles["z"]
+    goal_match = None
+    for reversed_eq, lone, body in (
+        (False, g_eq["lhs"], g_eq["rhs"]),
+        (True, g_eq["rhs"], g_eq["lhs"]),
+    ):
+        if lone[0] == "var" and body[0] == "op" and body[1] == sq(lone):
+            goal_match = (reversed_eq, lone, body)
+            break
+    if goal_match is None:
         return None
+    goal_reversed, lhs, rhs = goal_match
     goal_x = term_to_str(lhs)
     rhs_inner = term_to_str(rhs[2])
     rhs_s = term_to_str(rhs)
@@ -8195,11 +8242,14 @@ def grounding_derived_body(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str | 
 
     def h_call(x: str, y: str, z: str) -> str:
         mp = {hx: x, hy: y, hz: z}
-        return "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        proof = "h " + " ".join(lean_arg(mp[v]) for v in h_eq["variables"])
+        return f"({proof}).symm" if roles["reversed"] else proof
 
     lines = []
     if g_eq["variables"]:
         lines.append("intro " + " ".join(g_eq["variables"]))
+    if goal_reversed:
+        lines.append("symm")
     lines.extend([
         "have E1 : ∀ v0 v1 v2 v3 : G, (v0 ◇ v0) ◇ (v1 ◇ ((v2 ◇ v3) ◇ v3)) = v0 := by",
         "  intro v0 v1 v2 v3",
@@ -8285,11 +8335,9 @@ def proof_battery_graph_body(h_eq: dict[str, Any], g_eq: dict[str, Any], max_lay
 def old_haves_grind_bodies(h_eq: dict[str, Any], g_eq: dict[str, Any]):
     """Yield staged HAVE+GRIND bodies from the generic h-instantiation pool.
 
-    The 24-row body was the original cheap fallback.  A focused gap probe on
-    held-out rows found that the same generator needs a slightly deeper
-    prefix for some cases: `hard2_0021` closes at 48 generated instances and
-    `hard3_0193` closes at 64.  Keep the stages separate so Lean can accept a
-    cheap prefix before buying the larger grind context.
+    Geometric prefix widening preserves a cheap first attempt while allowing
+    denser goals to buy a larger instantiation context. The limits describe
+    resource tiers, not recognized problem identities.
     """
     intro = "intro " + " ".join(g_eq["variables"]) if g_eq["variables"] else ""
     for limit in (24, 48, 64):
@@ -8420,9 +8468,9 @@ def helper_chain_trigger_flags(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> li
         flags.append("nested_tail_absorption")
     if repeated_self_absorption_h(h_eq, g_eq):
         flags.append("repeated_self_absorption")
-    if special_right_square_h(h_eq):
+    if right_square_h_roles(h_eq):
         flags.append("focused_right_square_shape")
-    if square_sandwich_h(h_eq):
+    if square_sandwich_h_roles(h_eq):
         flags.append("focused_square_sandwich_shape")
     return flags
 
@@ -8801,13 +8849,13 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
         advice.append("H has repeated self-absorption form x = T[x,x,...] and G is x = compound; prefer an early true-side midpoint/lemma_chain before expensive false search.")
     if nested_tail_absorption_h(h_eq, g_eq):
         advice.append("H has nested-tail absorption form x = (y ◇ (z ◇ x)) ◇ (w ◇ x); try nested_absorb then the broad tail_any contraction helper.")
-    if special_right_square_h(h_eq):
+    if right_square_h_roles(h_eq):
         advice.append("H matches right_square_chain: try helpers u ◇ (v ◇ v)=v and u ◇ v=v ◇ v.")
-    if square_sandwich_h(h_eq):
+    if square_sandwich_h_roles(h_eq):
         advice.append("H matches square_sandwich_chain: try square_const/right_id_square/sandwich helpers.")
-    if rowconst_h(h_eq):
+    if rowconst_h_roles(h_eq):
         advice.append("H matches rowconst_certificates.")
-    if square_rowconst_h(h_eq):
+    if square_rowconst_h_roles(h_eq):
         advice.append("H matches grounding_derived square-rowconst: derive a ◇ b = a ◇ a and close explicitly.")
     advice.append("If false, use false_model_search for fixed finite routes, false_model_family for a compact finite operation, or residue_ray_countermodel for an unbounded residue-controlled operation. Every candidate is mechanically checked; misses return concrete repair diagnostics.")
     return "\n".join(advice)
@@ -8960,7 +9008,7 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
             "why": "Goal differs only by a right argument under a shared left prefix; try this non-refuted reusable contraction helper.",
             "call": action,
         })
-    if right_square_chain_body(h_eq, g_eq) or special_right_square_h(h_eq):
+    if right_square_chain_body(h_eq, g_eq) or right_square_h_roles(h_eq):
         ranked.append({"tool": "right_square_chain", "score": 98, "why": "H/G match the trusted right-square absorption helper-chain renderer.", "call": {"kind": "tool_call", "tool": "right_square_chain", "target": "goal", "budget": 15}})
         ranked.append({"tool": "lemma_chain", "score": 90, "why": "Same proof through generic helper-chain consumer.", "call": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [
             {"name": "square_absorb", "equation": "u ◇ (v ◇ v) = v"},
@@ -8970,7 +9018,7 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
         ranked.append({"tool": "helper_chain_portfolio", "score": 93, "why": "H has repeated self-absorption; try reusable helper chains through the generic midpoint consumer and use their proved/not-consumed feedback.", "call": {"kind": "tool_call", "tool": "helper_chain_portfolio", "target": "goal", "chains": ["generic_right_square_absorption"], "budget": 12}})
     if nested_tail_absorption_h(h_eq, g_eq):
         ranked.append({"tool": "helper_chain_portfolio", "score": 97, "why": "H has nested-tail absorption; prove nested_absorb, then the broad tail_any contraction law and instantiate it to G.", "call": {"kind": "tool_call", "tool": "helper_chain_portfolio", "target": "goal", "chains": ["nested_tail_absorption"], "budget": 36}})
-    if square_sandwich_h(h_eq):
+    if square_sandwich_h_roles(h_eq):
         ranked.append({"tool": "lemma_chain", "score": 98, "why": "H has the square-witness/sandwich shape; use the four-helper chain.", "call": {"kind": "tool_call", "tool": "lemma_chain", "target": "goal", "lemmas": [
             {"name": "square_const", "equation": "u ◇ u = v ◇ v"},
             {"name": "right_id_square", "equation": "u ◇ (v ◇ v) = u"},
@@ -8978,9 +9026,9 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
             {"name": "left_sandwich", "equation": "v ◇ (u ◇ v) = u"},
         ]}})
         ranked.append({"tool": "square_sandwich_chain", "score": 92, "why": "Focused equivalent renderer for the square-witness helper chain.", "call": {"kind": "tool_call", "tool": "square_sandwich_chain", "target": "goal", "budget": 15}})
-    if rowconst_h(h_eq):
+    if rowconst_h_roles(h_eq):
         ranked.append({"tool": "rowconst_certificates", "score": 85, "why": "H matches a row-constant certificate pattern.", "call": {"kind": "tool_call", "tool": "rowconst_certificates", "target": "goal"}})
-    if square_rowconst_h(h_eq):
+    if square_rowconst_h_roles(h_eq):
         ranked.append({"tool": "grounding_derived", "score": 84, "why": "H matches square-rowconst grounding; derive/use a◇b=a◇a with an explicit final close.", "call": {"kind": "tool_call", "tool": "grounding_derived", "target": "goal", "budget": 12}})
     if residue_ray_promising_h(h_eq):
         ranked.append({
@@ -10364,9 +10412,9 @@ def compact_tool_signature(data: dict[str, Any]) -> str:
 
 def should_try_collaboration_first(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> bool:
     return bool(
-        special_right_square_h(h_eq)
-        or square_sandwich_h(h_eq)
-        or rowconst_h(h_eq)
+        right_square_h_roles(h_eq)
+        or square_sandwich_h_roles(h_eq)
+        or rowconst_h_roles(h_eq)
         or repeated_self_absorption_h(h_eq, g_eq)
         or goal_generalization_actions(h_eq, g_eq)
     )
@@ -10912,9 +10960,9 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     false_failure_feedback: list[dict[str, Any]] = []
     early_true_feedback: list[dict[str, Any]] = []
 
-    # A research deployment may provide a broad semantic registry externally.
-    # Even then, the submission carries no exact-case artifact or lesson: System
-    # 2 must propose a construction and Lean remains the trust boundary.
+    # Research deployments may attach equation-level semantic metadata. The
+    # packed solver consumes only the generic status contract: System 2 must
+    # propose a construction and Lean remains the trust boundary.
     if semantic_context.get("current_solver_certificate_status") == "requires_infinite_model_artifact":
         remaining = max(0.0, budget - (time.monotonic() - solve_started))
         if remaining >= 8.0:
@@ -10941,9 +10989,9 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         print(json.dumps(semantic_state, ensure_ascii=False), file=sys.stderr)
         return "semantic_solver_capability_gap"
 
-    # Equation-driven symbolic checkpoint. This is deliberately broader than
-    # any benchmark row: whenever H returns a lone variable through nested left
-    # translations, System 2 may request a residue-controlled operation family.
+    # Equation-driven symbolic checkpoint. Whenever H returns a lone variable
+    # through nested left translations, System 2 may request a
+    # residue-controlled operation family.
     # The mechanical side searches parameters, reports near misses, and emits a
     # Type-level certificate only for proof-supported candidates.
     if residue_ray_promising_h(h_eq):
