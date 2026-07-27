@@ -82,6 +82,8 @@ The most useful orientation documents are:
   competition-compatible `solver.py`.
 - `scripts/compiled_submission_smoke.py`: exercise a compiled solver through
   the official proxy and Lean judge.
+- `submission/solver.py`: checked-in generated competition artifact; regenerate
+  it from `baby_solver.py` rather than editing it directly.
 - `configs/`: checked-in example LLM configuration files that read credentials
   from environment variables.
 - `docs/`: design notes, protocols, roadmaps, and evidence summaries.
@@ -185,11 +187,10 @@ python3 scripts/compile_submission.py
 python3 scripts/compiled_submission_smoke.py
 ```
 
-Generated outputs are written beneath `.artifacts/`.
-
-The generated competition submission is written to
-`.artifacts/compiled_submission/submission/solver.py`. It is not checked in, so
-there is one maintained solver source in the public tree.
+The generated competition submission is written to `submission/solver.py`.
+`baby_solver.py` is its sole maintained source; CI regenerates the artifact and
+checks that the committed copy is current. Build manifests and smoke-test logs
+remain beneath `.artifacts/`.
 
 ## Credits
 

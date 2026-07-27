@@ -20,7 +20,7 @@ def main() -> int:
     parser.add_argument(
         "--submission-dir",
         type=Path,
-        default=ROOT / ".artifacts" / "compiled_submission" / "submission",
+        default=ROOT / "submission",
     )
     parser.add_argument(
         "--manifest",
@@ -48,4 +48,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

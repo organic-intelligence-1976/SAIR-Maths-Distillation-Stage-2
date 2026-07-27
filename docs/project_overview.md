@@ -96,7 +96,8 @@ The main solver entry points are:
 
 - `baby_solver.py`: maintained packed solver source;
 - `scripts/compile_submission.py`: writes the generated competition
-  `solver.py` under `.artifacts/compiled_submission/submission/`;
+  artifact to `submission/solver.py`;
+- `submission/solver.py`: checked-in, directly submittable generated artifact;
 - `research_system/`: modular experimental framework for curriculum,
   blackboard, planner, executor, verifier, and feedback protocols.
 

@@ -24,3 +24,5 @@ jobs:
         run: python scripts/native_import_audit.py
       - name: Build competition submission artifact
         run: python scripts/compile_submission.py
+      - name: Verify committed submission is current
+        run: git diff --exit-code -- submission/solver.py
