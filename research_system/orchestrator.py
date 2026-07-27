@@ -64,6 +64,8 @@ def compact_mechanical_feedback(
         "kind": source.get("kind") or "MechanicalObservation",
         "status": execution_status or source.get("status") or "unknown",
     }
+    if source.get("status") and source.get("status") != feedback["status"]:
+        feedback["mechanical_status"] = source["status"]
     for key in (
         "source",
         "need_hint",
@@ -81,6 +83,20 @@ def compact_mechanical_feedback(
         "h_profile",
         "g_profile",
         "errors",
+        "config",
+        "carrier_size",
+        "quotient_obligation_count",
+        "quotient_tables_examined",
+        "quotient_candidates",
+        "selected_quotient_index",
+        "lifted_h_constraints",
+        "iterations",
+        "goal_witness",
+        "parameters",
+        "last_goal_witness",
+        "last_parameters",
+        "candidate_events",
+        "events",
     ):
         if source.get(key) not in (None, [], {}):
             feedback[key] = _bounded(source[key])

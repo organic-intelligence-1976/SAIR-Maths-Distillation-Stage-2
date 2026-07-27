@@ -17,7 +17,11 @@ from research_system.distillation import VerifiedDistiller  # noqa: E402
 from research_system.executor import MechanicalExecutor  # noqa: E402
 from research_system.experience import ExperienceStore  # noqa: E402
 from research_system.orchestrator import ResearchEpisodeRunner  # noqa: E402
-from research_system.planner import ContextAugmentingPlanner, OpenAICompatiblePlanner  # noqa: E402
+from research_system.planner import (  # noqa: E402
+    ContextAugmentingPlanner,
+    FeedbackRepairPlanner,
+    OpenAICompatiblePlanner,
+)
 from research_system.semantics import SemanticService  # noqa: E402
 from research_system.teacher import (  # noqa: E402
     TeacherSearchConfig,
@@ -216,7 +220,10 @@ def main() -> int:
 
     def student_factory(lesson: dict | None):
         assert student_config is not None
-        planner = OpenAICompatiblePlanner(student_config, timeout=args.llm_timeout)
+        planner = FeedbackRepairPlanner(
+            OpenAICompatiblePlanner(student_config, timeout=args.llm_timeout),
+            max_corrections=1,
+        )
         additions = {"teacher_lesson": lesson} if lesson is not None else {}
         return ContextAugmentingPlanner(
             planner,
@@ -255,12 +262,21 @@ def main() -> int:
         )
         search = TeacherStudentSearch(
             runner,
-            OpenAICompatiblePlanner(teacher_config, timeout=args.llm_timeout),
+            FeedbackRepairPlanner(
+                OpenAICompatiblePlanner(
+                    teacher_config,
+                    timeout=args.llm_timeout,
+                ),
+                max_corrections=1,
+            ),
             config=config,
             student_planner_factory=None if args.skip_student else student_factory,
-            teacher_planner_factory=lambda: OpenAICompatiblePlanner(
-                teacher_config,
-                timeout=args.llm_timeout,
+            teacher_planner_factory=lambda: FeedbackRepairPlanner(
+                OpenAICompatiblePlanner(
+                    teacher_config,
+                    timeout=args.llm_timeout,
+                ),
+                max_corrections=1,
             ),
         )
         prior = prior_reports.get(case.case_id)

@@ -57,6 +57,10 @@ The most useful orientation documents are:
 - `scripts/run_research_episode.py`: run scripted or live-LLM research episodes.
 - `scripts/teacher_student_search.py`: run resumable mechanically ranked
   teacher search and ordinary-student attribution.
+- `scripts/skew_model_probe.py` and `scripts/bundle_model_probe.py`: synthesize
+  compact quotient/fiber countermodels and verify their expanded tables.
+- `scripts/bundle_feedback_probe.py`: test live repair across a failed
+  equal-fiber family and progressively larger non-uniform bundles.
 - `scripts/structured_infinite_model_probe.py`: assemble and judge a typed
   infinite countermodel plan.
 - `scripts/research_system_contracts.py`: fast contract and regression checks.

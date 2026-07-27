@@ -20,6 +20,15 @@ from research_system.curriculum import CurriculumCase, reference_cases  # noqa: 
 from research_system.distillation import VerifiedDistiller  # noqa: E402
 from research_system.executor import MechanicalExecutor  # noqa: E402
 from research_system.experience import ExperienceStore  # noqa: E402
+from research_system.finite_models import (  # noqa: E402
+    BundleModelConfig,
+    SkewProductConfig,
+    affine_fiber_library,
+    affine_rectangular_library,
+    analyze_congruence_decompositions,
+    bundle_counterexample_search,
+    skew_product_counterexample_search,
+)
 from research_system.integration import IntegrationCatalog  # noqa: E402
 from research_system.infinite_models import (  # noqa: E402
     assemble_infinite_model_plan,
@@ -29,6 +38,7 @@ from research_system.obligations import ObligationGraph, infer_approach_family  
 from research_system.orchestrator import ResearchEpisodeRunner, compact_mechanical_feedback  # noqa: E402
 from research_system.planner import (  # noqa: E402
     ContextAugmentingPlanner,
+    FeedbackRepairPlanner,
     FunctionPlanner,
     OpenAICompatiblePlanner,
     RetrievedLessonPlanner,
@@ -309,6 +319,107 @@ def main() -> int:
         and family_gate is not None
         and family_gate.get("status") == "withheld_for_curriculum"
     )
+    skew_h = baby_solver.parse_equation("x = (y ◇ y) ◇ (x ◇ (y ◇ x))")
+    skew_g = baby_solver.parse_equation("x ◇ y = (x ◇ (x ◇ x)) ◇ y")
+    skew_status, skew_table, skew_state = skew_product_counterexample_search(
+        skew_h,
+        skew_g,
+        SkewProductConfig(
+            control_size=2,
+            fiber_size=3,
+            time_budget=5,
+            max_iterations=32,
+            workers=2,
+        ),
+    )
+    skew_normalized, skew_adapter = MechanicalExecutor.normalize({
+        "kind": "skew_product_search",
+        "quotient_size": 2,
+        "fiber_size": 3,
+        "budget": 5,
+    })
+    checks["skew_product_constructor_contract"] = (
+        len(affine_fiber_library(3)) == 27
+        and skew_normalized is not None
+        and skew_normalized.get("kind") == "skew_model_search"
+        and skew_normalized.get("control_size") == 2
+        and skew_adapter is None
+        and (
+            (
+                skew_status == "found"
+                and skew_table is not None
+                and baby_solver.is_counterexample(skew_h, skew_g, skew_table)
+                and skew_state.get("status") == "verified_countermodel"
+                and skew_state.get("parameters", {}).get("parameter_count") == 8
+            )
+            or (
+                skew_status == "unavailable"
+                and skew_table is None
+                and skew_state.get("status") == "unavailable"
+            )
+        )
+    )
+    bundle_h = baby_solver.parse_equation(
+        "x = ((x ◇ (y ◇ z)) ◇ z) ◇ x"
+    )
+    bundle_g = baby_solver.parse_equation(
+        "x = ((x ◇ x) ◇ (y ◇ y)) ◇ x"
+    )
+    bundle_status, bundle_table, bundle_state = bundle_counterexample_search(
+        bundle_h,
+        bundle_g,
+        BundleModelConfig(
+            fiber_sizes=(4, 2),
+            max_patches=6,
+            time_budget=6,
+            max_iterations=160,
+            workers=2,
+        ),
+    )
+    bundle_normalized, bundle_adapter = MechanicalExecutor.normalize({
+        "kind": "fiber_bundle_search",
+        "block_sizes": [4, 2],
+        "max_patches": 6,
+        "budget": 6,
+    })
+    checks["bundle_model_constructor_contract"] = (
+        len(affine_rectangular_library(4, 2, 4)) == 64
+        and bundle_normalized is not None
+        and bundle_normalized.get("kind") == "bundle_model_search"
+        and bundle_normalized.get("fiber_sizes") == (4, 2)
+        and bundle_adapter is None
+        and (
+            (
+                bundle_status == "found"
+                and bundle_table is not None
+                and baby_solver.is_counterexample(bundle_h, bundle_g, bundle_table)
+                and bundle_state.get("status") == "verified_countermodel"
+                and bundle_state.get("parameters", {}).get("patch_count") <= 6
+            )
+            or (
+                bundle_status == "unavailable"
+                and bundle_table is None
+                and bundle_state.get("status") == "unavailable"
+            )
+        )
+    )
+    hard2_0125_known_table = [
+        [0, 5, 2, 3, 3, 3],
+        [4, 1, 1, 4, 4, 4],
+        [0, 2, 2, 3, 0, 5],
+        [0, 2, 2, 3, 3, 3],
+        [4, 1, 4, 4, 4, 4],
+        [5, 2, 2, 5, 5, 5],
+    ]
+    decomposition = analyze_congruence_decompositions(hard2_0125_known_table)
+    checks["congruence_decomposition_contract"] = (
+        decomposition.get("status") == "complete"
+        and decomposition.get("decomposition_count") == 1
+        and decomposition["decompositions"][0]["block_sizes"] == [4, 2]
+        and decomposition["decompositions"][0]["quotient_table"]
+        == [[0, 0], [1, 1]]
+        and not decomposition["decompositions"][0]["equal_fibers"]
+    )
     original_call_llm = baby_solver.call_llm
     original_judge_infinite = baby_solver.judge_infinite_model_artifact_attributed
     infinite_contexts: list[dict] = []
@@ -474,6 +585,35 @@ def main() -> int:
 
     planner = ScriptedPlanner([{"kind": "midpoint", "lemma": "a = a"}])
     checks["scripted_planner"] = planner.next_action({}) is not None and planner.next_action({}) is None
+    repair_recommendation = {
+        "kind": "bundle_model_search",
+        "fiber_sizes": [4, 2],
+        "max_patches": 6,
+        "budget": 30,
+    }
+    repair_planner = FeedbackRepairPlanner(
+        ScriptedPlanner([
+            {
+                "kind": "bundle_model_search",
+                "fiber_sizes": [3, 2],
+                "max_patches": 4,
+            },
+            repair_recommendation,
+        ]),
+        max_corrections=1,
+    )
+    repaired_action = repair_planner.next_action({
+        "recent_observations": [{
+            "mechanical_status": "family_infeasible",
+            "suggested_next_actions": [repair_recommendation],
+        }],
+    })
+    checks["feedback_repair_planner"] = (
+        repaired_action == repair_recommendation
+        and repair_planner.last_trace is not None
+        and repair_planner.last_trace.get("correction_count") == 1
+        and repair_planner.last_trace.get("matched_primary_recommendation") is True
+    )
     policy = baby_solver.MidpointBudgetPolicy.from_mapping({
         "total_budget": 8,
         "initial_grant": 1,
@@ -1170,27 +1310,32 @@ def main() -> int:
         and "available_tools" in live_prompt
         and "Retain the proved node and add one missing bridge." in live_prompt
     )
-    compact = compact_mechanical_feedback({
-        "kind": "SearchState",
-        "status": "stuck",
-        "need_hint": "propose a bridge",
-        "stderr": "x" * 10000,
-        "goal_search_state": {
-            "target": "x = y",
-            "closest_pairs": [{"left": "x", "right": "y"}],
+    compact = compact_mechanical_feedback(
+        {
+            "kind": "SearchState",
+            "status": "family_infeasible",
+            "need_hint": "propose a bridge",
+            "stderr": "x" * 10000,
+            "goal_search_state": {
+                "target": "x = y",
+                "closest_pairs": [{"left": "x", "right": "y"}],
+            },
+            "budget_allocation": {"policy_id": "contract", "events": [{"event": "grant"}]},
+            "repair_class": "repair_h_preserve_g",
+            "family_summary": {"carrier_size": 3, "rule_count": 2},
+            "h_profile": {
+                "failures_observed": 2,
+                "examples": [{"env": {"x": 0}, "cells": [[0, 1]]}],
+            },
+            "g_profile": {"failures_observed": 1},
+            "errors": [{"code": "contract_schema_error"}],
         },
-        "budget_allocation": {"policy_id": "contract", "events": [{"event": "grant"}]},
-        "repair_class": "repair_h_preserve_g",
-        "family_summary": {"carrier_size": 3, "rule_count": 2},
-        "h_profile": {
-            "failures_observed": 2,
-            "examples": [{"env": {"x": 0}, "cells": [[0, 1]]}],
-        },
-        "g_profile": {"failures_observed": 1},
-        "errors": [{"code": "contract_schema_error"}],
-    })
+        execution_status="mechanical_stuck",
+    )
     checks["compact_system2_feedback"] = (
         compact.get("need_hint") == "propose a bridge"
+        and compact.get("status") == "mechanical_stuck"
+        and compact.get("mechanical_status") == "family_infeasible"
         and "stderr" not in compact
         and compact.get("goal_search", {}).get("target") == "x = y"
         and compact.get("budget_allocation", {}).get("policy_id") == "contract"

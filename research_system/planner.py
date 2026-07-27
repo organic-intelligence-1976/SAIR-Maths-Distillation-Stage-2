@@ -72,6 +72,131 @@ class ContextAugmentingPlanner:
         return self.planner.next_action(augmented)
 
 
+def _matches_recommended_action(
+    action: dict[str, Any] | None,
+    recommended: dict[str, Any],
+) -> bool:
+    if not isinstance(action, dict):
+        return False
+    kind = str(action.get("kind") or "").strip().lower()
+    if kind == "tool_call":
+        kind = str(action.get("tool") or "").strip().lower()
+    expected_kind = str(recommended.get("kind") or "").strip().lower()
+    if expected_kind == "tool_call":
+        expected_kind = str(recommended.get("tool") or "").strip().lower()
+    aliases = {
+        "fiber_bundle_search": "bundle_model_search",
+        "patched_bundle_search": "bundle_model_search",
+        "skew_product_search": "skew_model_search",
+        "block_model_search": "skew_model_search",
+    }
+    kind = aliases.get(kind, kind)
+    expected_kind = aliases.get(expected_kind, expected_kind)
+    if kind != expected_kind:
+        return False
+    if expected_kind == "bundle_model_search":
+        actual_fibers = action.get("fiber_sizes") or action.get("block_sizes")
+        expected_fibers = (
+            recommended.get("fiber_sizes") or recommended.get("block_sizes")
+        )
+        return (
+            list(actual_fibers or []) == list(expected_fibers or [])
+            and int(action.get("max_patches") or 0)
+            == int(recommended.get("max_patches") or 0)
+        )
+    if expected_kind == "skew_model_search":
+        return (
+            int(action.get("control_size") or action.get("quotient_size") or 0)
+            == int(
+                recommended.get("control_size")
+                or recommended.get("quotient_size")
+                or 0
+            )
+            and int(action.get("fiber_size") or 0)
+            == int(recommended.get("fiber_size") or 0)
+        )
+    return action == recommended
+
+
+class FeedbackRepairPlanner:
+    """Give System 2 one bounded correction when it ignores exact feedback."""
+
+    def __init__(
+        self,
+        planner: Planner,
+        *,
+        max_corrections: int = 1,
+        name: str | None = None,
+    ):
+        self.planner = planner
+        self.max_corrections = max(0, min(3, int(max_corrections)))
+        self.name = name or f"feedback_repair:{planner.name}"
+        self.last_trace: dict[str, Any] | None = None
+
+    def next_action(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        action = self.planner.next_action(context)
+        traces = []
+        trace = getattr(self.planner, "last_trace", None)
+        if isinstance(trace, dict):
+            traces.append(deepcopy(trace))
+        observations = context.get("recent_observations")
+        latest = (
+            observations[-1]
+            if isinstance(observations, list)
+            and observations
+            and isinstance(observations[-1], dict)
+            else {}
+        )
+        suggestions = latest.get("suggested_next_actions")
+        recommended = (
+            suggestions[0]
+            if isinstance(suggestions, list)
+            and suggestions
+            and isinstance(suggestions[0], dict)
+            else None
+        )
+        corrections = 0
+        while (
+            corrections < self.max_corrections
+            and latest.get("mechanical_status") == "family_infeasible"
+            and recommended is not None
+            and not _matches_recommended_action(action, recommended)
+        ):
+            corrections += 1
+            repaired_context = deepcopy(context)
+            repaired_observations = list(
+                repaired_context.get("recent_observations") or []
+            )
+            repaired_observations.append({
+                "kind": "LLMAdapterState",
+                "status": "correction_required",
+                "mechanical_status": "family_infeasible",
+                "error_code": "ignored_primary_mechanical_repair",
+                "rejected_action": action,
+                "required_action": recommended,
+                "need_hint": (
+                    "Return required_action exactly. The previous compact model "
+                    "configuration was mechanically proved infeasible."
+                ),
+            })
+            repaired_context["recent_observations"] = repaired_observations[-3:]
+            action = self.planner.next_action(repaired_context)
+            trace = getattr(self.planner, "last_trace", None)
+            if isinstance(trace, dict):
+                traces.append(deepcopy(trace))
+        self.last_trace = {
+            "status": "action_ready" if action is not None else "no_action",
+            "source": "feedback_repair_planner",
+            "correction_count": corrections,
+            "matched_primary_recommendation": bool(
+                recommended is not None
+                and _matches_recommended_action(action, recommended)
+            ),
+            "delegate_traces": traces,
+        }
+        return action
+
+
 class RetrievedLessonPlanner:
     """Deterministic baseline that replays only missing nodes from the best lesson.
 
@@ -197,6 +322,7 @@ class OpenAICompatiblePlanner:
             "Retrieved lessons are structurally matched verified experience, not trusted target proofs. Reuse only their missing plan nodes; the target mechanics will prove them again.",
             "The obligation graph tracks approach families, dependencies, blocked routes, and evidence. Advance an open obligation; do not rename a blocked mechanism and resubmit it.",
             "A blocked exact node may be reopened only with reopen_novelty describing a materially new construction, invariant, representation, or proof mechanism.",
+            "When the latest observation has mechanical_status=family_infeasible and suggested_next_actions, use the first suggested action exactly unless you can identify a concrete structural reason to choose another. Never repeat the rejected configuration unchanged.",
             "Do not call an unavailable tool. Prefer a reusable universal helper over restating the goal with its variables.",
             "Closest-pair equations are diagnostics, not commands: generalize their recurring algebraic shape before proposing a helper.",
             "During teacher search, use the proposal slot and avoided-action list to explore a genuinely different mathematical family, not a renamed duplicate.",
@@ -214,6 +340,11 @@ class OpenAICompatiblePlanner:
             '{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["model_finder_v2:n=6"],"budget":8}',
             '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}',
             'false_model_family conditions: diagonal, off_diagonal, same_mod, different_mod, left_residue, right_residue, or {"kind":"cell","i":0,"j":1}; string conditions may use i, j, n and bounded arithmetic/comparisons.',
+            '{"kind":"skew_model_search","control_size":2,"fiber_size":3,"fiber_library":"affine","require_quotient_goal":true,"budget":15}',
+            "skew_model_search mechanically synthesizes a Q-by-fiber extension. With require_quotient_goal=true, the smaller quotient satisfies both H and G, so only block-dependent fiber maps may create the counterexample. Change factor sizes or the fiber library after family_infeasible feedback.",
+            '{"kind":"bundle_model_search","fiber_sizes":[4,2],"fiber_library":"affine_patches","max_patches":6,"require_quotient_goal":true,"budget":30}',
+            "bundle_model_search generalizes skew_model_search to unequal fibers. The mechanical side enumerates small quotient tables satisfying H and G, synthesizes affine maps between each pair of fibers, and permits at most max_patches exceptional cells. Use it when equal-factor searches fail or feedback suggests a non-uniform quotient; increase max_patches gradually.",
+            "Finite bundle search heuristic: after an equal 2-by-k extension is mechanically infeasible, keep two quotient blocks but try unequal fibers and increase total carrier one step at a time, such as [k+1,k]. Start with sparse patches (roughly 10-20 percent of table cells), then increase only after an infeasibility certificate. This is a search policy, not evidence that any proposed shape is correct.",
             '{"kind":"false_table","counterexample_table":[[0,1],[1,0]]}',
             '{"kind":"infinite_model_plan","model_name":"model","imports":["Mathlib.Tactic"],"carrier":"ℕ","operation":"fun x y ↦ ...","setup":["have helper : ... := by\\n  ..."],"hypothesis_proof":"intro x y z\\n...","counterexample_proof":"simp only [not_forall]\\nuse ...\\n..."}',
             '{"kind":"infinite_model_patch","set":{"hypothesis_proof":"<complete repaired tactic body>"}}',

@@ -13,6 +13,16 @@ from .infinite_models import (
     is_infinite_model_patch,
     is_infinite_model_plan,
 )
+from .finite_models import (
+    bundle_config_from_action,
+    bundle_counterexample_search,
+    config_from_action,
+    is_bundle_model_action,
+    is_skew_product_action,
+    normalize_bundle_model_action,
+    normalize_skew_product_action,
+    skew_product_counterexample_search,
+)
 
 
 class MechanicalExecutor:
@@ -32,6 +42,30 @@ class MechanicalExecutor:
     def normalize(action: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         if is_infinite_model_plan(action) or is_infinite_model_patch(action):
             return dict(action), None
+        if is_skew_product_action(action):
+            try:
+                return normalize_skew_product_action(action), None
+            except Exception as exc:
+                return None, {
+                    "kind": "LLMAdapterState",
+                    "status": "adapter_rejected",
+                    "errors": [{
+                        "code": "invalid_skew_product_action",
+                        "message": repr(exc),
+                    }],
+                }
+        if is_bundle_model_action(action):
+            try:
+                return normalize_bundle_model_action(action), None
+            except Exception as exc:
+                return None, {
+                    "kind": "LLMAdapterState",
+                    "status": "adapter_rejected",
+                    "errors": [{
+                        "code": "invalid_bundle_model_action",
+                        "message": repr(exc),
+                    }],
+                }
         return baby_solver.normalize_llm_action(action)
 
     @staticmethod
@@ -150,6 +184,76 @@ class MechanicalExecutor:
                         "a complete infinite_model_plan."
                     ),
                 },
+                adapter_state=adapter_state,
+                seconds=time.monotonic() - started,
+            )
+
+        if is_skew_product_action(normalized):
+            if (
+                semantic_context
+                and not baby_solver.finite_countermodel_search_allowed(semantic_context)
+            ):
+                return ExecutionResult(
+                    status="mechanical_stuck",
+                    normalized_action=normalized,
+                    submitted_action=normalized,
+                    state={
+                        "kind": "SkewProductSearchState",
+                        "status": "semantically_blocked",
+                        "need_hint": (
+                            "The semantic registry rules out finite countermodels "
+                            "for this implication. Use a structured infinite model."
+                        ),
+                    },
+                    adapter_state=adapter_state,
+                    seconds=time.monotonic() - started,
+                )
+            status, table, state = skew_product_counterexample_search(
+                h_eq,
+                g_eq,
+                config_from_action(normalized),
+            )
+            return ExecutionResult(
+                status="candidate_ready" if table is not None else "mechanical_stuck",
+                normalized_action=normalized,
+                submitted_action=normalized,
+                finite_table=table,
+                state={**state, "search_status": status},
+                adapter_state=adapter_state,
+                seconds=time.monotonic() - started,
+            )
+
+        if is_bundle_model_action(normalized):
+            if (
+                semantic_context
+                and not baby_solver.finite_countermodel_search_allowed(semantic_context)
+            ):
+                return ExecutionResult(
+                    status="mechanical_stuck",
+                    normalized_action=normalized,
+                    submitted_action=normalized,
+                    state={
+                        "kind": "BundleModelSearchState",
+                        "status": "semantically_blocked",
+                        "need_hint": (
+                            "The semantic registry rules out finite countermodels "
+                            "for this implication. Use a structured infinite model."
+                        ),
+                    },
+                    adapter_state=adapter_state,
+                    seconds=time.monotonic() - started,
+                )
+            status, table, state = bundle_counterexample_search(
+                h_eq,
+                g_eq,
+                bundle_config_from_action(normalized),
+            )
+            return ExecutionResult(
+                status="candidate_ready" if table is not None else "mechanical_stuck",
+                normalized_action=normalized,
+                submitted_action=normalized,
+                finite_table=table,
+                state={**state, "search_status": status},
                 adapter_state=adapter_state,
                 seconds=time.monotonic() - started,
             )

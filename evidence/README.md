@@ -19,8 +19,13 @@ consumption result, and Lean judge outcome.
 - `case_study_structured_infinite_repair.md`: structured infinite-model
   assembly, exact Lean repair feedback, and load-bearing teacher-to-student
   replay.
+- `case_study_recursive_bundle_countermodel.md`: quotient/fiber decomposition,
+  sparse symbolic finite-model synthesis, and a live two-step repair ladder
+  accepted by the official judge.
 - `teacher_student_structured_models_2026_07_26.json`: machine-readable finite
   teacher-search stop result and structured infinite-model attribution summary.
+- `recursive_bundle_countermodel_2026_07_26.json`: compact machine-readable
+  record of the non-uniform bundle case.
 - `cases/*.json`: machine-readable versions of the case studies.
 - `lean/*.lean`: Lean certificates accepted by the official Stage 2 judge for
   the showcased cases.

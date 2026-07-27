@@ -1,6 +1,6 @@
 # Modular Research System and Competition Compilation
 
-Status: walking skeleton operational, 2026-07-17
+Status: walking skeleton operational, 2026-07-26
 
 The project now has two deliberately different products:
 
@@ -41,10 +41,11 @@ official Lean verifier accepts the final artifact.
 | Capabilities | `research_system/capabilities.py` | Manifests, masks, gates, and intervention eligibility audit |
 | Blackboard | `research_system/blackboard.py` | Immutable proved nodes and alpha-canonical small-model refutations |
 | Obligation graph | `research_system/obligations.py` | Approach families, executable dependencies, diverse alternatives, blocking, and novelty-gated reopening |
-| Planner | `research_system/planner.py` | Deterministic scripted planner, callable adapter, and live OpenAI-compatible planner |
+| Planner | `research_system/planner.py` | Deterministic scripted planner, callable adapter, live OpenAI-compatible planner, and bounded feedback-correction wrapper |
 | Teacher search | `research_system/teacher.py` | Resumable mechanically ranked beams, trajectory minimization, and counterfactual ordinary-student replay |
 | Budget broker | `research_system/budget.py` | Renewable geometric worker leases, tunable policy genotypes, and reproducible mutation |
 | Executor | `research_system/executor.py` | True lemma/tool actions, finite tables/search, direct proofs, structured infinite plans, and legacy artifacts through `baby_solver.py` |
+| Finite-model contract | `research_system/finite_models.py` | Equal-fiber skew products, non-uniform quotient bundles, sparse affine-map patches, CEGIS verification, and congruence decomposition |
 | Infinite-model contract | `research_system/infinite_models.py` | Typed model parts, safe syntax normalization, field patches, and deterministic Lean assembly |
 | Verifier | `research_system/verifier.py` | Official Lean checks under competition or research declaration policy |
 | Curriculum | `research_system/curriculum.py` | True-dropout, finite-false, and infinite-false reference episodes |
@@ -150,6 +151,16 @@ python3 scripts/teacher_student_search.py \
 Reports contain a resumable beam checkpoint. Exact bounded propagation probes
 also prevent the LLM from proposing carriers already eliminated by the
 mechanical side.
+
+Finite symbolic search now has two compositional constructors. A skew product
+uses equal fibers; a bundle permits unequal fiber sizes and sparse exceptions
+to local affine maps while preserving an exact quotient. Mechanical
+`family_infeasible` states retain that specific status, emit primary and
+secondary next-action schemas, and receive one bounded correction reprompt if
+the live planner repeats the rejected configuration. The `hard2_0125` case
+demonstrates the ladder `2x2 -> [3,2] -> [4,2]`, ending in an official
+judge-accepted six-element countermodel. See
+[`../evidence/case_study_recursive_bundle_countermodel.md`](../evidence/case_study_recursive_bundle_countermodel.md).
 
 Structured infinite countermodels use a smaller repair surface than whole-file
 Lean generation:

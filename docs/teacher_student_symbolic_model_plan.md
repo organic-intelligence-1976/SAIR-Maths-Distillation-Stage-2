@@ -40,13 +40,23 @@ The teacher platform is now implemented rather than only planned:
 - promotion only when mechanical replay and lesson-aware student replay pass
   while the no-lesson control fails.
 
-The first long finite-family search on `hard2_0093` did not solve the case.
+The first long flat finite-family search on `hard2_0093` did not solve the case.
 Exact propagation eliminated carrier sizes 2 through 5. At size 6 the teacher
 produced a goal-breaking family with 9 hypothesis failures among 36 checked
 assignments, but no countermodel. After 63 unique actions and 12 cumulative
-depth levels, this lane hit its stop condition. The next experiment should add
-a mechanically assisted multiobjective table fitter or a richer family
-language; repeating the same conversational beam is not the next action.
+depth levels, this lane hit its stop condition.
+
+That consumer gap now has a first answer. Equal-fiber skew products found
+countermodels for 27 of 60 hard-false cases lacking a simple invariant
+separator. The non-uniform bundle extension then solved `hard2_0125` with a
+two-element quotient, fiber sizes `[4,2]`, four affine local maps, and six
+patched cells. A controlled live run began with a failed `2x2` skew family;
+`gpt-oss-120b` followed the structured mechanical repairs through `[3,2]` and
+`[4,2]`, and the final ordinary table passed the official judge. Compact
+feedback now preserves `mechanical_status=family_infeasible`, and a bounded
+correction reprompt handles ignored primary repairs. This is a verified
+collaboration result, though `hard2_0125` was already solvable by broad
+mechanical CP-SAT and the first skew action was deliberately seeded.
 
 The structured infinite lane did reach its first attribution milestone. A
 known `ℕ` model was assembled from five typed parts and accepted by the official

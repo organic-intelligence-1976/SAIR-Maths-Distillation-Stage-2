@@ -189,6 +189,25 @@ def score_episode(episode: EpisodeRecord, *, depth: int) -> tuple[float, dict[st
             ):
                 breakdown["lean_repair_diagnostic"] = 50.0
                 break
+    if state.get("kind") == "SkewProductSearchState":
+        if state.get("status") == "family_infeasible":
+            breakdown["skew_family_eliminated"] = 40.0
+        elif state.get("status") == "search_incomplete":
+            breakdown["skew_partial_search"] = 180.0
+        if state.get("last_goal_witness") or state.get("goal_witness"):
+            breakdown["skew_goal_separation"] = 80.0
+    if state.get("kind") == "BundleModelSearchState":
+        if state.get("status") == "family_infeasible":
+            breakdown["bundle_family_eliminated"] = 40.0
+        elif state.get("status") == "search_incomplete":
+            breakdown["bundle_partial_search"] = 180.0
+        parameters = state.get("parameters")
+        if isinstance(parameters, dict):
+            breakdown["bundle_verified_parameters"] = 240.0
+            breakdown["bundle_sparse_patches"] = max(
+                0.0,
+                80.0 - 5.0 * float(parameters.get("patch_count") or 0),
+            )
 
     repair_class = str(state.get("repair_class") or "")
     h_profile = state.get("h_profile") if isinstance(state.get("h_profile"), dict) else {}
@@ -283,10 +302,18 @@ class TeacherStudentSearch:
                 focus = "general"
         if focus == "finite_symbolic":
             directive = (
-                "Return kind=false_model_family only. Do not call fixed-route "
-                "false_model_search or true-side proof tools. Propose a coherent compact "
-                "operation family, then repair its H-violating regions from parent feedback "
-                "while preserving a concrete G failure. Cell conditions use "
+                "Return kind=false_model_family, kind=skew_model_search, or "
+                "kind=bundle_model_search only. Do not "
+                "call fixed-route false_model_search or true-side proof tools. Use "
+                "false_model_family for a coherent compact operation formula and repair "
+                "its H-violating regions while preserving a concrete G failure. Use "
+                "skew_model_search when a small quotient with block-dependent fibers may "
+                "compress a larger table; after family_infeasible feedback, change factor "
+                "sizes or the fiber library rather than resubmitting it. Use "
+                "bundle_model_search with unequal fiber_sizes and a gradually increased "
+                "max_patches when equal fibers are too rigid; the mechanical side "
+                "enumerates quotient laws and fills all affine maps and exceptions. "
+                "Cell conditions use "
                 '{"kind":"cell","i":0,"j":1}; machine feedback includes exact examples '
                 "and hot cells. Respect mechanical_diagnostics.minimum_unexcluded_carrier_size; "
                 "do not repair a carrier already proved unable to contain a countermodel."
@@ -434,15 +461,35 @@ class TeacherStudentSearch:
         width = min(self.config.beam_width, len(ordered))
         if width <= 1:
             return ordered[:width]
-        exploration_slots = min(
-            width - 1,
-            int(round(width * self.config.exploration_fraction)),
-        )
+        exploration_slots = 0
+        if self.config.exploration_fraction > 0:
+            exploration_slots = min(
+                width - 1,
+                max(1, int(round(width * self.config.exploration_fraction))),
+            )
         exploitation_slots = width - exploration_slots
         selected = ordered[:exploitation_slots]
         remainder = ordered[exploitation_slots:]
-        if exploration_slots and remainder:
-            selected.extend(self._rng.sample(remainder, min(exploration_slots, len(remainder))))
+        while exploration_slots and remainder:
+            represented = {
+                str(branch.action.get("kind") or branch.action.get("tool") or "unknown")
+                for branch in selected
+            }
+            diverse = [
+                branch
+                for branch in remainder
+                if str(
+                    branch.action.get("kind")
+                    or branch.action.get("tool")
+                    or "unknown"
+                )
+                not in represented
+            ]
+            pool = diverse or remainder
+            choice = self._rng.choice(pool)
+            selected.append(choice)
+            remainder.remove(choice)
+            exploration_slots -= 1
         return selected
 
     def _replay(
@@ -706,8 +753,22 @@ class TeacherStudentSearch:
                 if is_infinite_model_patch(action) and parent is not None:
                     action = merge_infinite_model_patch(parent.action, action)
                 source = action.get("family") if isinstance(action.get("family"), dict) else action
+                action_kind = str(
+                    action.get("tool")
+                    if action.get("kind") == "tool_call"
+                    else action.get("kind")
+                    or ""
+                )
                 try:
                     proposed_n = int(source.get("carrier_size") or source.get("n") or 0)
+                    if not proposed_n and action_kind == "skew_model_search":
+                        proposed_n = int(source.get("control_size") or 0) * int(
+                            source.get("fiber_size") or 0
+                        )
+                    if not proposed_n and action_kind == "bundle_model_search":
+                        fibers = source.get("fiber_sizes") or source.get("block_sizes") or []
+                        if isinstance(fibers, (list, tuple)):
+                            proposed_n = sum(int(value) for value in fibers)
                 except Exception:
                     proposed_n = 0
                 minimum_n = int(diagnostics.get("minimum_unexcluded_carrier_size") or 0)
@@ -718,6 +779,8 @@ class TeacherStudentSearch:
                     and (
                         action.get("kind") == "false_model_family"
                         or action.get("tool") == "false_model_family"
+                        or action_kind == "skew_model_search"
+                        or action_kind == "bundle_model_search"
                     )
                 ):
                     policy_rejections += 1
