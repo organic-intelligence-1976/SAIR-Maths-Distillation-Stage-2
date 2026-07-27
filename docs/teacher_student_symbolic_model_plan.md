@@ -172,8 +172,8 @@ carrier definition
 
 Each obligation becomes persistent state. Accepted definitions and lemmas
 survive later repair rounds; rejected Lean fragments return exact diagnostics.
-Begin with known closed infinite countermodels before attempting
-`hard2_0027`/E1167 -> E1763.
+The plan now includes pre-model local definitions, so an operation can depend
+on symbolic helpers such as parity, residue classes, or fiber projections.
 
 The existing whole-file artifact remains an expert fast path, but it must no
 longer be the only interface. Research soundness and competition-policy
@@ -183,8 +183,13 @@ Promotion milestone: reconstruct one known infinite countermodel from
 structured parts, repair at least one rejected obligation, and obtain a
 judge-accepted final artifact.
 
-Current status: met for exact-case repair and replay. Held-out transfer and
-operation-family discovery remain open.
+Current status: met for exact-case repair and replay, and for
+`hard2_0027`/E1167 -> E1763 itself. Its modified-parity `Nat` model assembles
+from six structured parts and is accepted under the competition proof policy.
+Live `gpt-oss-120b` selected the infinite structured lane and used indexed
+repair feedback, but did not rediscover the correct operation; the winning
+construction came from published mathematics and is replayed as verified
+memory. Held-out transfer and operation-family discovery remain open.
 
 ## Phase 5: Explicit Recursive Obligations
 

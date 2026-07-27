@@ -359,6 +359,26 @@ historical evidence about the protocol, but not as evidence about the required
 mathematics. Future reports must identify it as a semantic classification
 failure and an infinite-model curriculum case.
 
+### 2.4 2026-07-27 resolution
+
+`hard2_0027` now has an official-judge-accepted infinite certificate. It uses
+a modified parity walk on `Nat`, traced to the dual of the Equational Theories
+Project's `Equation1659_facts`. The readable certificate and structured plan
+are:
+
+- `data/semantics/hard2_0027_modified_parity_model.lean`;
+- `data/semantics/hard2_0027_modified_parity_model_plan.json`.
+
+The packed solver keeps a compressed copy because the submission contract is
+single-file. This is attributed as verified symbolic-memory replay, not as an
+LLM discovery.
+
+The structured contract now has six parts: carrier, pre-model definitions,
+operation, setup lemmas, universal H proof, and concrete not-G proof. It also
+supports indexed component patches and complete active-plan handoff between
+LLM rounds. A separate accepted `Fin 257` probe confirms that formula-defined
+finite models do not require an explicit operation table.
+
 ## 3. Research Clues From the Published Work
 
 The research plan should be grounded in what the Equational Theories Project

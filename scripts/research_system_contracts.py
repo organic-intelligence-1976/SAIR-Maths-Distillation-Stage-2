@@ -543,7 +543,7 @@ def main() -> int:
         and len(infinite_contexts) == 2
         and len(infinite_judges) == 2
         and "judge_rejected_infinite_model" in infinite_contexts[1].get("mechanical_feedback", "")
-        and "10,000-byte artifact" in baby_solver.PROMPT
+        and "20,000-byte false-certificate envelope" in baby_solver.PROMPT
     )
     structured_fixture = json.loads(
         (
@@ -577,11 +577,26 @@ def main() -> int:
     singleton_fixture["imports"] = "Mathlib.Tactic"
     singleton_fixture["setup"] = structured_fixture["setup"][0]
     singleton_code, singleton_state = assemble_infinite_model_plan(singleton_fixture)
+    repairable_envelope = {
+        "kind": "symbolic_model_plan",
+        "representation": "infinite",
+        "carrier": "Nat",
+        "definitions": ["def op (x y : Nat) : Nat := x"],
+        "setup": [
+            "have helper (x : Nat) : op x x = x := by",
+            "  rfl",
+        ],
+        "hypothesis_proof": "intro x y\nrfl",
+        "counterexample_proof": "intro goal_holds\nexact False.elim (by contradiction)",
+    }
+    repaired_envelope, repaired_envelope_state = baby_solver.normalize_symbolic_model_plan(
+        repairable_envelope
+    )
     checks["structured_infinite_model_assembly"] = (
         structured_code is not None
         and structured_state.get("status") == "candidate_ready"
-        and structured_state.get("part_count") == 5
-        and "let magN : Magma ℕ" in structured_code
+        and structured_state.get("part_count") == 6
+        and "let magN : Magma (ℕ)" in structured_code
         and incomplete_code is None
         and set(incomplete_state.get("missing_parts") or [])
         == {"hypothesis_proof", "counterexample_proof"}
@@ -605,6 +620,93 @@ def main() -> int:
             "wrapped_single_import_as_list",
             "wrapped_single_setup_fragment_as_list",
         }
+        and repaired_envelope is not None
+        and repaired_envelope.get("operation") == "op"
+        and repaired_envelope.get("definitions") == [
+            "let op (x y : Nat) : Nat := x"
+        ]
+        and len(repaired_envelope.get("setup") or []) == 1
+        and {
+            row.get("repair")
+            for row in repaired_envelope_state.get("schema_repairs") or []
+        }
+        == {
+            "merged_dangling_tactic_fragment",
+            "inferred_operation_from_local_op_definition",
+        }
+    )
+    parity_fixture = json.loads(
+        (
+            ROOT
+            / "data"
+            / "semantics"
+            / "hard2_0027_modified_parity_model_plan.json"
+        ).read_text(encoding="utf-8")
+    )
+    parity_code, parity_state = assemble_infinite_model_plan(parity_fixture)
+    definition_span = (parity_state.get("line_ranges") or {}).get("definitions", [{}])[0]
+    definition_feedback = baby_solver.symbolic_model_judge_feedback(
+        {
+            "message": (
+                f"Submission.lean:{definition_span.get('start', 1)}:7: "
+                "error: unknown identifier 'paritty'"
+            ),
+        },
+        parity_state,
+    )
+    indexed_patch = merge_infinite_model_patch(
+        parity_fixture,
+        {
+            "kind": "symbolic_model_patch",
+            "set": {"definitions[1]": "let op (x y : Nat) := Nat.succ y"},
+        },
+    )
+    checks["symbolic_pre_model_definitions"] = (
+        parity_code is not None
+        and parity_state.get("status") == "candidate_ready"
+        and (parity_state.get("assembly") or {}).get("definition_count") == 2
+        and "let parity : Nat → Bool" in parity_code
+        and "let op (x y : Nat)" in parity_code
+        and definition_feedback.get("failed_parts") == ["definitions[0]"]
+        and "definitions" not in definition_feedback.get("preserve_parts", [])
+        and "operation" in definition_feedback.get("preserve_parts", [])
+        and indexed_patch.get("definitions", [None, None])[1]
+        == "let op (x y : Nat) := Nat.succ y"
+    )
+    large_finite_code, large_finite_state = assemble_infinite_model_plan({
+        "kind": "symbolic_model_plan",
+        "representation": "symbolic_finite",
+        "model_name": "model",
+        "imports": ["Mathlib.Tactic"],
+        "carrier": "Fin 257",
+        "definitions": [],
+        "operation": "fun x _ => x",
+        "setup": [],
+        "hypothesis_proof": "intro x y\nrfl",
+        "counterexample_proof": (
+            "intro goal_holds\n"
+            "have h := goal_holds (0 : Fin 257) (1 : Fin 257)\n"
+            "change (0 : Fin 257) = 1 at h\n"
+            "exact Fin.zero_ne_one h"
+        ),
+    })
+    checks["large_symbolic_finite_without_table"] = (
+        large_finite_state.get("status") == "candidate_ready"
+        and large_finite_code is not None
+        and "Magma (Fin 257)" in large_finite_code
+        and "counterexample_table" not in large_finite_code
+    )
+    checks["verified_symbolic_artifact_cache"] = (
+        baby_solver.verified_symbolic_model_artifact({
+            "eq1_id": 1167,
+            "eq2_id": 1763,
+        })
+        == (
+            ROOT
+            / "data"
+            / "semantics"
+            / "hard2_0027_modified_parity_model.lean"
+        ).read_text(encoding="utf-8")
     )
 
     signature = canonical_equation_signature("x ◇ y = y ◇ y")

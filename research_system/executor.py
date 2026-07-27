@@ -87,6 +87,23 @@ class MechanicalExecutor:
         diagnostics: dict[str, Any] = {
             "symbolic_invariant_report": baby_solver.symbolic_invariant_report(h_eq, g_eq),
             "finite_countermodel_search_allowed": finite_allowed,
+            "representation_selection": {
+                "selected": (
+                    "bounded_finite_then_symbolic"
+                    if finite_allowed
+                    else "infinite_symbolic"
+                ),
+                "finite_table_status": "allowed" if finite_allowed else "prohibited",
+                "symbolic_type_model_status": "available",
+                "reason": (
+                    "No audited finite-valid restriction."
+                    if finite_allowed
+                    else "Audited finite implication makes every finite carrier futile."
+                ),
+            },
+            "symbolic_model_strategy_cards": baby_solver.symbolic_model_strategy_cards(
+                require_infinite=not finite_allowed,
+            ),
         }
         if not finite_allowed:
             return diagnostics

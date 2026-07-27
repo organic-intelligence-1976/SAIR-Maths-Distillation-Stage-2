@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "case_id": "hard2_0027",
+  "equation_ids": {
+    "hypothesis": 1167,
+    "goal": 1763
+  },
+  "semantic_status": {
+    "general_implication": false,
+    "finite_implication": true,
+    "required_countermodel": "infinite"
+  },
+  "construction": {
+    "family": "modified_parity_walk",
+    "carrier": "Nat",
+    "readable_certificate": "data/semantics/hard2_0027_modified_parity_model.lean",
+    "structured_plan": "data/semantics/hard2_0027_modified_parity_model_plan.json",
+    "readable_certificate_sha256": "c91fb756de111ddefac94033f12bf267cb97cbe68b0cffd331333a714f8d8dd9",
+    "structured_plan_sha256": "3b6e8756b546dec6775e90e0fb8e54b4c1f1af9404592ea67ab3129f6250982d"
+  },
+  "verification": {
+    "structured_artifact_bytes": 7127,
+    "readable_artifact_bytes": 7478,
+    "official_competition_policy_status": "accepted",
+    "compiled_solver_status": "solved",
+    "compiled_solver_verdict": "false",
+    "compiled_solver_seconds": 7.2,
+    "compiled_solver_llm_calls": 0,
+    "compiled_solver_judge_calls": 1
+  },
+  "attribution": {
+    "winning_route": "memory:verified_symbolic_model",
+    "llm_discovery": false,
+    "note": "Published construction plus mechanically verified replay; live gpt-oss-120b probes did not rediscover the winning operation."
+  },
+  "upstream": {
+    "project": "Equational Theories Project",
+    "commit": "7e276a2d05e84e3eef02432abfd0718e78f7abfa",
+    "source_theorem": "Equation1659_facts"
+  }
+}

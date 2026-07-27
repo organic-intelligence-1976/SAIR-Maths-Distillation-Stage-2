@@ -19,6 +19,9 @@ consumption result, and Lean judge outcome.
 - `case_study_structured_infinite_repair.md`: structured infinite-model
   assembly, exact Lean repair feedback, and load-bearing teacher-to-student
   replay.
+- `case_study_hard2_0027_symbolic_countermodel.md`: accepted modified-parity
+  infinite countermodel, representation routing, and honest live LLM
+  discovery/repair attribution.
 - `case_study_recursive_bundle_countermodel.md`: quotient/fiber decomposition,
   sparse symbolic finite-model synthesis, and a live two-step repair ladder
   accepted by the official judge.
@@ -27,6 +30,9 @@ consumption result, and Lean judge outcome.
   six-element countermodel, plus its factor-repair feedback.
 - `teacher_student_structured_models_2026_07_26.json`: machine-readable finite
   teacher-search stop result and structured infinite-model attribution summary.
+- `hard2_0027_symbolic_countermodel_2026_07_27.json`: machine-readable
+  semantic classification, certificate hashes, official verification, and
+  attribution for the modified-parity model.
 - `recursive_bundle_countermodel_2026_07_26.json`: compact machine-readable
   record of the non-uniform bundle case.
 - `native_skew_hard1_0009_2026_07_26.json`: before/after packed-solver

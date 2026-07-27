@@ -321,11 +321,13 @@ class TeacherStudentSearch:
         elif focus == "infinite_model":
             directive = (
                 "Finite countermodels are unavailable for this lane. Prefer a structured "
-                "infinite_model_plan with carrier, operation, setup lemmas, hypothesis_proof, "
-                "and counterexample_proof. After a rejected parent plan, return "
-                "infinite_model_patch changing only the failed parts; preserve accepted parts "
-                "and use exact Lean stderr. A complete kind=infinite_model artifact remains "
-                "an expert fast path."
+                "symbolic_model_plan with representation=infinite, carrier, optional "
+                "pre-model definitions, operation, setup lemmas, hypothesis_proof, and "
+                "counterexample_proof. Use the supplied "
+                "construction-family cards to select a representation. After a rejected "
+                "parent plan, return symbolic_model_patch changing only failed_parts; preserve "
+                "preserve_parts and use exact Lean stderr. A complete kind=infinite_model "
+                "artifact remains an expert fast path."
             )
         else:
             directive = (

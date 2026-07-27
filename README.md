@@ -67,6 +67,9 @@ The most useful orientation documents are:
   equal-fiber family and progressively larger non-uniform bundles.
 - `scripts/structured_infinite_model_probe.py`: assemble and judge a typed
   infinite countermodel plan.
+- `data/semantics/hard2_0027_modified_parity_model_plan.json`: accepted
+  six-part infinite countermodel showing that symbolic false certificates need
+  not be finite tables.
 - `scripts/research_system_contracts.py`: fast contract and regression checks.
 - `scripts/stage1_routing_probe.py`: compare Stage 1 priors and feedback-aware
   scheduling on a frozen balanced residual fixture.
