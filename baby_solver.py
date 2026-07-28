@@ -10019,6 +10019,13 @@ def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, d
     if "tool_name" in out and "tool" not in out:
         out["tool"] = out.pop("tool_name")
         repairs.append(ProtocolIssue("field_alias", "Renamed tool_name to tool", "tool_name").to_dict())
+    if out.get("tool") and not out.get("kind"):
+        out["kind"] = "tool_call"
+        repairs.append(ProtocolIssue(
+            "tool_call_kind_inferred",
+            "Inferred kind=tool_call from the tool field",
+            "kind",
+        ).to_dict())
     if out.get("kind") == "tool":
         out["kind"] = "tool_call"
         repairs.append(ProtocolIssue("kind_alias", "Renamed kind=tool to kind=tool_call", "kind").to_dict())
@@ -10407,7 +10414,85 @@ def compact_tool_signature(data: dict[str, Any]) -> str:
                 }
             },
         }, sort_keys=True, ensure_ascii=False)
+    if data.get("kind") == "tool_call" or data.get("tool"):
+        return json.dumps({
+            key: value for key, value in data.items()
+            if key not in {"why", "reason", "rationale", "explanation"}
+        }, sort_keys=True, ensure_ascii=False)[:1000]
     return json.dumps(data, sort_keys=True, ensure_ascii=False)[:500]
+
+
+def repair_starved_standard_aux_action(
+    data: dict[str, Any],
+    mechanical_feedback: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Focus and renew an auxiliary call when telemetry says time was binding."""
+    raw_tool = str(data.get("tool") or "").strip()
+    tool = TOOL_ALIASES.get(raw_tool, raw_tool)
+    if tool != "standard_aux_superposition":
+        return data, None
+
+    starved: dict[str, float] = {}
+    stack: list[Any] = list(mechanical_feedback)
+    seen: set[int] = set()
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            marker = id(value)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if value.get("kind") == "StandardAuxSuperpositionState":
+                for attempt in value.get("attempts") or []:
+                    if not isinstance(attempt, dict) or attempt.get("status") != "budget_starved":
+                        continue
+                    kind = str(attempt.get("kind") or "")
+                    if kind:
+                        starved[kind] = max(
+                            starved.get(kind, 0.0),
+                            _finite_float(attempt.get("attempt_budget"), 0.0),
+                        )
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    if not starved:
+        return data, None
+
+    requested = standard_aux_order(data)
+    focused = [kind for kind in requested if kind in starved]
+    if not focused:
+        return data, None
+    previous_budget = max(starved[kind] for kind in focused)
+    renewed_budget = min(40.0, max(16.0, previous_budget * 2.0))
+    current_budget = _finite_float(
+        data.get("budget", data.get("time_budget")),
+        0.0,
+    )
+    out = dict(data)
+    out["lemmas"] = focused
+    out.pop("lemma", None)
+    out.pop("time_budget", None)
+    out["budget"] = max(current_budget, renewed_budget)
+    if out == data:
+        return data, None
+    return out, protocol_state(
+        "LLMAdapterState",
+        "budget_repaired",
+        "llm_adapter",
+        tool="standard_aux_superposition",
+        repairs=[ProtocolIssue(
+            "renew_budget_starved_aux",
+            "Focused the call on the implied budget-starved auxiliary and doubled its prior grant.",
+            "budget",
+        ).to_dict()],
+        prior_attempt_budget=previous_budget,
+        normalized_action={
+            "kind": "tool_call",
+            "tool": "standard_aux_superposition",
+            "lemmas": focused,
+            "budget": out["budget"],
+        },
+    )
 
 
 def should_try_collaboration_first(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> bool:
@@ -10434,12 +10519,13 @@ def try_llm_collaboration(
     capability_mask: Any = None,
     allow_infinite_model_artifacts: bool = False,
     hint_budget_cap: float | None = None,
+    failed_signatures: set[str] | None = None,
 ) -> str | None:
     mechanical_feedback: list[dict[str, Any]] = list(initial_feedback or [])
     finite_search_allowed = finite_countermodel_search_allowed(semantic_context)
     if semantic_context and semantic_context.get("semantic_class") != "unclassified":
         mechanical_feedback.insert(0, semantic_status_state(semantic_context))
-    failed_signatures: set[str] = set()
+    failed_signatures = failed_signatures if failed_signatures is not None else set()
     tried_false_routes: set[str] = false_tried_routes_from_states(false_feedback_states(mechanical_feedback, limit=None))
     active_symbolic_plan: dict[str, Any] | None = None
     deadline = time.monotonic() + max(8.0, min(90.0, budget * 0.35))
@@ -10870,6 +10956,12 @@ def try_llm_collaboration(
                 ))
                 failed_signatures.add(compact_tool_signature(data))
                 continue
+        data, aux_budget_state = repair_starved_standard_aux_action(
+            data,
+            mechanical_feedback,
+        )
+        if aux_budget_state is not None:
+            mechanical_feedback.append(aux_budget_state)
         body = None
         candidate_route = "llm:goal_proof"
         candidate_source = "llm_direct_artifact"
@@ -11353,11 +11445,15 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         ))
     deep_failure_feedback = deep_failure_feedback[-6:]
 
-    # Give System 2 a load-bearing late chance. This is where LLM-proposed
-    # midpoints/search routes can complement the bounded native portfolio while
-    # remaining checked by the same mechanical consumers and Lean judge.
+    # Give System 2 a load-bearing late true-side chance. The broad finite
+    # portfolio above has already followed concrete false-route telemetry, so
+    # continuing to force every LLM action back onto the next finite carrier
+    # can starve midpoint recovery indefinitely. False artifacts remain
+    # admissible when the model has a concrete construction, but explicit
+    # midpoint and true-tool actions are now executed rather than rewritten.
     remaining = max(0.0, budget - (time.monotonic() - solve_started))
     late_llm_feedback: list[dict[str, Any]] = []
+    late_failed_signatures: set[str] = set()
     status = try_llm_collaboration(
         h_eq,
         g_eq,
@@ -11365,7 +11461,10 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         max_rounds=2,
         collaboration_goal=(
             "Late collaboration pass after native deterministic tools failed. "
-            "Prefer a real bridge midpoint/lemma_chain or a concrete false_model_hint. "
+            "Broad finite-model routes have already failed in this solve. Prefer "
+            "a real bridge midpoint/lemma_chain or a true-side tool that acts on "
+            "the reported frontier. Use a false artifact only when you can provide "
+            "a concrete construction rather than another routine carrier retry. "
             "A useful midpoint will be proved as H=>M and then consumed as H+M=>G."
         ),
         initial_feedback=[{
@@ -11376,9 +11475,10 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             "native_deep_failed_attempts": deep_failure_feedback,
             "need_hint": "Propose a small midpoint with seed_h_args, or a concrete false_model_hint route not already covered by default search.",
         }],
-        prefer_false="balanced",
+        prefer_false=False,
         feedback_sink=late_llm_feedback,
         semantic_context=semantic_context,
+        failed_signatures=late_failed_signatures,
     )
     if status:
         return status
@@ -11390,9 +11490,11 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         budget,
         max_rounds=3,
         collaboration_goal=(
-            "Fallback collaboration pass after deterministic routes failed. "
-            "Use mechanical feedback to avoid repeats and propose a bridge "
-            "midpoint, lemma_chain, seed_terms, or a concrete false-model route."
+            "True-recovery collaboration pass after deterministic and broad "
+            "finite-model routes failed. Use the preserved mechanical feedback "
+            "to repair prior midpoint/tool actions. Propose a bridge midpoint, "
+            "lemma_chain, seed_terms, or direct proof; return a false artifact "
+            "only when it is concrete and not another routine carrier retry."
         ),
         initial_feedback=[{
             "kind": "initial_direct_graph_state",
@@ -11400,8 +11502,9 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             "search_state": graph_search_state(h_eq, g_eq, status="direct_goal_not_connected"),
             "need_hint": "Use the frontier/closest_pairs to propose a bridge midpoint, or choose a different bounded tool route.",
         }, *false_failure_feedback[-3:], *deep_failure_feedback[-4:], *late_llm_feedback[-6:]],
-        prefer_false=True,
+        prefer_false=False,
         semantic_context=semantic_context,
+        failed_signatures=late_failed_signatures,
     )
     return status or "unsolved"
 

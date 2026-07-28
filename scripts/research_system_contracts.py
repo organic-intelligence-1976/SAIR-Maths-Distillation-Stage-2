@@ -298,6 +298,70 @@ def main() -> int:
     checks["capability_manifest"] = any(
         row.get("capability") == "tool:right_square_chain" for row in manifest["tools"]
     )
+    inferred_tool, inferred_adapter = baby_solver.normalize_llm_action({
+        "tool": "helper_chain_portfolio",
+        "chains": ["generic_right_square_absorption"],
+        "why": "try the closest reusable chain",
+    })
+    checks["tool_call_kind_repair"] = (
+        inferred_tool is not None
+        and inferred_tool.get("kind") == "tool_call"
+        and inferred_adapter.get("status") == "syntax_repaired"
+        and any(
+            repair.get("code") == "tool_call_kind_inferred"
+            for repair in inferred_adapter.get("repairs", [])
+        )
+    )
+    signature_base = {
+        "kind": "tool_call",
+        "tool": "standard_aux_superposition",
+        "lemmas": ["proj_l"],
+        "budget": 10,
+    }
+    checks["tool_call_semantic_duplicate_signature"] = (
+        baby_solver.compact_tool_signature({
+            **signature_base,
+            "why": "first wording",
+        })
+        == baby_solver.compact_tool_signature({
+            **signature_base,
+            "why": "different prose",
+        })
+        and baby_solver.compact_tool_signature(signature_base)
+        != baby_solver.compact_tool_signature({
+            **signature_base,
+            "budget": 20,
+        })
+    )
+    renewed_action, renewed_state = baby_solver.repair_starved_standard_aux_action(
+        {
+            "kind": "tool_call",
+            "tool": "standard_aux_superposition",
+            "lemmas": ["proj_l", "proj_r"],
+            "budget": 10,
+        },
+        [{
+            "kind": "StandardAuxSuperpositionState",
+            "attempts": [
+                {
+                    "kind": "proj_l",
+                    "status": "budget_starved",
+                    "attempt_budget": 10,
+                },
+                {
+                    "kind": "proj_r",
+                    "status": "saturated",
+                    "attempt_budget": 10,
+                },
+            ],
+        }],
+    )
+    checks["starved_aux_budget_repair"] = (
+        renewed_action.get("lemmas") == ["proj_l"]
+        and renewed_action.get("budget") == 20
+        and renewed_state is not None
+        and renewed_state.get("status") == "budget_repaired"
+    )
     family_h = baby_solver.parse_equation("x ◇ y = x")
     family_g = baby_solver.parse_equation("x ◇ y = y")
     family_action, family_adapter = baby_solver.normalize_llm_action({

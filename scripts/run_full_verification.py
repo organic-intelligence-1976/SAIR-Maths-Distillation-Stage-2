@@ -92,7 +92,27 @@ def lean_certificate(problem: dict[str, Any], result: dict[str, Any]) -> str:
     return header + code + "\n"
 
 
+def llm_health(log: Any) -> dict[str, Any]:
+    events = log if isinstance(log, list) else []
+    responses = [
+        event.get("response") or {}
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "llm"
+    ]
+    errors = [
+        str(response.get("error"))
+        for response in responses
+        if response.get("error")
+    ]
+    return {
+        "llm_successful_responses": len(responses) - len(errors),
+        "llm_error_count": len(errors),
+        "llm_error_messages": list(dict.fromkeys(errors))[:3],
+    }
+
+
 def compact_result(result: dict[str, Any]) -> dict[str, Any]:
+    log = result.get("log")
     return {
         "solved": bool(result.get("solved")),
         "verdict": result.get("verdict"),
@@ -100,8 +120,9 @@ def compact_result(result: dict[str, Any]) -> dict[str, Any]:
         "llm_calls": result.get("llm_calls"),
         "judge_calls": result.get("judge_calls"),
         "timed_out": result.get("timed_out"),
-        "log": result.get("log"),
+        "log": log,
         "stderr_tail": result.get("stderr_tail"),
+        **llm_health(log),
     }
 
 
@@ -188,6 +209,9 @@ def run_one(
         "expected_matches": previous["expected_matches"],
         "elapsed_seconds": elapsed,
         "llm_calls": result.get("llm_calls"),
+        "llm_successful_responses": result.get("llm_successful_responses"),
+        "llm_error_count": result.get("llm_error_count"),
+        "llm_error_messages": result.get("llm_error_messages"),
         "judge_calls": result.get("judge_calls"),
         "timed_out": result.get("timed_out"),
         "error": error,
@@ -222,6 +246,9 @@ def summarize(
             ),
             "elapsed_seconds": latest.get("elapsed_seconds"),
             "llm_calls": latest.get("llm_calls"),
+            "llm_successful_responses": latest.get("llm_successful_responses"),
+            "llm_error_count": latest.get("llm_error_count"),
+            "llm_error_messages": latest.get("llm_error_messages"),
             "judge_calls": latest.get("judge_calls"),
             "timed_out": latest.get("timed_out"),
             "error": latest.get("error"),
