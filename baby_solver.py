@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+import heapq
 import json
 import random
 import re
@@ -87,6 +88,7 @@ There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"tool_call","tool":"forward_saturation","target":"goal","seed_terms":["x ◇ y","(x ◇ y) ◇ x"],"budget":3,"why":"try graph proof with extra seed terms"}
 {"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8,"why":"try broad proof-carrying superposition when graph search is stuck"}
 {"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10,"why":"try standard collapse/projection/rowconst lemmas"}
+{"kind":"tool_call","tool":"ordered_completion","target":"goal","lemmas":["proj_l","proj_r","rowconst"],"budget":120,"why":"build and Lean-replay a simplifying proof plan for a hard auxiliary law"}
 {"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"direct opconst bridge when feedback shows an opconst-like derived equation"}
 {"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}
 {"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}
@@ -681,6 +683,18 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": ["aux_superposition", "standard_aux", "collapse_lemmas", "projection_lemmas"],
         "description": "Try standard auxiliary lemmas such as const, projections, and rowconst via proof-carrying superposition.",
     },
+    "ordered_completion": {
+        "domain": "true",
+        "scope": "both",
+        "cost": "expensive",
+        "feedback_quality": "rich",
+        "native_import": "native_completion",
+        "aliases": ["completion", "proof_plan_completion", "ordered_paramodulation"],
+        "description": (
+            "Run simplification-ordered completion toward a proposed or standard "
+            "auxiliary equation, then replay its dependency-local proof plan in Lean."
+        ),
+    },
     "false_model_search": {
         "domain": "false",
         "scope": "whole_goal",
@@ -881,6 +895,7 @@ CAPABILITY_DEPENDENCIES: dict[str, list[str]] = {
     "helper_chain_portfolio": ["primitive:generic_midpoint_prover"],
     "goal_superposition": ["primitive:proof_carrying_superposition"],
     "standard_aux_superposition": ["primitive:proof_carrying_superposition"],
+    "ordered_completion": ["primitive:proof_carrying_superposition"],
     "false_model_search": ["primitive:finite_model_search"],
     "false_model_family": ["primitive:symbolic_family_evaluator", "primitive:finite_model_search"],
     "residue_ray_countermodel": [
@@ -6217,6 +6232,769 @@ def pc_rec_summary(rec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def completion_match(
+    pattern: Term,
+    subject: Term,
+    substitution: dict[str, Term],
+) -> bool:
+    if pattern[0] == "var":
+        previous = substitution.get(pattern[1])
+        if previous is None:
+            substitution[pattern[1]] = subject
+            return True
+        return previous == subject
+    return (
+        subject[0] == "op"
+        and completion_match(pattern[1], subject[1], substitution)
+        and completion_match(pattern[2], subject[2], substitution)
+    )
+
+
+def completion_substitute(term: Term, substitution: dict[str, Term]) -> Term:
+    if term[0] == "var":
+        return substitution.get(term[1], term)
+    return (
+        "op",
+        completion_substitute(term[1], substitution),
+        completion_substitute(term[2], substitution),
+    )
+
+
+def completion_rewrite_once(
+    term: Term,
+    lhs: Term,
+    rhs: Term,
+) -> tuple[Term, bool]:
+    if term[0] == "op":
+        rewritten, changed = completion_rewrite_once(term[1], lhs, rhs)
+        if changed:
+            return ("op", rewritten, term[2]), True
+        rewritten, changed = completion_rewrite_once(term[2], lhs, rhs)
+        if changed:
+            return ("op", term[1], rewritten), True
+    substitution: dict[str, Term] = {}
+    if completion_match(lhs, term, substitution):
+        return completion_substitute(rhs, substitution), True
+    return term, False
+
+
+def completion_orient(lhs: Term, rhs: Term) -> tuple[Term, Term]:
+    """Orient toward the smaller deterministic term ordering."""
+    left_key = (term_size(lhs), term_key(lhs))
+    right_key = (term_size(rhs), term_key(rhs))
+    return (lhs, rhs) if left_key > right_key else (rhs, lhs)
+
+
+def completion_equation(lhs: Term, rhs: Term) -> dict[str, Any]:
+    variables = pc_vars_of(lhs)
+    variables += [var for var in pc_vars_of(rhs) if var not in variables]
+    return {
+        "text": f"{term_to_str(lhs)} = {term_to_str(rhs)}",
+        "variables": variables,
+        "lhs": lhs,
+        "rhs": rhs,
+    }
+
+
+def ordered_completion_discover(
+    h_eq: dict[str, Any],
+    target_eq: dict[str, Any],
+    *,
+    budget: float,
+    max_rules: int = 500,
+    max_size: int = 100,
+) -> tuple[list[dict[str, Any]] | None, list[int], dict[str, Any]]:
+    """Discover a simplifying equational proof plan.
+
+    This is a completion scheduler over the existing proof-carrying
+    paramodulation primitive. It keeps only a compact parent graph here; every
+    edge in the graph is independently reconstructed before Lean sees it.
+    """
+    started = time.monotonic()
+    deadline = started + max(0.1, budget)
+    active: list[dict[str, Any]] = []
+    pending: list[tuple[Any, ...]] = []
+    seen: set[tuple[str, str]] = set()
+    counter = [0]
+    serial = 0
+    generated = 0
+    target_text = f"{term_to_str(target_eq['lhs'])}={term_to_str(target_eq['rhs'])}"
+
+    def normal_form(term: Term) -> tuple[Term, set[int]]:
+        dependencies: set[int] = set()
+        for _step in range(100):
+            changed = False
+            for rule_id, record in enumerate(active):
+                if not record.get("rewritable", True):
+                    continue
+                rewritten, did_rewrite = completion_rewrite_once(
+                    term,
+                    record["lhs"],
+                    record["rhs"],
+                )
+                if did_rewrite:
+                    term = rewritten
+                    dependencies.add(rule_id)
+                    changed = True
+                    break
+            if not changed:
+                break
+        return term, dependencies
+
+    def push(
+        lhs: Term,
+        rhs: Term,
+        depth: int,
+        parents: tuple[int, ...],
+    ) -> None:
+        nonlocal serial, generated
+        lhs, left_dependencies = normal_form(lhs)
+        rhs, right_dependencies = normal_form(rhs)
+        if lhs == rhs:
+            return
+        lhs, rhs = completion_orient(lhs, rhs)
+        canonical = pc_canon(lhs, rhs)
+        signature = (term_key(canonical[0]), term_key(canonical[1]))
+        if signature in seen:
+            return
+        seen.add(signature)
+        all_parents = tuple(dict.fromkeys([
+            *parents,
+            *sorted(left_dependencies | right_dependencies),
+        ]))
+        equation_text = f"{term_to_str(lhs)}={term_to_str(rhs)}"
+        similarity = difflib.SequenceMatcher(
+            None,
+            equation_text,
+            target_text,
+            autojunk=False,
+        ).ratio()
+        serial += 1
+        generated += 1
+        heapq.heappush(
+            pending,
+            (
+                term_size(lhs) + term_size(rhs),
+                depth,
+                -similarity,
+                serial,
+                lhs,
+                rhs,
+                all_parents,
+            ),
+        )
+        if len(pending) > 60_000:
+            del pending[30_000:]
+            heapq.heapify(pending)
+
+    push(h_eq["lhs"], h_eq["rhs"], 0, ())
+    target_dependencies: set[int] = set()
+    stop_reason = "saturated"
+
+    while pending and len(active) < max_rules:
+        if time.monotonic() >= deadline:
+            stop_reason = "time_budget"
+            break
+        _size, depth, _similarity, _serial, lhs, rhs, parents = heapq.heappop(pending)
+        lhs, left_dependencies = normal_form(lhs)
+        rhs, right_dependencies = normal_form(rhs)
+        if lhs == rhs:
+            continue
+        lhs, rhs = completion_orient(lhs, rhs)
+        parent_ids = tuple(dict.fromkeys([
+            *parents,
+            *sorted(left_dependencies | right_dependencies),
+        ]))
+        lhs_vars = set(pc_vars_of(lhs))
+        rhs_vars = set(pc_vars_of(rhs))
+        record = {
+            "lhs": lhs,
+            "rhs": rhs,
+            "binders": pc_vars_of(lhs) + [
+                var for var in pc_vars_of(rhs) if var not in pc_vars_of(lhs)
+            ],
+            "parents": parent_ids,
+            "depth": depth,
+            "rewritable": rhs_vars.issubset(lhs_vars),
+        }
+        record_id = len(active)
+        active.append(record)
+
+        normalized_left, left_target_dependencies = normal_form(target_eq["lhs"])
+        normalized_right, right_target_dependencies = normal_form(target_eq["rhs"])
+        if normalized_left == normalized_right:
+            target_dependencies = left_target_dependencies | right_target_dependencies
+            stop_reason = "target_joined"
+            break
+
+        for other_id in range(len(active)):
+            if time.monotonic() >= deadline:
+                stop_reason = "time_budget"
+                break
+            for first_id, second_id in ((record_id, other_id), (other_id, record_id)):
+                for (
+                    new_lhs,
+                    new_rhs,
+                    _binders,
+                    _args_first,
+                    _args_second,
+                    _proof_info,
+                ) in pc_paramodulants(
+                    active[first_id],
+                    active[second_id],
+                    counter,
+                    max_size,
+                    allow_var_overlap=False,
+                ):
+                    push(
+                        new_lhs,
+                        new_rhs,
+                        max(active[first_id]["depth"], active[second_id]["depth"]) + 1,
+                        (first_id, second_id),
+                    )
+            if stop_reason == "time_budget":
+                break
+        if stop_reason == "time_budget":
+            break
+
+    if len(active) >= max_rules and stop_reason == "saturated":
+        stop_reason = "max_rules"
+    elapsed = time.monotonic() - started
+    state = {
+        "kind": "OrderedCompletionDiscoveryState",
+        "status": "proof_plan_found" if target_dependencies else "stuck",
+        "target": target_eq["text"],
+        "active_rules": len(active),
+        "generated_equations": generated,
+        "pending_equations": len(pending),
+        "target_dependencies": sorted(target_dependencies),
+        "stop_reason": stop_reason,
+        "elapsed_seconds": round(elapsed, 3),
+        "frontier": [
+            {
+                "equation": f"{term_to_str(record['lhs'])} = {term_to_str(record['rhs'])}",
+                "depth": record["depth"],
+                "parent_count": len(record["parents"]),
+            }
+            for record in active[-8:]
+        ],
+        "need_hint": None if target_dependencies else {
+            "kind": "completion_target_not_joined",
+            "target": target_eq["text"],
+            "reason": stop_reason,
+            "next_action": (
+                "Propose a smaller auxiliary equation near the completion frontier, "
+                "or grant this tool a larger bounded budget."
+            ),
+        },
+    }
+    return (active if target_dependencies else None), sorted(target_dependencies), state
+
+
+def completion_dependency_closure(
+    active: list[dict[str, Any]],
+    target_dependencies: list[int],
+) -> list[int]:
+    needed: set[int] = set()
+
+    def visit(rule_id: int) -> None:
+        if rule_id in needed or rule_id < 0 or rule_id >= len(active):
+            return
+        for parent in active[rule_id].get("parents", ()):
+            visit(parent)
+        needed.add(rule_id)
+
+    for dependency in target_dependencies:
+        visit(dependency)
+    return sorted(needed)
+
+
+def completion_focused_replay(
+    target_eq: dict[str, Any],
+    parent_ids: list[int],
+    equations: dict[int, dict[str, Any]],
+    names: dict[int, str],
+    *,
+    rounds: int,
+    time_budget: float,
+) -> tuple[str | None, dict[str, Any]]:
+    parent_ids = [
+        parent for parent in parent_ids
+        if parent in equations and parent in names
+    ]
+    if not parent_ids:
+        return None, {"status": "no_available_parents"}
+    start = [
+        (equations[parent]["lhs"], equations[parent]["rhs"])
+        for parent in parent_ids
+    ]
+    target_signature = pc_canon(target_eq["lhs"], target_eq["rhs"])
+    target_size = term_size(target_eq["lhs"]) + term_size(target_eq["rhs"])
+    target_id, records, metadata = pc_saturate(
+        start,
+        lambda pair: pc_canon(*pair) == target_signature,
+        max_rounds=rounds,
+        max_eqs=25_000,
+        max_size=max(80, target_size * 3),
+        time_budget=time_budget,
+        allow_var_overlap=False,
+    )
+    state = {
+        "status": "proved" if target_id is not None else "stuck",
+        "parent_ids": parent_ids,
+        "parent_names": [names[parent] for parent in parent_ids],
+        "records_generated": len(records),
+        "saturation": metadata,
+    }
+    if target_id is None:
+        return None, state
+    state["derivation_length"] = len(pc_derivation_chain(target_id, records))
+    return pc_render(
+        target_id,
+        records,
+        target_eq["variables"],
+        target_eq["lhs"],
+        target_eq["rhs"],
+        base_names=[names[parent] for parent in parent_ids],
+    ), state
+
+
+def completion_linear_replay(
+    target_eq: dict[str, Any],
+    parent_ids: list[int],
+    equations: dict[int, dict[str, Any]],
+    names: dict[int, str],
+    *,
+    max_depth: int,
+    beam_width: int,
+    time_budget: float,
+) -> tuple[str | None, dict[str, Any]]:
+    parent_ids = [
+        parent for parent in parent_ids
+        if parent in equations and parent in names
+    ]
+    if len(parent_ids) < 2:
+        return None, {
+            "status": "insufficient_available_parents",
+            "parent_ids": parent_ids,
+        }
+
+    records: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str], int] = {}
+    for base_index, parent in enumerate(parent_ids):
+        equation = equations[parent]
+        canonical = pc_canon(equation["lhs"], equation["rhs"])
+        signature = (term_key(canonical[0]), term_key(canonical[1]))
+        seen[signature] = len(records)
+        records.append({
+            "lhs": equation["lhs"],
+            "rhs": equation["rhs"],
+            "binders": equation["variables"],
+            "deriv": None,
+            "base": base_index,
+        })
+
+    target_signature = pc_canon(target_eq["lhs"], target_eq["rhs"])
+    target_text = f"{term_to_str(target_eq['lhs'])}={term_to_str(target_eq['rhs'])}"
+    target_size = term_size(target_eq["lhs"]) + term_size(target_eq["rhs"])
+    max_size = max(80, target_size * 3)
+    frontier = [0]
+    rule_ids = list(range(1, len(parent_ids)))
+    counter = [0]
+    deadline = time.monotonic() + max(0.1, time_budget)
+    depth_rows: list[dict[str, Any]] = []
+
+    for depth in range(1, max_depth + 1):
+        candidates: list[tuple[float, int]] = []
+        for current_id in frontier:
+            if time.monotonic() >= deadline:
+                return None, {
+                    "status": "time_budget",
+                    "parent_ids": parent_ids,
+                    "records_generated": len(records),
+                    "depths": depth_rows,
+                }
+            for rule_id in rule_ids:
+                for left_id, right_id in (
+                    (current_id, rule_id),
+                    (rule_id, current_id),
+                ):
+                    for (
+                        lhs,
+                        rhs,
+                        binders,
+                        args_left,
+                        args_right,
+                        proof_info,
+                    ) in pc_paramodulants(
+                        records[left_id],
+                        records[right_id],
+                        counter,
+                        max_size,
+                        allow_var_overlap=False,
+                    ):
+                        canonical = pc_canon(lhs, rhs)
+                        signature = (term_key(canonical[0]), term_key(canonical[1]))
+                        if signature in seen:
+                            continue
+                        record_id = len(records)
+                        seen[signature] = record_id
+                        records.append({
+                            "lhs": lhs,
+                            "rhs": rhs,
+                            "binders": binders,
+                            "deriv": (
+                                left_id,
+                                right_id,
+                                args_left,
+                                args_right,
+                                proof_info,
+                            ),
+                            "base": None,
+                        })
+                        if canonical == target_signature:
+                            return pc_render(
+                                record_id,
+                                records,
+                                target_eq["variables"],
+                                target_eq["lhs"],
+                                target_eq["rhs"],
+                                base_names=[names[parent] for parent in parent_ids],
+                            ), {
+                                "status": "proved",
+                                "parent_ids": parent_ids,
+                                "parent_names": [names[parent] for parent in parent_ids],
+                                "records_generated": len(records),
+                                "depth": depth,
+                                "derivation_length": len(
+                                    pc_derivation_chain(record_id, records)
+                                ),
+                                "depths": depth_rows,
+                            }
+                        candidate_text = f"{term_to_str(lhs)}={term_to_str(rhs)}"
+                        score = difflib.SequenceMatcher(
+                            None,
+                            candidate_text,
+                            target_text,
+                            autojunk=False,
+                        ).ratio()
+                        candidates.append((score, record_id))
+        candidates.sort(reverse=True)
+        frontier = [record_id for _score, record_id in candidates[:beam_width]]
+        depth_rows.append({
+            "depth": depth,
+            "candidates": len(candidates),
+            "retained": len(frontier),
+            "best_similarity": round(candidates[0][0], 4) if candidates else None,
+        })
+        if not frontier:
+            break
+
+    return None, {
+        "status": "depth_exhausted",
+        "parent_ids": parent_ids,
+        "records_generated": len(records),
+        "depths": depth_rows,
+    }
+
+
+def ordered_completion_replay(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    active: list[dict[str, Any]],
+    target_dependencies: list[int],
+    *,
+    budget: float,
+) -> tuple[str | None, dict[str, Any]]:
+    started = time.monotonic()
+    deadline = started + max(1.0, budget)
+    closure = completion_dependency_closure(active, target_dependencies)
+    equations = {
+        rule_id: completion_equation(record["lhs"], record["rhs"])
+        for rule_id, record in enumerate(active)
+    }
+    # Completion orients H for rewriting. Lean receives the original direction.
+    equations[0] = h_eq
+    names = {0: "h"}
+    declarations: list[str] = []
+    assumptions: list[UniversalEquation] = []
+    attempts: list[dict[str, Any]] = []
+
+    for rule_id in closure:
+        if rule_id == 0:
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            return None, {
+                "kind": "OrderedCompletionReplayState",
+                "status": "budget_exhausted",
+                "dependency_closure": closure,
+                "proved_rules": sorted(names),
+                "attempts": attempts,
+                "need_hint": {
+                    "kind": "completion_replay_budget_exhausted",
+                    "blocked_rule": equations[rule_id]["text"],
+                },
+            }
+        parent_ids = list(active[rule_id].get("parents", ()))
+        proof_body, focused_state = completion_focused_replay(
+            equations[rule_id],
+            parent_ids,
+            equations,
+            names,
+            rounds=4,
+            time_budget=min(4.0, max(0.25, remaining)),
+        )
+        linear_state = None
+        if proof_body is None and len(parent_ids) >= 2:
+            linear_attempts: list[dict[str, Any]] = []
+            for source_index in range(len(parent_ids)):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.5:
+                    break
+                rotated = parent_ids[source_index:] + parent_ids[:source_index]
+                proof_body, one_linear_state = completion_linear_replay(
+                    equations[rule_id],
+                    rotated,
+                    equations,
+                    names,
+                    max_depth=6,
+                    beam_width=60,
+                    time_budget=min(10.0, max(0.25, remaining)),
+                )
+                linear_attempts.append({
+                    "source_parent": rotated[0],
+                    "state": one_linear_state,
+                })
+                if proof_body is not None:
+                    break
+            linear_state = {
+                "status": "proved" if proof_body else "stuck",
+                "attempts": linear_attempts,
+            }
+        broad_state = None
+        if proof_body is None:
+            remaining = deadline - time.monotonic()
+            parent_assumptions = [
+                UniversalEquation(names[parent], equations[parent], [])
+                for parent in parent_ids
+                if parent != 0 and parent in names
+            ]
+            if remaining > 0.5:
+                proof_body, broad_state = prove_with_assumptions_detailed(
+                    h_eq,
+                    equations[rule_id],
+                    parent_assumptions,
+                    superposition_budget=min(6.0, max(0.25, remaining)),
+                )
+        attempts.append({
+            "rule_id": rule_id,
+            "equation": equations[rule_id]["text"],
+            "parent_ids": parent_ids,
+            "status": "proved" if proof_body else "replay_failed",
+            "focused": focused_state,
+            "linear": linear_state,
+            "broad": broad_state,
+        })
+        if proof_body is None:
+            return None, {
+                "kind": "OrderedCompletionReplayState",
+                "status": "replay_failed",
+                "dependency_closure": closure,
+                "proved_rules": sorted(names),
+                "attempts": attempts,
+                "need_hint": {
+                    "kind": "completion_edge_not_replayed",
+                    "blocked_rule": equations[rule_id]["text"],
+                    "parents": [
+                        equations[parent]["text"]
+                        for parent in parent_ids
+                        if parent in equations
+                    ],
+                    "next_action": "Propose this blocked equation as a smaller midpoint or simplify its parent set.",
+                },
+            }
+        name = f"completion_rule_{rule_id}"
+        names[rule_id] = name
+        assumption = UniversalEquation(name, equations[rule_id], [])
+        assumptions.append(assumption)
+        declarations.extend([
+            f"have {name} : {lemma_statement(equations[rule_id])} := by",
+            indent(proof_body, 2),
+        ])
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.5:
+        return None, {
+            "kind": "OrderedCompletionReplayState",
+            "status": "goal_consume_budget_exhausted",
+            "dependency_closure": closure,
+            "proved_rules": sorted(names),
+            "attempts": attempts,
+        }
+    goal_body, goal_state = prove_with_assumptions_detailed(
+        h_eq,
+        g_eq,
+        assumptions,
+        superposition_budget=min(12.0, max(0.5, remaining)),
+    )
+    state = {
+        "kind": "OrderedCompletionReplayState",
+        "status": "body_built" if goal_body else "helper_proved_not_consumed",
+        "dependency_closure": closure,
+        "proved_rules": sorted(names),
+        "replayed_rule_count": len(assumptions),
+        "attempts": attempts,
+        "goal_state": goal_state,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "need_hint": None if goal_body else {
+            "kind": "completion_plan_not_consumed",
+            "proved_equations": [assumption.eq["text"] for assumption in assumptions[-8:]],
+            "next": goal_state.get("need_hint") if isinstance(goal_state, dict) else None,
+        },
+    }
+    if goal_body is None:
+        return None, state
+    return "\n".join([*declarations, goal_body]), state
+
+
+def ordered_completion_targets(
+    h_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    call = call or {}
+    targets: list[tuple[str, dict[str, Any]]] = []
+    for key in ("midpoint", "lemma", "equation", "target_equation"):
+        raw = call.get(key)
+        values = raw if isinstance(raw, list) else [raw]
+        for value in values:
+            if isinstance(value, str) and "=" in value:
+                try:
+                    equation = parse_equation(value)
+                except Exception:
+                    continue
+                targets.append((f"proposed_{len(targets) + 1}", equation))
+
+    explicit_aux = any(key in call for key in ("lemmas", "aux", "kinds", "targets"))
+    kinds = standard_aux_order(call) if explicit_aux else implied_standard_aux_lemmas(h_eq)
+    if not kinds and not targets:
+        kinds = standard_aux_order(None)
+    for kind in kinds:
+        equation = standard_aux_equation(kind)
+        canonical = pc_canon(equation["lhs"], equation["rhs"])
+        if any(pc_canon(item["lhs"], item["rhs"]) == canonical for _label, item in targets):
+            continue
+        targets.append((kind, equation))
+    return targets
+
+
+def ordered_completion_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    call = call or {}
+    total_budget = float(call.get("budget") or call.get("time_budget") or 120.0)
+    deadline = time.monotonic() + max(1.0, total_budget)
+    targets = ordered_completion_targets(h_eq, call)
+    attempts: list[dict[str, Any]] = []
+    unresolved: list[tuple[str, dict[str, Any]]] = []
+
+    for label, target_eq in targets:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            break
+        active, dependencies, discovery = ordered_completion_discover(
+            h_eq,
+            target_eq,
+            budget=min(2.5, max(0.5, remaining)),
+        )
+        attempt = {
+            "target_kind": label,
+            "target": target_eq["text"],
+            "phase": "scout",
+            "discovery": discovery,
+        }
+        attempts.append(attempt)
+        if active is None:
+            unresolved.append((label, target_eq))
+            continue
+        replay_budget = max(1.0, deadline - time.monotonic())
+        body, replay = ordered_completion_replay(
+            h_eq,
+            g_eq,
+            active,
+            dependencies,
+            budget=replay_budget,
+        )
+        attempt["replay"] = replay
+        if body:
+            return body, {
+                "kind": "OrderedCompletionState",
+                "status": "body_built",
+                "winning_target": label,
+                "winning_equation": target_eq["text"],
+                "attempts": attempts,
+            }
+
+    for index, (label, target_eq) in enumerate(unresolved):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            break
+        remaining_targets = max(1, len(unresolved) - index)
+        discovery_budget = min(50.0, max(8.0, remaining / remaining_targets))
+        active, dependencies, discovery = ordered_completion_discover(
+            h_eq,
+            target_eq,
+            budget=min(remaining, discovery_budget),
+        )
+        attempt = {
+            "target_kind": label,
+            "target": target_eq["text"],
+            "phase": "extended",
+            "discovery": discovery,
+        }
+        attempts.append(attempt)
+        if active is None:
+            continue
+        replay_budget = max(1.0, deadline - time.monotonic())
+        body, replay = ordered_completion_replay(
+            h_eq,
+            g_eq,
+            active,
+            dependencies,
+            budget=replay_budget,
+        )
+        attempt["replay"] = replay
+        if body:
+            return body, {
+                "kind": "OrderedCompletionState",
+                "status": "body_built",
+                "winning_target": label,
+                "winning_equation": target_eq["text"],
+                "attempts": attempts,
+            }
+
+    return None, {
+        "kind": "OrderedCompletionState",
+        "status": "stuck",
+        "targets": [
+            {"kind": label, "equation": equation["text"]}
+            for label, equation in targets
+        ],
+        "attempts": attempts,
+        "need_hint": {
+            "kind": "ordered_completion_failed",
+            "reason": "No targeted completion plan was both discovered and replayed into the goal.",
+            "best_frontiers": [
+                attempt["discovery"].get("frontier", [])
+                for attempt in attempts[-3:]
+            ],
+            "next_action": "Propose a custom midpoint equation near one of these completion frontiers.",
+        },
+    }
+
+
 def collapse_witness_vars(t: Term, acc: set[str] | None = None) -> set[str]:
     acc = acc if acc is not None else set()
     if t[0] == "var":
@@ -8794,6 +9572,14 @@ def run_tool_call_detailed(
         body, state = standard_aux_superposition_attempt(h_eq, g_eq, call)
         state = state or {}
         return body, protocolize_state(state, "standard_aux_superposition", status="proved" if body else state.get("status", "stuck"))
+    if tool == "ordered_completion":
+        body, state = ordered_completion_attempt(h_eq, g_eq, call)
+        state = state or {}
+        return body, protocolize_state(
+            state,
+            "ordered_completion",
+            status="proved" if body else state.get("status", "stuck"),
+        )
     if tool in {"lemma_chain", "lemma_hint", "midpoint", "midpoint_chain"}:
         body, state = hint_payload_attempt(call, h_eq, g_eq, capability_mask=capability_mask)
         state = state or {}
@@ -8833,6 +9619,7 @@ def analysis(h_eq: dict[str, Any], g_eq: dict[str, Any]) -> str:
     advice = []
     advice.append("General midpoint engine is available: propose one small equation M or a short chain; each must be proved from H before use.")
     advice.append("Broad true-side consumer available: goal_superposition runs bounded proof-carrying paramodulation and reports a frontier if it gets stuck.")
+    advice.append("Ordered completion is available for hard true goals: it targets a helper equation, simplifies critical pairs, and Lean-replays only the dependency closure.")
     advice.append("Broad grounding certificates available: broad_grounding_derived tries to derive collapse or factor-irrelevance helpers and then close G.")
     advice.append("Standard auxiliary consumer available: standard_aux_superposition tries const/projection/rowconst lemmas as explicit proved helpers.")
     advice.append("Helper-chain portfolio available: helper_chain_portfolio tries a small set of reusable lemma chains through the generic midpoint stitcher and reports proved-but-not-consumed chains.")
@@ -11445,6 +12232,57 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         ))
     deep_failure_feedback = deep_failure_feedback[-6:]
 
+    # Completion is deliberately late: it is broader and more expensive than
+    # the established native portfolio, but it can turn a hard auxiliary law
+    # into a small dependency graph and replay every edge as ordinary Lean.
+    completion_failure_feedback: list[dict[str, Any]] = []
+    remaining = max(0.0, budget - (time.monotonic() - solve_started))
+    if standard_aux_plausible_h(h_eq) and remaining >= 35.0:
+        completion_budget = min(
+            remaining,
+            180.0,
+            max(125.0, remaining * 0.10),
+        )
+        completion_body, completion_state = ordered_completion_attempt(
+            h_eq,
+            g_eq,
+            {"budget": completion_budget},
+        )
+        if completion_body:
+            result = judge_true_attributed(
+                "native:true:ordered_completion",
+                completion_body,
+                source="native_completion",
+                detail={
+                    "family": "ordered_completion",
+                    "winning_target": (
+                        completion_state.get("winning_target")
+                        if isinstance(completion_state, dict)
+                        else None
+                    ),
+                },
+            )
+            if result.get("status") == "accepted":
+                return "accepted_true_ordered_completion"
+            completion_failure_feedback.append(protocol_state(
+                "MechanicalResponse",
+                "judge_rejected_true_body",
+                "ordered_completion",
+                tool_state=completion_state,
+                judge_status=result.get("status"),
+                need_hint=(
+                    "Completion built a proof plan but Lean rejected the final "
+                    "body; inspect the blocked replay edge or propose its equation "
+                    "as a smaller midpoint."
+                ),
+            ))
+        elif isinstance(completion_state, dict):
+            completion_failure_feedback.append(protocolize_state(
+                completion_state,
+                "ordered_completion",
+                status=completion_state.get("status", "stuck"),
+            ))
+
     # Give System 2 a load-bearing late true-side chance. The broad finite
     # portfolio above has already followed concrete false-route telemetry, so
     # continuing to force every LLM action back onto the next finite carrier
@@ -11473,6 +12311,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             "search_state": graph_search_state(h_eq, g_eq, status="native_deep_goal_not_connected"),
             "native_false_failed_attempts": false_failure_feedback[-3:],
             "native_deep_failed_attempts": deep_failure_feedback,
+            "completion_failed_attempts": completion_failure_feedback,
             "need_hint": "Propose a small midpoint with seed_h_args, or a concrete false_model_hint route not already covered by default search.",
         }],
         prefer_false=False,
@@ -11501,7 +12340,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             "status": "direct_mechanical_routes_exhausted",
             "search_state": graph_search_state(h_eq, g_eq, status="direct_goal_not_connected"),
             "need_hint": "Use the frontier/closest_pairs to propose a bridge midpoint, or choose a different bounded tool route.",
-        }, *false_failure_feedback[-3:], *deep_failure_feedback[-4:], *late_llm_feedback[-6:]],
+        }, *false_failure_feedback[-3:], *deep_failure_feedback[-4:], *completion_failure_feedback[-2:], *late_llm_feedback[-6:]],
         prefer_false=False,
         semantic_context=semantic_context,
         failed_signatures=late_failed_signatures,

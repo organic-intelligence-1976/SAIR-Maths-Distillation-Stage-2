@@ -15,7 +15,12 @@ Recent examples:
   that midpoint toward a common reduct.
 - `hard3_0266` and `hard3_0314`: projection-style midpoint cases. `hard3_0266`
   now solves after a tightly bounded variable-overlap superposition pass derives
-  right projection; `hard3_0314` still needs a richer projection proof search.
+  right projection. An untrusted E-trace teacher experiment first reconstructed
+  a 19-helper proof for `hard3_0314`; the resulting general idea is now a native
+  simplification-ordered completion route. It discovers a parent-local plan,
+  independently replays every dependency with proof-carrying mechanics, and
+  submits the stitched body to Lean. A fresh 1,669-problem audit solved and
+  retained certificates for the full published corpus.
 
 ## Priority 1: Repeated Midpoint Stitching
 
