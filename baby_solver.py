@@ -5337,6 +5337,11 @@ def short_text(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def compact_judge_diagnostic(result: dict[str, Any], limit: int = 800) -> str:
+    raw = str(result.get("stderr") or result.get("message") or "").strip()
+    return raw if len(raw) <= limit else "..." + raw[-limit + 3 :]
+
+
 def right_context_contraction_actions(h_eq: dict[str, Any], target_eq: dict[str, Any]) -> list[dict[str, Any]]:
     """Suggest reusable helper lemmas for goals differing under one left context."""
     actions: list[dict[str, Any]] = []
@@ -10104,13 +10109,86 @@ def run_tool_call_detailed(
     if tool == "deep_saturation":
         bodies = list(native_saturation_bodies(h_eq, g_eq))
         body = bodies[-1][1] if bodies else None
+        route = bodies[-1][0] if bodies else None
+        if verify_candidates and body and route:
+            result = judge_true_attributed(
+                f"llm:tool:deep_saturation:{route}",
+                body,
+                source="llm_tool_call",
+            )
+            judge_attempt = {
+                "route": route,
+                "status": result.get("status"),
+                "diagnostic": compact_judge_diagnostic(result, 500),
+            }
+            if result.get("status") == "accepted":
+                return body, protocol_state(
+                    "MechanicalResponse",
+                    "proved",
+                    "deep_saturation",
+                    tool=tool,
+                    accepted_route=route,
+                    judge_attempts=[judge_attempt],
+                    already_judged_accepted=True,
+                )
+
+            # A broad body is only a failed attempt, not a proof. Consume one
+            # structured SearchState continuation before spending another LLM
+            # round; the continuation remains untrusted and judge-checked.
+            search_state = graph_search_state(
+                h_eq,
+                g_eq,
+                status="deep_saturation_rejected",
+            )
+            suggested = search_state.get("suggested_next_actions") or []
+            continuation = suggested[0] if suggested else None
+            if isinstance(continuation, dict) and is_hint_payload(continuation):
+                continuation_body, _ = hint_payload_attempt(
+                    continuation,
+                    h_eq,
+                    g_eq,
+                    capability_mask=capability_mask,
+                )
+                if continuation_body:
+                    continuation_result = judge_true_attributed(
+                        "llm:tool:deep_saturation:structured_continuation",
+                        continuation_body,
+                        source="mechanical_feedback_continuation",
+                    )
+                    if continuation_result.get("status") == "accepted":
+                        return continuation_body, protocol_state(
+                            "MechanicalResponse",
+                            "proved",
+                            "deep_saturation",
+                            tool=tool,
+                            judge_attempts=[judge_attempt],
+                            accepted_route="structured_continuation",
+                            already_judged_accepted=True,
+                        )
+                    search_state["continuation_status"] = continuation_result.get("status")
+            return None, protocol_state(
+                "MechanicalResponse",
+                "stuck",
+                "deep_saturation",
+                tool=tool,
+                selected_route=route,
+                judge_attempts=[judge_attempt],
+                search_state=search_state,
+                recommended_next_call=continuation,
+                need_hint="Saturation was rejected; repair from the continuation or closest_pairs.",
+            )
         return body, protocol_state(
             "MechanicalResponse",
-            "proved" if body else "not_applicable",
+            "candidate_generated" if body else "not_applicable",
             "deep_saturation",
             tool=tool,
             candidate_count=len(bodies),
-            need_hint=None if body else "No bounded saturation body was generated; try goal_superposition or a midpoint.",
+            selected_route=route,
+            need_hint=(
+                "Generated but not judge-verified."
+                if body else
+                "No bounded saturation body was generated; try goal_superposition or a midpoint."
+            ),
         )
     if tool == "proof_battery":
         max_layers = int(call.get("max_graph_candidates") or call.get("graph_candidates") or 3)
@@ -12470,7 +12548,7 @@ def try_llm_collaboration(
                 "MechanicalResponse",
                 "judge_rejected_true_body",
                 "lean_judge",
-                errors=[ProtocolIssue("judge_rejected", short_text(result.get("stderr") or result.get("message") or "", 800)).to_dict()],
+                errors=[ProtocolIssue("judge_rejected", compact_judge_diagnostic(result, 800)).to_dict()],
                 judge_status=result.get("status"),
                 need_hint="Repair the proof body or propose a smaller midpoint/lemma chain that the mechanical prover can stitch.",
             ))
