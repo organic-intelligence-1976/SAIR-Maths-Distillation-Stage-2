@@ -15,7 +15,7 @@ from typing import Any
 import baby_solver
 
 
-COMPILER_VERSION = "submission-compiler-v1"
+COMPILER_VERSION = "submission-compiler-v2"
 
 
 @dataclass(frozen=True)
@@ -88,6 +88,68 @@ class SubmissionCompiler:
             spans.add(((value.lineno, value.col_offset), (value.end_lineno, value.end_col_offset)))
         return spans
 
+    @staticmethod
+    def _compact_token_pairs(
+        source: str,
+        docstring_spans: set[tuple[tuple[int, int], tuple[int, int]]],
+    ) -> list[tuple[int, str]]:
+        """Return version-stable token pairs while preserving f-strings exactly.
+
+        Python 3.12+ exposes the internals of f-strings as separate tokenizer
+        tokens. Passing those token pairs through ``untokenize`` can insert
+        spaces that Python 3.11 rejects, for example ``{value !r }``. Collapse
+        each complete f-string back to one string token before compaction so
+        builds are identical on the development and competition interpreters.
+        """
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+        source_lines = source.splitlines(keepends=True)
+        line_offsets = [0]
+        for line in source_lines:
+            line_offsets.append(line_offsets[-1] + len(line))
+
+        def source_slice(start: tuple[int, int], end: tuple[int, int]) -> str:
+            start_offset = line_offsets[start[0] - 1] + start[1]
+            end_offset = line_offsets[end[0] - 1] + end[1]
+            return source[start_offset:end_offset]
+
+        fstring_start = getattr(tokenize, "FSTRING_START", None)
+        fstring_end = getattr(tokenize, "FSTRING_END", None)
+        compact: list[tuple[int, str]] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if fstring_start is not None and token.type == fstring_start:
+                depth = 0
+                end_index = index
+                while end_index < len(tokens):
+                    candidate = tokens[end_index]
+                    if candidate.type == fstring_start:
+                        depth += 1
+                    elif candidate.type == fstring_end:
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    end_index += 1
+                if depth != 0:
+                    raise ValueError(f"unterminated f-string at line {token.start[0]}")
+                compact.append((
+                    tokenize.STRING,
+                    source_slice(token.start, tokens[end_index].end),
+                ))
+                index = end_index + 1
+                continue
+            if (
+                token.type != tokenize.COMMENT
+                and not (token.type == tokenize.NL and not token.line.strip())
+                and not (
+                    token.type == tokenize.STRING
+                    and (token.start, token.end) in docstring_spans
+                )
+            ):
+                compact.append((token.type, token.string))
+            index += 1
+        return compact
+
     def compile(self, spec: CompilationSpec) -> dict[str, Any]:
         source_bytes = spec.source.read_bytes()
         source_text = source_bytes.decode("utf-8")
@@ -109,13 +171,7 @@ class SubmissionCompiler:
         shebang = lines[0] if lines and lines[0].startswith("#!") else ""
         token_source = "".join(lines[1:]) if shebang else source_text
         docstring_spans = self._docstring_spans(token_source)
-        compact_tokens = [
-            (token.type, token.string)
-            for token in tokenize.generate_tokens(io.StringIO(token_source).readline)
-            if token.type != tokenize.COMMENT
-            and not (token.type == tokenize.NL and not token.line.strip())
-            and not (token.type == tokenize.STRING and (token.start, token.end) in docstring_spans)
-        ]
+        compact_tokens = self._compact_token_pairs(token_source, docstring_spans)
         compiled_source = tokenize.untokenize(compact_tokens)
         compiled_source = "".join(
             line.rstrip(" \t\r\n") + ("\n" if line.endswith(("\n", "\r")) else "")
