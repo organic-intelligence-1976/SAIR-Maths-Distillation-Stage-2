@@ -785,6 +785,34 @@ def main() -> int:
             "inferred_operation_from_local_op_definition",
         }
     )
+    zmod_plan, zmod_plan_state = baby_solver.normalize_symbolic_model_plan({
+        "kind": "symbolic_model_plan",
+        "representation": "symbolic_finite",
+        "imports": ["Mathlib.Data.ZMod.Basic"],
+        "carrier": "ZMod 5",
+        "definitions": [],
+        "operation": "fun x y => x + y",
+        "setup": [],
+        "hypothesis_proof": "intro x y\nrfl",
+        "counterexample_proof": "intro goal_holds\ncontradiction",
+    })
+    zmod_artifact, zmod_artifact_state = baby_solver.validate_infinite_model_payload({
+        "kind": "infinite_model",
+        "code": (
+            "import JudgeProblem\nimport Mathlib.Data.ZMod.Basic\n"
+            "def submission : Goal := by\n  let G := ZMod 5\n  contradiction\n"
+        ),
+    })
+    checks["symbolic_model_respects_proof_policy"] = (
+        zmod_plan is None
+        and zmod_plan_state.get("status") == "invalid_plan"
+        and zmod_artifact is None
+        and any(
+            error.get("code") == "disallowed_zmod_dependency"
+            for error in zmod_artifact_state.get("errors") or []
+        )
+        and "ZMod n" not in baby_solver.PROMPT
+    )
     parity_fixture = json.loads(
         (
             ROOT

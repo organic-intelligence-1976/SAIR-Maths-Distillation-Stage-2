@@ -106,6 +106,8 @@ If phase_directive or allowed_action_override narrows the response kinds,
 that narrower contract overrides the generic examples above.
 Do not write Lean unless you return kind=goal_proof, kind=infinite_model,
 kind=symbolic_model_plan, or kind=symbolic_model_patch.
+Lean policy: do not use ZMod/ZMod.*. Keep custom helper declarations local
+inside def submission or under the submission.* namespace.
 Prefer tool_call, midpoint, midpoint_chain, lemma_hint, lemma_chain,
 false_model_family, symbolic_model_plan, symbolic_model_patch, or false_table.
 """
@@ -10684,7 +10686,7 @@ def symbolic_model_strategy_cards(*, require_infinite: bool) -> list[dict[str, A
         {
             "family": "affine_or_linear",
             "representations": ["symbolic_finite", "infinite"],
-            "shape": "Use ZMod n, integers, vectors, or modules with an affine operation.",
+            "shape": "Use Fin n with an explicit operation, integers, vectors, or products with an affine operation.",
             "repair_signal": "Translate H and not-G into coefficient constraints before writing Lean.",
         },
         {
@@ -10740,6 +10742,10 @@ def _symbolic_fragment(
         return None, (
             f"{field_name} contains disallowed placeholder/declaration: "
             f"{match.group(0)}"
+        )
+    if re.search(r"\bZMod\b", text):
+        return None, (
+            f"{field_name} uses ZMod, which is outside the official declaration allowlist"
         )
     return text, None
 
@@ -10897,6 +10903,11 @@ def normalize_symbolic_model_plan(
         name = str(item).strip()
         if not _SYMBOLIC_MODEL_IMPORT_RE.fullmatch(name):
             errors.append({"field": "imports", "message": f"invalid import name: {name}"})
+        elif re.search(r"(?:^|\.)ZMod(?:\.|$)", name):
+            errors.append({
+                "field": "imports",
+                "message": "ZMod imports are outside the official declaration allowlist",
+            })
         elif name != "JudgeProblem" and name not in normalized_imports:
             normalized_imports.append(name)
     plan["imports"] = normalized_imports
@@ -11217,6 +11228,12 @@ def validate_infinite_model_payload(data: dict[str, Any]) -> tuple[str | None, d
         errors.append(ProtocolIssue(
             "missing_submission_definition",
             "Lean code must define `submission : Goal` for the judge-controlled false goal.",
+            "code",
+        ).to_dict())
+    elif re.search(r"\bZMod\b", code):
+        errors.append(ProtocolIssue(
+            "disallowed_zmod_dependency",
+            "The official proof policy rejects ZMod/ZMod.* declarations; use Fin, Nat, Int, products, or a submission-defined carrier.",
             "code",
         ).to_dict())
     elif len(code.encode("utf-8")) > 20_000:
@@ -11711,7 +11728,7 @@ def llm_context(
                 "representation": "infinite" if require_infinite else "symbolic_finite",
                 "model_name": "model",
                 "imports": ["Mathlib.Tactic"],
-                "carrier": "Lean carrier type, such as ℕ, ℤ, ZMod n, or a product",
+                "carrier": "Lean carrier type, such as ℕ, ℤ, Fin n, a product, or a submission-defined inductive type",
                 "definitions": [
                     "local definitions needed before the Magma value, such as parity and op"
                 ],
@@ -11720,6 +11737,10 @@ def llm_context(
                 "hypothesis_proof": "tactic body proving H universally",
                 "counterexample_proof": "tactic body exhibiting a concrete failure of G",
             },
+            "proof_policy": (
+                "Do not use ZMod or ZMod.* declarations. Keep helper definitions and "
+                "lemmas local inside def submission, or name them under submission.*."
+            ),
             "repair_action": {
                 "kind": "symbolic_model_patch",
                 "set": {"failed_part_name": "complete replacement fragment"},
