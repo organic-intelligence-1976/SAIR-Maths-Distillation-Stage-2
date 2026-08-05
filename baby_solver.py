@@ -9711,6 +9711,10 @@ def proof_candidates_with_sources(h_eq: dict[str, Any], g_eq: dict[str, Any]):
         body = h_graph_body(h_eq, g_eq, cfg[0], congruence_cap=cfg[1])
         if body:
             yield f"h_graph_limit_{cfg[0]}_cong_{cfg[1]}", body
+    for i, action in enumerate(right_context_contraction_actions(h_eq, g_eq), 1):
+        body, _ = hint_payload_attempt(action, h_eq, g_eq)
+        if body:
+            yield f"structured_continuation_{i}", body
     yield from native_saturation_bodies(h_eq, g_eq)
     yield from old_haves_grind_bodies(h_eq, g_eq)
 
@@ -10172,9 +10176,6 @@ def run_tool_call_detailed(
             "MechanicalResponse",
             "candidate_generated" if body else "not_applicable",
             "deep_saturation",
-            tool=tool,
-            candidate_count=len(bodies),
-            selected_route=route,
             need_hint=(
                 "Generated but not judge-verified."
                 if body else

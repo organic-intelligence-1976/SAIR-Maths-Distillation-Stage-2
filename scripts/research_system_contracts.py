@@ -200,6 +200,18 @@ def main() -> int:
         and unverified_deep_state is not None
         and unverified_deep_state.get("status") == "candidate_generated"
     )
+    hard3_0202_candidates = baby_solver.proof_candidates_with_sources(
+        hard3_0202_h,
+        hard3_0202_g,
+    )
+    first_structured_route = next(
+        route for route, _body in hard3_0202_candidates
+        if route.startswith("structured_continuation_")
+        or route.startswith("deep_saturation:")
+    )
+    checks["whole_solver_prefers_structured_continuation"] = (
+        first_structured_route.startswith("structured_continuation_")
+    )
     aux_h = baby_solver.parse_equation("x = (x ◇ y) ◇ ((z ◇ y) ◇ y)")
     aux_g = baby_solver.parse_equation("x = (x ◇ y) ◇ (z ◇ (z ◇ w))")
     rowconst = baby_solver.UniversalEquation(
