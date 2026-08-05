@@ -10111,35 +10111,7 @@ def run_tool_call_detailed(
         body = bodies[-1][1] if bodies else None
         route = bodies[-1][0] if bodies else None
         if verify_candidates and body and route:
-            result = judge_true_attributed(
-                f"llm:tool:deep_saturation:{route}",
-                body,
-                source="llm_tool_call",
-            )
-            judge_attempt = {
-                "route": route,
-                "status": result.get("status"),
-                "diagnostic": compact_judge_diagnostic(result, 500),
-            }
-            if result.get("status") == "accepted":
-                return body, protocol_state(
-                    "MechanicalResponse",
-                    "proved",
-                    "deep_saturation",
-                    tool=tool,
-                    accepted_route=route,
-                    judge_attempts=[judge_attempt],
-                    already_judged_accepted=True,
-                )
-
-            # A broad body is only a failed attempt, not a proof. Consume one
-            # structured SearchState continuation before spending another LLM
-            # round; the continuation remains untrusted and judge-checked.
-            search_state = graph_search_state(
-                h_eq,
-                g_eq,
-                status="deep_saturation_rejected",
-            )
+            search_state = graph_search_state(h_eq, g_eq, status="deep_saturation_pending")
             suggested = search_state.get("suggested_next_actions") or []
             continuation = suggested[0] if suggested else None
             if isinstance(continuation, dict) and is_hint_payload(continuation):
@@ -10161,11 +10133,30 @@ def run_tool_call_detailed(
                             "proved",
                             "deep_saturation",
                             tool=tool,
-                            judge_attempts=[judge_attempt],
                             accepted_route="structured_continuation",
                             already_judged_accepted=True,
                         )
                     search_state["continuation_status"] = continuation_result.get("status")
+            result = judge_true_attributed(
+                f"llm:tool:deep_saturation:{route}",
+                body,
+                source="llm_tool_call",
+            )
+            judge_attempt = {
+                "route": route,
+                "status": result.get("status"),
+                "diagnostic": compact_judge_diagnostic(result, 500),
+            }
+            if result.get("status") == "accepted":
+                return body, protocol_state(
+                    "MechanicalResponse",
+                    "proved",
+                    "deep_saturation",
+                    tool=tool,
+                    accepted_route=route,
+                    judge_attempts=[judge_attempt],
+                    already_judged_accepted=True,
+                )
             return None, protocol_state(
                 "MechanicalResponse",
                 "stuck",
