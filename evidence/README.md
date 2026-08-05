@@ -15,6 +15,9 @@ consumption result, and Lean judge outcome.
   summary. It records 8 true and 3 false accepted cases whose winning route was
   attributed to an LLM-selected hint or tool call.
 - `case_study_hard3_0231_true.md`: end-to-end true-side helper-chain case.
+- `case_study_hard3_0202_repair.md`: real false-route/over-strong-lemma
+  failure trajectory repaired into a contraction midpoint, plus a reproducible
+  normalization probe that accepts a specialized version of the same idea.
 - `case_study_hard1_0009_false.md`: end-to-end false-side route-selection case.
 - `case_study_structured_infinite_repair.md`: structured infinite-model
   assembly, exact Lean repair feedback, and load-bearing teacher-to-student

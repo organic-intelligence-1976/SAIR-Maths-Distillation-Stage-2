@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "problem_id": "hard3_0202",
+  "verdict": "true",
+  "equation1": "x = (x ◇ (y ◇ z)) ◇ (y ◇ w)",
+  "equation2": "x ◇ y = x ◇ ((y ◇ z) ◇ x)",
+  "historical_live_trajectory": {
+    "model": "gpt-oss-120b via an OpenAI-compatible chat API",
+    "llm_calls": [
+      {
+        "round": 1,
+        "action": "false_model_search",
+        "result": "no_countermodel_found"
+      },
+      {
+        "round": 2,
+        "action": "standard_aux_superposition",
+        "candidate": "a ◇ b = a ◇ c",
+        "result": "budget_starved"
+      },
+      {
+        "round": 3,
+        "action": "midpoint",
+        "candidate": "a ◇ ((b ◇ c) ◇ d) = a ◇ b",
+        "result": "proved_and_helpful"
+      }
+    ],
+    "mechanical_repair_signal": {
+      "generated_equations": 368,
+      "stop_reason": "time_budget",
+      "closest_equation_family": "a ◇ ((b ◇ c) ◇ d) = a ◇ b"
+    },
+    "accepted": true,
+    "llm_calls_total": 3,
+    "judge_calls_total": 12,
+    "elapsed_seconds": 318.214
+  },
+  "candidate_normalization_probe": {
+    "provider_candidate": "x ◇ y = x ◇ ((y ◇ z) ◇ x)",
+    "provider_candidate_status": "invalid_goal_repetition",
+    "generated_candidate": "x ◇ y = x ◇ ((y ◇ z) ◇ a)",
+    "variant_kind": "fresh_variable_generalization",
+    "generated_candidate_status": "proved_and_helpful",
+    "mechanical_seconds": 2.698,
+    "accepted": true
+  },
+  "mechanical_consumption": {
+    "untrusted_candidates": true,
+    "both_legs_checked": true,
+    "lean_certificate": "evidence/lean/hard3_0202_submission.lean"
+  },
+  "judge": {
+    "status": "accepted",
+    "accepted": true,
+    "axioms": []
+  },
+  "attribution": {
+    "historical_winning_category": "llm_load_bearing",
+    "historical_winning_route": "llm:midpoint",
+    "new_capability": "provider_specialization_tolerance"
+  }
+}

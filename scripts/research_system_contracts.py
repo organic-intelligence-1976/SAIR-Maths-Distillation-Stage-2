@@ -937,6 +937,169 @@ def main() -> int:
         and filtered["lemmas"][0]["name"] == "fresh"
     )
 
+    bundle_action, bundle_state = baby_solver.normalize_llm_action({
+        "kind": "candidate_bundle",
+        "candidates": [
+            {"lemma": "x ◇ y = x ◇ ((y ◇ z) ◇ x)"},
+            {"lemma": "a ◇ b = a ◇ ((b ◇ c) ◇ d)"},
+        ],
+    })
+    checks["packed_ranked_candidate_bundle"] = (
+        bundle_action is not None
+        and bundle_action.get("kind") == "midpoint_chain"
+        and len(bundle_action.get("lemmas") or []) == 2
+        and bundle_state is not None
+        and bundle_state.get("status") == "syntax_repaired"
+    )
+    h0202 = baby_solver.parse_equation(
+        "x = (x ◇ (y ◇ z)) ◇ (y ◇ w)"
+    )
+    g0202 = baby_solver.parse_equation(
+        "x ◇ y = x ◇ ((y ◇ z) ◇ x)"
+    )
+    specialized_goal = baby_solver.parse_universal_equations({
+        "kind": "midpoint",
+        "lemma": g0202["text"],
+    })
+    generalized_variants = baby_solver.expand_hint_variants(
+        specialized_goal,
+        g0202,
+    )
+    winning_0202_signature = baby_solver.canonical_hint_signature(
+        "a ◇ ((b ◇ c) ◇ d) = a ◇ b"
+    )
+    checks["packed_goal_generalization_lattice"] = any(
+        baby_solver.canonical_hint_signature(hint.eq) == winning_0202_signature
+        and hint.variant_kind == "fresh_variable_generalization"
+        for hint in generalized_variants
+    )
+    packed_board = baby_solver.CandidateBlackboard()
+    first_action, first_state = packed_board.materialize_action(
+        {"kind": "midpoint", "lemma": "a ◇ b = a ◇ c"},
+        g0202,
+        round_index=1,
+    )
+    assert first_action is not None
+    rowconst_equation = first_action["lemmas"][0]["equation"]
+    first_update = packed_board.absorb_attempt({
+        "candidate_statuses": [{
+            "name": "rowconst",
+            "equation": rowconst_equation,
+            "status": "proved_but_not_connected",
+            "leg_1": {"status": "proved"},
+            "leg_2": {"status": "stuck"},
+            "need_hint": "bridge from the retained row-constant fact",
+        }],
+    }, round_index=1)
+    second_action, second_state = packed_board.materialize_action(
+        {
+            "kind": "midpoint",
+            "lemma": "a ◇ ((b ◇ c) ◇ d) = a ◇ b",
+        },
+        g0202,
+        round_index=2,
+    )
+    assert second_action is not None
+    checks["packed_cross_round_candidate_persistence"] = (
+        first_state.get("status") == "materialized"
+        and first_update.get("proved_fact_count") == 1
+        and second_state.get("retained_proved_count") == 1
+        and baby_solver.canonical_hint_signature(second_action["lemmas"][0]["equation"])
+        == baby_solver.canonical_hint_signature(rowconst_equation)
+    )
+    packed_board.absorb_attempt({
+        "candidate_statuses": [
+            {
+                "name": "budget_limited",
+                "equation": "a ◇ (b ◇ c) = a",
+                "status": "unproved_with_budget",
+                "leg_1": {"status": "unproved_with_budget"},
+                "leg_2": {"status": "stuck"},
+            },
+            {
+                "name": "refuted",
+                "equation": "a ◇ b = b",
+                "status": "counterexample_found",
+                "leg_1": {"status": "counterexample_found", "carrier_size": 2},
+                "leg_2": {"status": "not_attempted"},
+            },
+        ],
+    }, round_index=2)
+    packed_statuses = {
+        row["equation"]: row["status"]
+        for row in packed_board.snapshot()["candidates"]
+    }
+    checks["packed_failed_leg_status_distinction"] = (
+        "unproved_with_budget" in packed_statuses.values()
+        and "counterexample_found" in packed_statuses.values()
+    )
+    original_call_llm = baby_solver.call_llm
+    original_hint_attempt = baby_solver.hint_payload_attempt
+    original_judge_true = baby_solver.judge_true_attributed
+    integrated_actions = []
+    scripted_responses = iter([
+        {"kind": "midpoint", "lemma": "a ◇ b = a ◇ c"},
+        {
+            "kind": "midpoint",
+            "lemma": "a ◇ ((b ◇ c) ◇ d) = a ◇ b",
+        },
+    ])
+
+    def fake_call_llm(_context):
+        return {"response": json.dumps(next(scripted_responses))}
+
+    def fake_hint_attempt(payload, _h, _g, **_kwargs):
+        integrated_actions.append(payload)
+        equations = baby_solver.parse_universal_equations(payload)
+        if len(integrated_actions) == 1:
+            first = equations[0]
+            return None, {
+                "kind": "midpoint_chain_attempt",
+                "status": "proved_midpoints_not_consumed",
+                "proved_lemmas": [{"name": first.name, "equation": first.eq["text"]}],
+                "candidate_statuses": [{
+                    "name": first.name,
+                    "equation": first.eq["text"],
+                    "status": "proved_but_not_connected",
+                    "leg_1": {"status": "proved"},
+                    "leg_2": {"status": "stuck"},
+                    "need_hint": "add a contraction bridge",
+                }],
+            }
+        return "intro x y z\nrfl", {
+            "kind": "midpoint_chain_attempt",
+            "status": "body_built",
+            "candidate_statuses": [],
+        }
+
+    try:
+        baby_solver.call_llm = fake_call_llm
+        baby_solver.hint_payload_attempt = fake_hint_attempt
+        baby_solver.judge_true_attributed = lambda *_args, **_kwargs: {"status": "accepted"}
+        integrated_board = baby_solver.CandidateBlackboard()
+        integrated_status = baby_solver.try_llm_collaboration(
+            h0202,
+            g0202,
+            20,
+            max_rounds=2,
+            collaboration_goal="contract",
+            candidate_blackboard=integrated_board,
+        )
+    finally:
+        baby_solver.call_llm = original_call_llm
+        baby_solver.hint_payload_attempt = original_hint_attempt
+        baby_solver.judge_true_attributed = original_judge_true
+    second_signatures = {
+        baby_solver.canonical_hint_signature(hint.eq)
+        for hint in baby_solver.parse_universal_equations(integrated_actions[1])
+    }
+    checks["packed_collaboration_loop_accumulates_candidates"] = (
+        integrated_status == "accepted_true_llm"
+        and len(integrated_actions) == 2
+        and baby_solver.canonical_hint_signature(rowconst_equation) in second_signatures
+        and winning_0202_signature in second_signatures
+    )
+
     planner = ScriptedPlanner([{"kind": "midpoint", "lemma": "a = a"}])
     checks["scripted_planner"] = planner.next_action({}) is not None and planner.next_action({}) is None
     repair_recommendation = {

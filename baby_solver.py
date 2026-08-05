@@ -63,6 +63,9 @@ Previous attempts:
 Mechanical feedback from solver-side hint attempts:
 {solver.mechanical_feedback}
 
+Persistent candidate/proved-fact blackboard:
+{solver.candidate_blackboard}
+
 Few-shot tool-call guidance:
 {solver.fewshots}
 
@@ -70,7 +73,7 @@ Current collaboration goal:
 {solver.collaboration_goal}
 
 Return exactly one JSON object, no prose, no markdown, no chain-of-thought.
-Keep ordinary actions under 600 characters. When the phase explicitly enables
+Keep ordinary actions under 1200 characters. When the phase explicitly enables
 a symbolic type-level model, a complete Lean artifact or structured model plan
 may use the official 20,000-byte false-certificate envelope. Prefer structured
 parts over rewriting a whole artifact after a local Lean error.
@@ -78,32 +81,13 @@ parts over rewriting a whole artifact after a local Lean error.
 Allowed responses:
 There is no tool named "true_midpoint"; true-side bridges must use
 {"kind":"midpoint","lemma":"<equation>"} or {"kind":"tool_call","tool":"lemma_chain","lemmas":[...]}.
-{"kind":"tool_call","tool":"right_square_chain","target":"goal","why":"H has x = (y ◇ (y ◇ z)) ◇ (x ◇ x)"}
-{"kind":"tool_call","tool":"square_sandwich_chain","target":"goal","why":"H has x = ((y ◇ x) ◇ y) ◇ (z ◇ z)"}
-{"kind":"tool_call","tool":"rowconst_certificates","target":"goal","why":"try row-constant certificates"}
-{"kind":"tool_call","tool":"grounding_derived","target":"goal","why":"try the square-rowconst grounding-derived closer"}
-{"kind":"tool_call","tool":"broad_grounding_derived","target":"goal","budget":12,"why":"derive collapse or factor-irrelevance helper"}
-{"kind":"tool_call","tool":"collapse_certificates","target":"goal","why":"try carrier-collapse certificates"}
-{"kind":"tool_call","tool":"proof_battery","target":"goal","why":"try graph-first old battery h-instances"}
-{"kind":"tool_call","tool":"forward_saturation","target":"goal","seed_terms":["x ◇ y","(x ◇ y) ◇ x"],"budget":3,"why":"try graph proof with extra seed terms"}
-{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8,"why":"try broad proof-carrying superposition when graph search is stuck"}
 {"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10,"why":"try standard collapse/projection/rowconst lemmas"}
-{"kind":"tool_call","tool":"ordered_completion","target":"goal","lemmas":["proj_l","proj_r","rowconst"],"budget":120,"why":"build and Lean-replay a simplifying proof plan for a hard auxiliary law"}
-{"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"direct opconst bridge when feedback shows an opconst-like derived equation"}
 {"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}
-{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}
 {"kind":"midpoint","lemma":"a ◇ (b ◇ b) = b","why":"one bridge equation; solver proves H=>lemma and H+lemma=>Goal"}
-{"kind":"midpoint_chain","lemmas":["a ◇ a = b ◇ b","a ◇ (b ◇ b) = a"],"why":"short chain; each proved before use"}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"local_search","routes":["local_search:n=6:seed=2"],"budget":6}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder","routes":["model_finder:n=4"],"budget":6}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder_v2","routes":["model_finder_v2:n=6"],"budget":8}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"structured_ce","routes":["structured_ce:max_n=7"],"budget":8}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"skew_product","routes":["skew_product:2x3"],"budget":4}
-{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}
+{"kind":"candidate_bundle","candidates":[{"lemma":"<direct bridge>"},{"lemma":"<stronger reusable law>"},{"lemma":"<small repair of the closest failed leg>"}],"why":"ranked alternatives; the solver normalizes, verifies, and retains each candidate"}
+Use any exact tool name and argument shape from tool_registry/tool_advice.
+{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["model_finder_v2:n=6","local_search:n=6:seed=2"],"budget":8}
 {"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}
-{"kind":"tool_call","tool":"residue_ray_countermodel","target":"goal","moduli":[2],"a_values":[-1,0,1],"b_values":[-1,0,1],"c_values":[-1,0,1],"candidate_cap":2000,"budget":2}
 {"kind":"symbolic_model_plan","representation":"infinite","model_name":"model","imports":["Mathlib.Tactic"],"carrier":"ℕ","definitions":["let parity : Nat → Bool := ...","let op (x y : Nat) := ..."],"operation":"op","setup":["have helper : ... := by\n  ..."],"hypothesis_proof":"intro x y z\n...","counterexample_proof":"intro goal_holds\nhave h := goal_holds ...\n..."}
 {"kind":"symbolic_model_patch","set":{"hypothesis_proof":"intro x y z\n<complete repaired tactic body>"}}
 {"kind":"goal_proof","proof":"intro x y\\nhave h1 := h x x x\\ngrind"}
@@ -113,6 +97,11 @@ The equations in midpoint, midpoint_chain, and lemma_chain are untrusted hints.
 The solver tries to prove each helper from H before using it. Bad hints are
 ignored. If mechanical_feedback reports that a tool call or midpoint failed, do
 not repeat the exact same call; repair it or switch strategy.
+For a true-side bridge, prefer 3-5 ranked, mathematically distinct candidates
+in candidate_bundle unless one exact repair is strongly indicated. The
+candidate_blackboard persists mechanically proved, refuted, and budget-limited
+lemmas across rounds. If a lemma is proved but not connected to the goal, add a
+new bridge from that proved fact instead of replacing or repeating it.
 If phase_directive or allowed_action_override narrows the response kinds,
 that narrower contract overrides the generic examples above.
 Do not write Lean unless you return kind=goal_proof, kind=infinite_model,
@@ -535,6 +524,8 @@ class UniversalEquation:
     extra_args: list[tuple[str, ...]]
     seed_args: list[tuple[str, ...]] | None = None
     use_args: list[tuple[str, ...]] | None = None
+    origin_signature: str | None = None
+    variant_kind: str | None = None
 
     def as_lemma(self) -> dict[str, Any]:
         return {
@@ -4674,6 +4665,8 @@ def parse_universal_equations(payload: dict[str, Any]) -> list[UniversalEquation
             use_rows = hint_rows(item.get("use_args") or item.get("lemma_args"))
             if not use_rows:
                 use_rows = payload_use_rows
+            origin_signature = item.get("_origin_signature")
+            variant_kind = item.get("_variant_kind")
         else:
             continue
         if not isinstance(eq_text, str) or "=" not in eq_text:
@@ -4691,8 +4684,493 @@ def parse_universal_equations(payload: dict[str, Any]) -> list[UniversalEquation
             extra_args=seed_rows or use_rows,
             seed_args=seed_rows or None,
             use_args=use_rows or None,
+            origin_signature=(
+                str(origin_signature) if origin_signature else None
+            ) if isinstance(item, dict) else None,
+            variant_kind=(
+                str(variant_kind) if variant_kind else None
+            ) if isinstance(item, dict) else None,
         ))
     return out
+
+
+def _canonical_hint_term(term: Term, variables: dict[str, str]) -> str:
+    if term[0] == "var":
+        raw = str(term[1])
+        if raw not in variables:
+            variables[raw] = f"v{len(variables)}"
+        return variables[raw]
+    return (
+        f"({_canonical_hint_term(term[1], variables)}◇"
+        f"{_canonical_hint_term(term[2], variables)})"
+    )
+
+
+def canonical_hint_signature(eq_or_text: dict[str, Any] | str) -> str:
+    """Alpha-normalize an equation and identify it with its converse."""
+    eq = (
+        eq_or_text
+        if isinstance(eq_or_text, dict)
+        else parse_equation(clean_equation_hint_text(eq_or_text))
+    )
+
+    def oriented(left: Term, right: Term) -> str:
+        variables: dict[str, str] = {}
+        return (
+            f"{_canonical_hint_term(left, variables)}="
+            f"{_canonical_hint_term(right, variables)}"
+        )
+
+    return min(
+        oriented(eq["lhs"], eq["rhs"]),
+        oriented(eq["rhs"], eq["lhs"]),
+    )
+
+
+def _replace_variable_occurrence(
+    term: Term,
+    variable: str,
+    occurrence: int,
+    replacement: str,
+    counts: dict[str, int],
+) -> Term:
+    if term[0] == "var":
+        raw = str(term[1])
+        counts[raw] = counts.get(raw, 0) + 1
+        if raw == variable and counts[raw] == occurrence:
+            return ("var", replacement)
+        return term
+    return (
+        "op",
+        _replace_variable_occurrence(
+            term[1], variable, occurrence, replacement, counts
+        ),
+        _replace_variable_occurrence(
+            term[2], variable, occurrence, replacement, counts
+        ),
+    )
+
+
+def fresh_variable_variants(
+    hint: UniversalEquation,
+    *,
+    limit: int = 4,
+) -> list[UniversalEquation]:
+    """Try bounded strengthenings formed by splitting one repeated variable.
+
+    This is only candidate generation: each stronger equation must still be
+    mechanically proved from H before it can enter the blackboard.
+    """
+    variables = list(hint.eq["variables"])
+    if len(variables) >= 6:
+        return []
+    available = [ch for ch in "abcdefghijklmnopqrstuv" if ch not in variables]
+    if not available:
+        return []
+    occurrence_counts = Counter()
+
+    def count_term(term: Term) -> None:
+        if term[0] == "var":
+            occurrence_counts[str(term[1])] += 1
+        else:
+            count_term(term[1])
+            count_term(term[2])
+
+    count_term(hint.eq["lhs"])
+    count_term(hint.eq["rhs"])
+    variants: list[UniversalEquation] = []
+    seen = {canonical_hint_signature(hint.eq)}
+    for variable in variables:
+        # Later occurrences often encode accidental goal specialization, as in
+        # x◇y = x◇((y◇z)◇x); try the final occurrence first.
+        for occurrence in range(occurrence_counts[variable], 1, -1):
+            replacement = available[0]
+            counts: dict[str, int] = {}
+            lhs = _replace_variable_occurrence(
+                hint.eq["lhs"], variable, occurrence, replacement, counts
+            )
+            rhs = _replace_variable_occurrence(
+                hint.eq["rhs"], variable, occurrence, replacement, counts
+            )
+            try:
+                eq = parse_equation(f"{term_to_str(lhs)} = {term_to_str(rhs)}")
+            except Exception:
+                continue
+            signature = canonical_hint_signature(eq)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            variants.append(UniversalEquation(
+                name=f"{hint.name}_fresh_{len(variants) + 1}",
+                eq=eq,
+                extra_args=list(hint.extra_args),
+                seed_args=hint.seed_args,
+                use_args=hint.use_args,
+                origin_signature=canonical_hint_signature(hint.eq),
+                variant_kind="fresh_variable_generalization",
+            ))
+            if len(variants) >= limit:
+                return variants
+    return variants
+
+
+def _match_hint_term(
+    pattern: Term,
+    target: Term,
+    substitution: dict[str, Term],
+) -> bool:
+    if pattern[0] == "var":
+        variable = str(pattern[1])
+        previous = substitution.get(variable)
+        if previous is None:
+            substitution[variable] = target
+            return True
+        return previous == target
+    return bool(
+        target[0] == "op"
+        and _match_hint_term(pattern[1], target[1], substitution)
+        and _match_hint_term(pattern[2], target[2], substitution)
+    )
+
+
+def _substitute_hint_term(term: Term, substitution: dict[str, Term]) -> Term:
+    if term[0] == "var":
+        return substitution.get(str(term[1]), term)
+    return (
+        "op",
+        _substitute_hint_term(term[1], substitution),
+        _substitute_hint_term(term[2], substitution),
+    )
+
+
+def goal_specialization_variants(
+    hint: UniversalEquation,
+    g_eq: dict[str, Any],
+    *,
+    limit: int = 2,
+) -> list[UniversalEquation]:
+    """Instantiate a candidate side against a goal side when it unifies."""
+    variants: list[UniversalEquation] = []
+    seen = {canonical_hint_signature(hint.eq)}
+    for pattern in (hint.eq["lhs"], hint.eq["rhs"]):
+        for target in (g_eq["lhs"], g_eq["rhs"]):
+            substitution: dict[str, Term] = {}
+            if not _match_hint_term(pattern, target, substitution) or not substitution:
+                continue
+            lhs = _substitute_hint_term(hint.eq["lhs"], substitution)
+            rhs = _substitute_hint_term(hint.eq["rhs"], substitution)
+            if lhs == rhs:
+                continue
+            try:
+                eq = parse_equation(f"{term_to_str(lhs)} = {term_to_str(rhs)}")
+            except Exception:
+                continue
+            signature = canonical_hint_signature(eq)
+            if signature in seen or len(eq["variables"]) > 6:
+                continue
+            seen.add(signature)
+            variants.append(UniversalEquation(
+                name=f"{hint.name}_goal_{len(variants) + 1}",
+                eq=eq,
+                extra_args=list(hint.extra_args),
+                seed_args=hint.seed_args,
+                use_args=hint.use_args,
+                origin_signature=canonical_hint_signature(hint.eq),
+                variant_kind="goal_specialization",
+            ))
+            if len(variants) >= limit:
+                return variants
+    return variants
+
+
+def expand_hint_variants(
+    hints: list[UniversalEquation],
+    g_eq: dict[str, Any],
+    *,
+    limit: int = 8,
+) -> list[UniversalEquation]:
+    """Deduplicate hints, then add a small mechanically verified variant lattice."""
+    originals: list[UniversalEquation] = []
+    seen: set[str] = set()
+    for hint in hints:
+        signature = canonical_hint_signature(hint.eq)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        hint.origin_signature = hint.origin_signature or signature
+        hint.variant_kind = hint.variant_kind or "llm_original"
+        originals.append(hint)
+    out = list(originals[:limit])
+    for hint in originals:
+        same_as_goal = canonical_hint_signature(hint.eq) == canonical_hint_signature(g_eq)
+        variants = [
+            *fresh_variable_variants(hint, limit=4 if same_as_goal else 2),
+            *goal_specialization_variants(hint, g_eq, limit=2),
+        ]
+        for variant in variants:
+            signature = canonical_hint_signature(variant.eq)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            out.append(variant)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+@dataclass
+class CandidateBlackboard:
+    """Monotone candidate and proved-fact state shared by collaboration rounds."""
+
+    records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    round_counter: int = 0
+
+    def next_round(self) -> int:
+        self.round_counter += 1
+        return self.round_counter
+
+    def snapshot(self) -> dict[str, Any]:
+        rows = []
+        for record in self.records.values():
+            rows.append({
+                key: record.get(key)
+                for key in (
+                    "candidate_id",
+                    "equation",
+                    "status",
+                    "variant_kind",
+                    "first_round",
+                    "last_round",
+                    "proposal_count",
+                    "leg_1",
+                    "leg_2",
+                    "need_hint",
+                )
+                if record.get(key) is not None
+            })
+        rows.sort(key=lambda row: (row.get("first_round", 0), row.get("candidate_id", "")))
+        return {
+            "protocol_version": "candidate-blackboard-v1",
+            "invariants": [
+                "counterexample_found is decisive; budget-limited is not false",
+                "mechanically proved facts persist and are merged into later plans",
+                "alpha-renamed and reversed duplicates share one candidate id",
+            ],
+            "candidate_count": len(rows),
+            "candidates": rows[-10:],
+        }
+
+    def materialize_action(
+        self,
+        action: dict[str, Any],
+        g_eq: dict[str, Any],
+        *,
+        round_index: int,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        hints = expand_hint_variants(parse_universal_equations(action), g_eq)
+        if not hints:
+            return action, protocol_state(
+                "CandidateBlackboardState",
+                "no_parseable_candidates",
+                "candidate_blackboard",
+            )
+        new_hints: list[UniversalEquation] = []
+        blocked: list[dict[str, Any]] = []
+        used_names: set[str] = set()
+        for hint in hints:
+            signature = canonical_hint_signature(hint.eq)
+            record = self.records.get(signature)
+            if record is not None and record.get("status") == "counterexample_found":
+                blocked.append({
+                    "candidate_id": record.get("candidate_id"),
+                    "equation": record.get("equation"),
+                    "reason": "small model of H refutes this alpha/symmetry class",
+                })
+                continue
+            seed_key = json.dumps({
+                "seed": hint.seed_args or [],
+                "use": hint.use_args or [],
+            }, sort_keys=True)
+            is_new_attempt = record is None or seed_key not in (record.get("attempt_keys") or [])
+            if record is None:
+                record = {
+                    "candidate_id": f"c{len(self.records) + 1}",
+                    "signature": signature,
+                    "equation": hint.eq["text"],
+                    "name": hint.name,
+                    "status": "proposed",
+                    "variant_kind": hint.variant_kind,
+                    "origin_signature": hint.origin_signature,
+                    "first_round": round_index,
+                    "last_round": round_index,
+                    "proposal_count": 0,
+                    "attempt_keys": [],
+                }
+                self.records[signature] = record
+            record["last_round"] = round_index
+            record["proposal_count"] = int(record.get("proposal_count") or 0) + 1
+            if seed_key not in record["attempt_keys"]:
+                record["attempt_keys"].append(seed_key)
+            if is_new_attempt:
+                new_hints.append(hint)
+
+        trusted_hints: list[UniversalEquation] = []
+        for record in self.records.values():
+            if record.get("status") not in {
+                "mechanically_proved",
+                "proved_but_not_connected",
+                "second_leg_stuck",
+            }:
+                continue
+            try:
+                eq = parse_equation(record["equation"])
+            except Exception:
+                continue
+            trusted_hints.append(UniversalEquation(
+                name=unique_lean_name(record.get("name"), "trusted", used_names),
+                eq=eq,
+                extra_args=[],
+                origin_signature=record.get("origin_signature"),
+                variant_kind=record.get("variant_kind") or "persisted_proved_fact",
+            ))
+
+        combined: list[UniversalEquation] = []
+        seen: set[str] = set()
+        for hint in [*trusted_hints, *new_hints]:
+            signature = canonical_hint_signature(hint.eq)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            hint.name = unique_lean_name(hint.name, f"m{len(combined) + 1}", used_names)
+            combined.append(hint)
+        if not new_hints:
+            state = protocol_state(
+                "CandidateBlackboardState",
+                "no_new_candidates",
+                "candidate_blackboard",
+                blocked_candidates=blocked,
+                retained_proved_count=len(trusted_hints),
+                need_hint=(
+                    "Every candidate was previously tried or refuted. Add a new bridge; "
+                    "proved-but-unconnected facts remain available in the blackboard."
+                ),
+            )
+            self.events.append({"round": round_index, **state})
+            return None, state
+        materialized = {
+            "kind": "midpoint_chain",
+            "_variants_expanded": True,
+            "lemmas": [
+                {
+                    "name": hint.name,
+                    "equation": hint.eq["text"],
+                    **(
+                        {"_origin_signature": hint.origin_signature}
+                        if hint.origin_signature else {}
+                    ),
+                    **(
+                        {"_variant_kind": hint.variant_kind}
+                        if hint.variant_kind else {}
+                    ),
+                    **(
+                        {"seed_h_args": [list(row) for row in hint.seed_args]}
+                        if hint.seed_args else {}
+                    ),
+                    **(
+                        {"use_args": [list(row) for row in hint.use_args]}
+                        if hint.use_args else {}
+                    ),
+                }
+                for hint in combined
+            ],
+        }
+        for key in ("budget", "time_budget", "budget_policy"):
+            if key in action:
+                materialized[key] = action[key]
+        state = protocol_state(
+            "CandidateBlackboardState",
+            "materialized",
+            "candidate_blackboard",
+            new_candidate_count=len(new_hints),
+            retained_proved_count=len(trusted_hints),
+            blocked_candidates=blocked,
+            candidate_ids=[
+                self.records[canonical_hint_signature(hint.eq)]["candidate_id"]
+                for hint in new_hints
+            ],
+        )
+        self.events.append({"round": round_index, **state})
+        return materialized, state
+
+    def absorb_attempt(
+        self,
+        attempt_state: dict[str, Any],
+        *,
+        round_index: int,
+    ) -> dict[str, Any]:
+        updates = []
+        conflicts = []
+        for lifecycle in attempt_state.get("candidate_statuses") or []:
+            equation = lifecycle.get("equation") if isinstance(lifecycle, dict) else None
+            if not isinstance(equation, str):
+                continue
+            signature = canonical_hint_signature(equation)
+            record = self.records.get(signature)
+            if record is None:
+                record = {
+                    "candidate_id": f"c{len(self.records) + 1}",
+                    "signature": signature,
+                    "equation": equation,
+                    "name": lifecycle.get("name"),
+                    "first_round": round_index,
+                    "proposal_count": 1,
+                    "attempt_keys": [],
+                }
+                self.records[signature] = record
+            incoming = str(lifecycle.get("status") or "unproved_with_budget")
+            prior = str(record.get("status") or "proposed")
+            if prior in {"mechanically_proved", "proved_but_not_connected", "second_leg_stuck"} and incoming == "counterexample_found":
+                conflicts.append({"candidate_id": record["candidate_id"], "kind": "refuted_after_proved"})
+                continue
+            if prior == "counterexample_found" and incoming != "counterexample_found":
+                conflicts.append({"candidate_id": record["candidate_id"], "kind": "proved_after_refuted"})
+                continue
+            if incoming in {"proved_and_helpful", "proved_but_not_connected", "second_leg_stuck"}:
+                record["status"] = (
+                    "mechanically_proved" if incoming == "proved_and_helpful" else incoming
+                )
+            elif prior not in {"mechanically_proved", "proved_but_not_connected", "second_leg_stuck"}:
+                record["status"] = incoming
+            record["last_round"] = round_index
+            record["leg_1"] = lifecycle.get("leg_1")
+            record["leg_2"] = lifecycle.get("leg_2")
+            record["need_hint"] = lifecycle.get("need_hint")
+            record["variant_kind"] = lifecycle.get("variant_kind") or record.get("variant_kind")
+            updates.append({
+                "candidate_id": record["candidate_id"],
+                "equation": record["equation"],
+                "status": record["status"],
+            })
+        state = protocol_state(
+            "CandidateBlackboardUpdate",
+            "updated" if updates else "no_candidate_update",
+            "candidate_blackboard",
+            round=round_index,
+            updates=updates,
+            conflicts=conflicts,
+            candidate_count=len(self.records),
+            proved_fact_count=sum(
+                record.get("status") in {
+                    "mechanically_proved",
+                    "proved_but_not_connected",
+                    "second_leg_stuck",
+                }
+                for record in self.records.values()
+            ),
+        )
+        self.events.append(state)
+        return state
 
 
 def render_lemma_type(lemma_eq: dict[str, Any], args: tuple[str, ...]) -> tuple[str, str]:
@@ -8266,7 +8744,7 @@ def generic_midpoint_chain_attempt(
     budget_policy: dict[str, Any] | MidpointBudgetPolicy | None = None,
     total_budget: float | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
-    limited_hints = hints[:5]
+    limited_hints = hints[:10]
     policy = (
         budget_policy
         if isinstance(budget_policy, MidpointBudgetPolicy)
@@ -8281,6 +8759,7 @@ def generic_midpoint_chain_attempt(
     proved: list[UniversalEquation] = []
     proved_indices: set[int] = set()
     failed: list[dict[str, Any]] = []
+    candidate_statuses: list[dict[str, Any]] = []
     candidates: dict[int, dict[str, Any]] = {}
 
     for index, hint in enumerate(limited_hints):
@@ -8298,6 +8777,15 @@ def generic_midpoint_chain_attempt(
                     "repair": "Return a smaller reusable helper equation or a false_model_search route instead.",
                 },
             })
+            candidate_statuses.append({
+                "name": hint.name,
+                "equation": hint.eq["text"],
+                "status": "invalid_goal_repetition",
+                "variant_kind": hint.variant_kind,
+                "leg_1": {"status": "not_attempted"},
+                "leg_2": {"status": "same_as_original_goal"},
+                "need_hint": "Generalize or shrink the goal into a reusable bridge.",
+            })
             continue
         refutation = hint_refutation(h_eq, hint.eq)
         if refutation is not None:
@@ -8306,6 +8794,18 @@ def generic_midpoint_chain_attempt(
                 "name": hint.name,
                 "equation": hint.eq["text"],
                 "failure": refutation,
+            })
+            candidate_statuses.append({
+                "name": hint.name,
+                "equation": hint.eq["text"],
+                "status": "counterexample_found",
+                "variant_kind": hint.variant_kind,
+                "leg_1": {
+                    "status": "counterexample_found",
+                    "carrier_size": refutation.get("n"),
+                },
+                "leg_2": {"status": "not_attempted"},
+                "need_hint": "Replace this equation; a checked model of H refutes it.",
             })
             continue
 
@@ -8321,6 +8821,8 @@ def generic_midpoint_chain_attempt(
             "proof_state": None,
             "consume_body": None,
             "consume_state": None,
+            "variant_kind": hint.variant_kind,
+            "origin_signature": hint.origin_signature,
         }
         metadata = {
             "candidate_index": index,
@@ -8455,18 +8957,68 @@ def generic_midpoint_chain_attempt(
         )
 
     for index, candidate in candidates.items():
-        if index in proved_indices:
-            continue
         hint = candidate["hint"]
-        failed.append({
-            "stage": "prove_midpoint",
+        proof_state = candidate.get("proof_state") or {
+            "kind": "SearchState",
+            "status": "not_started_before_budget_exhausted",
+        }
+        consume_state = candidate.get("consume_state") or {
+            "kind": "SearchState",
+            "status": "not_started_before_budget_exhausted",
+        }
+        proved_here = index in proved_indices
+        consumed = bool(candidate.get("consume_body"))
+        if proved_here and consumed:
+            lifecycle_status = "proved_and_helpful"
+        elif proved_here:
+            lifecycle_status = "proved_but_not_connected"
+        elif consumed:
+            lifecycle_status = "second_leg_proved_first_leg_unproved"
+        else:
+            lifecycle_status = "unproved_with_budget"
+
+        def compact_leg(state: dict[str, Any], status: str) -> dict[str, Any]:
+            superposition = state.get("superposition_state")
+            need_hint = state.get("need_hint")
+            if need_hint is None and isinstance(superposition, dict):
+                need_hint = superposition.get("need_hint")
+            out = {
+                "status": status,
+                "search_status": state.get("status"),
+            }
+            if need_hint is not None and status != "proved":
+                out["need_hint"] = need_hint
+            closest = state.get("closest_pairs")
+            if status != "proved" and isinstance(closest, list) and closest:
+                out["closest_pairs"] = closest[:2]
+            return out
+
+        leg_1 = compact_leg(
+            proof_state,
+            "proved" if proved_here else "unproved_with_budget",
+        )
+        leg_2 = compact_leg(
+            consume_state,
+            "proved" if consumed else "stuck",
+        )
+        need_hint = leg_2.get("need_hint") if proved_here else leg_1.get("need_hint")
+        candidate_statuses.append({
             "name": hint.name,
             "equation": hint.eq["text"],
-            "search_state": candidate.get("proof_state") or {
-                "kind": "SearchState",
-                "status": "not_started_before_budget_exhausted",
-            },
+            "status": lifecycle_status,
+            "variant_kind": candidate.get("variant_kind"),
+            "origin_signature": candidate.get("origin_signature"),
+            "leg_1": leg_1,
+            "leg_2": leg_2,
+            "need_hint": need_hint,
         })
+        if not proved_here:
+            failed.append({
+                "stage": "prove_midpoint",
+                "name": hint.name,
+                "equation": hint.eq["text"],
+                "search_state": proof_state,
+            })
 
     summary: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -8484,6 +9036,7 @@ def generic_midpoint_chain_attempt(
         "proved_lemmas": [
             {"name": hint.name, "equation": hint.eq["text"]} for hint in proved
         ],
+        "candidate_statuses": candidate_statuses,
         "failed_midpoints": failed[:3],
         "budget_allocation": broker.snapshot(),
     }
@@ -8554,7 +9107,10 @@ def hint_payload_attempt(
     *,
     capability_mask: Any = None,
 ) -> tuple[str | None, dict[str, Any]]:
-    hints = ordered_hints_for_payload(payload, parse_universal_equations(payload), g_eq)
+    hints = parse_universal_equations(payload)
+    if not payload.get("_variants_expanded"):
+        hints = expand_hint_variants(hints, g_eq)
+    hints = ordered_hints_for_payload(payload, hints, g_eq)
     body, state = generic_midpoint_chain_attempt(
         h_eq,
         g_eq,
@@ -9722,8 +10278,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         "If the goal may collapse under a standard lemma, try auxiliary superposition:",
         '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10}',
         "If feedback says a stronger helper was refuted_by_small_model, do not repeat that helper; use the closest non-refuted bridge instead.",
-        "Repair example: if a projection-like target has the same left prefix on both sides, propose a reusable right-argument contraction:",
-        '{"kind":"midpoint","lemma":"a ◇ ((b ◇ c) ◇ d) = a ◇ b","why":"connects a left-prefix goal by contracting the right argument; mechanical side will prove and consume it"}',
+        "Observed repair: if rowconst times out but closest_equations expose a narrower right-argument contraction, follow the frontier instead of repeating rowconst:",
+        '{"kind":"candidate_bundle","candidates":[{"lemma":"a ◇ ((b ◇ c) ◇ d) = a ◇ b"},{"lemma":"a ◇ (b ◇ c) = a ◇ b"}],"why":"rank the closest mechanically reached contraction families"}',
         "Repair example: if feedback says rowconst was the target but direct opconst is not refuted, opconst can be a useful stronger bridge:",
         '{"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"derived opconst-like bridge was not refuted and would consume row/product goals"}',
         "Repair example: if rowconst `a ◇ b = a ◇ c` is proved but not consumed, add a non-refuted follow-up helper rather than repeating rowconst alone:",
@@ -10773,6 +11329,57 @@ def normalize_llm_action(data: dict[str, Any]) -> tuple[dict[str, Any] | None, d
     errors: list[dict[str, Any]] = []
     out = dict(data)
 
+    if str(out.get("kind") or "").strip() in {
+        "candidate_bundle",
+        "proposal_bundle",
+        "ranked_candidates",
+    }:
+        raw_candidates = out.get("candidates")
+        lemmas: list[dict[str, Any]] = []
+        if isinstance(raw_candidates, list):
+            for rank, candidate in enumerate(raw_candidates[:6], start=1):
+                if isinstance(candidate, str):
+                    equation = candidate
+                    name = f"candidate_{rank}"
+                elif isinstance(candidate, dict):
+                    equation = (
+                        candidate.get("equation")
+                        or candidate.get("lemma")
+                        or candidate.get("midpoint")
+                        or candidate.get("claim")
+                    )
+                    name = candidate.get("name") or f"candidate_{rank}"
+                else:
+                    continue
+                if isinstance(equation, str) and "=" in equation:
+                    lemmas.append({
+                        "name": name,
+                        "equation": equation,
+                        "rank": rank,
+                    })
+        if lemmas:
+            out = {
+                "kind": "midpoint_chain",
+                "lemmas": lemmas,
+                **({"budget": data["budget"]} if "budget" in data else {}),
+                **(
+                    {"budget_policy": data["budget_policy"]}
+                    if "budget_policy" in data else {}
+                ),
+                **({"why": data["why"]} if "why" in data else {}),
+            }
+            repairs.append(ProtocolIssue(
+                "candidate_bundle_normalized",
+                "Normalized ranked candidate bundle to the midpoint-chain consumer",
+                "candidates",
+            ).to_dict())
+        else:
+            errors.append(ProtocolIssue(
+                "empty_candidate_bundle",
+                "candidate_bundle must contain 1-6 equation candidates",
+                "candidates",
+            ).to_dict())
+
     if isinstance(out.get("action"), dict) and not any(
         key in out
         for key in (
@@ -10992,6 +11599,7 @@ def llm_context(
     capability_mask: Any = None,
     allow_infinite_model_artifacts: bool = False,
     active_symbolic_plan: dict[str, Any] | None = None,
+    candidate_blackboard: CandidateBlackboard | None = None,
 ) -> dict[str, Any]:
     if not finite_countermodel_search_allowed(semantic_context):
         phase_directive = (
@@ -11074,6 +11682,14 @@ def llm_context(
         "strategy_cards": cards_for_prompt,
         "phase_directive": phase_directive,
         "mechanical_feedback": feedback_json(mechanical_feedback),
+        "candidate_blackboard": json.dumps(
+            candidate_blackboard.snapshot() if candidate_blackboard else {
+                "protocol_version": "candidate-blackboard-v1",
+                "candidate_count": 0,
+                "candidates": [],
+            },
+            ensure_ascii=False,
+        ),
         "fewshots": fewshots_for_prompt,
         "collaboration_goal": collaboration_goal,
     }
@@ -11307,18 +11923,21 @@ def try_llm_collaboration(
     allow_infinite_model_artifacts: bool = False,
     hint_budget_cap: float | None = None,
     failed_signatures: set[str] | None = None,
+    candidate_blackboard: CandidateBlackboard | None = None,
 ) -> str | None:
     mechanical_feedback: list[dict[str, Any]] = list(initial_feedback or [])
     finite_search_allowed = finite_countermodel_search_allowed(semantic_context)
     if semantic_context and semantic_context.get("semantic_class") != "unclassified":
         mechanical_feedback.insert(0, semantic_status_state(semantic_context))
     failed_signatures = failed_signatures if failed_signatures is not None else set()
+    candidate_blackboard = candidate_blackboard or CandidateBlackboard()
     tried_false_routes: set[str] = false_tried_routes_from_states(false_feedback_states(mechanical_feedback, limit=None))
     active_symbolic_plan: dict[str, Any] | None = None
     deadline = time.monotonic() + max(8.0, min(90.0, budget * 0.35))
     rounds = 0
     while rounds < max_rounds and time.monotonic() < deadline:
         rounds += 1
+        blackboard_round = candidate_blackboard.next_round()
         resp = call_llm(llm_context(
             h_eq,
             g_eq,
@@ -11329,6 +11948,7 @@ def try_llm_collaboration(
             capability_mask=capability_mask,
             allow_infinite_model_artifacts=allow_infinite_model_artifacts,
             active_symbolic_plan=active_symbolic_plan,
+            candidate_blackboard=candidate_blackboard,
         ))
         if resp.get("error"):
             mechanical_feedback.append(protocol_state(
@@ -11753,6 +12373,14 @@ def try_llm_collaboration(
         candidate_route = "llm:goal_proof"
         candidate_source = "llm_direct_artifact"
         if is_hint_payload(data):
+            data, blackboard_state = candidate_blackboard.materialize_action(
+                data,
+                g_eq,
+                round_index=blackboard_round,
+            )
+            mechanical_feedback.append(blackboard_state)
+            if data is None:
+                continue
             data = cap_hint_payload_budget(data, hint_budget_cap)
             sig = compact_tool_signature(data)
             if sig in failed_signatures:
@@ -11773,6 +12401,10 @@ def try_llm_collaboration(
             candidate_route = "llm:hint_payload"
             candidate_source = "llm_hint"
             mechanical_feedback.append(state)
+            mechanical_feedback.append(candidate_blackboard.absorb_attempt(
+                state,
+                round_index=blackboard_round,
+            ))
             if not body:
                 failed_signatures.add(sig)
         elif data.get("kind") == "tool_call":
@@ -11823,7 +12455,15 @@ def try_llm_collaboration(
             ))
     if feedback_sink is not None:
         feedback_sink.clear()
-        feedback_sink.extend(mechanical_feedback[-10:])
+        feedback_sink.extend([
+            *mechanical_feedback[-9:],
+            protocol_state(
+                "CandidateBlackboardState",
+                "snapshot",
+                "candidate_blackboard",
+                blackboard=candidate_blackboard.snapshot(),
+            ),
+        ])
     return None
 
 
@@ -11838,6 +12478,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     semantic_state = semantic_status_state(semantic_context)
     false_failure_feedback: list[dict[str, Any]] = []
     early_true_feedback: list[dict[str, Any]] = []
+    candidate_blackboard = CandidateBlackboard()
 
     # Research deployments may attach equation-level semantic metadata. The
     # packed solver consumes only the generic status contract: System 2 must
@@ -11862,6 +12503,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                 prefer_false=True,
                 semantic_context=semantic_context,
                 allow_infinite_model_artifacts=True,
+                candidate_blackboard=candidate_blackboard,
             )
             if status:
                 return status
@@ -11915,6 +12557,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                     ),
                 )],
                 semantic_context=semantic_context,
+                candidate_blackboard=candidate_blackboard,
             )
             if status:
                 return status
@@ -12090,6 +12733,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                 initial_feedback=initial_feedback,
                 semantic_context=semantic_context,
                 hint_budget_cap=hint_budget_cap,
+                candidate_blackboard=candidate_blackboard,
             )
             if status:
                 return status
@@ -12139,6 +12783,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             ),
             initial_feedback=initial_feedback,
             semantic_context=semantic_context,
+            candidate_blackboard=candidate_blackboard,
         )
         if status:
             return status
@@ -12168,6 +12813,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             }],
             prefer_false=True,
             semantic_context=semantic_context,
+            candidate_blackboard=candidate_blackboard,
         )
         if status:
             return status
@@ -12318,6 +12964,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         feedback_sink=late_llm_feedback,
         semantic_context=semantic_context,
         failed_signatures=late_failed_signatures,
+        candidate_blackboard=candidate_blackboard,
     )
     if status:
         return status
@@ -12344,6 +12991,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         prefer_false=False,
         semantic_context=semantic_context,
         failed_signatures=late_failed_signatures,
+        candidate_blackboard=candidate_blackboard,
     )
     return status or "unsolved"
 

@@ -64,6 +64,30 @@ class SubmissionCompiler:
             return "submission must contain one regular, non-symlink solver.py"
         return None
 
+    @staticmethod
+    def _docstring_spans(source: str) -> set[tuple[tuple[int, int], tuple[int, int]]]:
+        """Return token spans for inert module, class, and function docstrings."""
+        tree = ast.parse(source)
+        scopes = [
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        spans: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+        for scope in scopes:
+            body = getattr(scope, "body", [])
+            if not body:
+                continue
+            first = body[0]
+            if not (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                continue
+            value = first.value
+            spans.add(((value.lineno, value.col_offset), (value.end_lineno, value.end_col_offset)))
+        return spans
+
     def compile(self, spec: CompilationSpec) -> dict[str, Any]:
         source_bytes = spec.source.read_bytes()
         source_text = source_bytes.decode("utf-8")
@@ -84,10 +108,13 @@ class SubmissionCompiler:
         lines = source_text.splitlines(keepends=True)
         shebang = lines[0] if lines and lines[0].startswith("#!") else ""
         token_source = "".join(lines[1:]) if shebang else source_text
+        docstring_spans = self._docstring_spans(token_source)
         compact_tokens = [
             (token.type, token.string)
             for token in tokenize.generate_tokens(io.StringIO(token_source).readline)
             if token.type != tokenize.COMMENT
+            and not (token.type == tokenize.NL and not token.line.strip())
+            and not (token.type == tokenize.STRING and (token.start, token.end) in docstring_spans)
         ]
         compiled_source = tokenize.untokenize(compact_tokens)
         compiled_source = "".join(

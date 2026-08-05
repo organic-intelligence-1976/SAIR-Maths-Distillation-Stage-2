@@ -149,6 +149,47 @@ The midpoint is discarded unless both legs are mechanically verified.
 The solver proves each lemma in order. Later lemmas may use earlier proved
 lemmas. The goal proof may use all proved lemmas.
 
+### Ranked Candidate Bundle
+
+```json
+{
+  "kind": "candidate_bundle",
+  "candidates": [
+    {"lemma": "a ◇ ((b ◇ c) ◇ d) = a ◇ b"},
+    {"lemma": "a ◇ (b ◇ c) = a ◇ b"},
+    {"lemma": "a ◇ b = a ◇ c"}
+  ],
+  "why": "ranked alternatives at different strengths"
+}
+```
+
+The adapter accepts up to six candidates from one provider response and
+normalizes the bundle into a bounded midpoint chain. Candidates remain
+untrusted and are scheduled as separate attain/consume obligations. This makes
+one provider call less dependent on its first-ranked guess.
+
+### Candidate Blackboard
+
+All collaboration checkpoints in one solve share a monotone
+`candidate-blackboard-v1`. Alpha-renamed candidates and their converses receive
+one canonical ID. The board records both proof legs and distinguishes:
+
+- `counterexample_found`;
+- `unproved_with_budget`;
+- `proved_but_not_connected`;
+- `second_leg_proved_first_leg_unproved`;
+- `proved_and_helpful`.
+
+A budget-limited attempt is never treated as a refutation. A checked
+counterexample blocks equivalent repeats. A proved-but-unused equation remains
+available to later rounds, where it is mechanically re-established before use.
+
+Before scheduling, the adapter also tries a small candidate lattice: converse
+equations are handled canonically, repeated-variable specializations can be
+generalized with one fresh variable, and universal candidates can be
+specialized against goal sides. These are candidate-generation operations, not
+proof rules; every variant still has to pass both mechanical legs.
+
 ### False-Model Search
 
 ```json
@@ -208,6 +249,7 @@ Current v0 repairs:
 - known tool aliases -> canonical tool names;
 - false-model hints -> `false_model_search`;
 - missing hint kind -> inferred `midpoint` or `midpoint_chain`.
+- `candidate_bundle` / `ranked_candidates` -> bounded `midpoint_chain`.
 
 Example:
 
@@ -337,9 +379,19 @@ Recommended v0 statuses:
   counts, hot blocked/branch cells, best partial-table progress, and a compact
   next-action policy;
 - protocol metadata on generic midpoint-chain attempts;
+- cross-round `candidate-blackboard-v1` state shared by every LLM checkpoint;
+- per-candidate first-leg and second-leg diagnostics;
+- ranked candidate-bundle parsing and bounded specialization/generalization
+  variants;
 - tool feedback from `run_tool_call_detailed()` normalized into protocol-aware
   states;
 - LLM collaboration loop normalization before acting on LLM JSON.
+
+The concrete repair evidence is documented in
+`evidence/case_study_hard3_0202_repair.md`. In the historical live trajectory,
+mechanical feedback redirected an over-strong row-constancy proposal to a
+provable contraction law. In a new deterministic probe, the variant lattice
+recovered the same law when given only the specialized goal equation.
 
 The implementation is deliberately incremental. The solver still has an older
 scheduler and family-specific routes, but new modules can now target the v0
@@ -382,10 +434,10 @@ Verification artifacts from the first implementation pass:
    reference child fallback.
 3. Convert more reference mechanical imports from wrapped tools to structured tools by
    returning `need_hint`, `closest_pairs`, and `suggested_next_actions`.
-4. Add regression transcripts for:
-   - one true midpoint repair;
-   - one false-route repair;
-   - one syntax-repaired LLM action.
+4. Mine more load-bearing repair trajectories into compact few-shots, while
+   keeping provider transcripts out of the submission artifact.
+5. Measure whether candidate bundles and retained proved-but-unused facts add
+   accepted cases under provider perturbation, not only deterministic probes.
 
 The first syntax-repair transcript now exists:
 `.artifacts/feedback_uptake_hard2_0027_goal_midpoint_repair_v3_reprocessed.json`.
