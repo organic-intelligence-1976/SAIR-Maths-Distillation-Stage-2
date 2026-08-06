@@ -25,7 +25,7 @@ sys.path.insert(0, str(OFFICIAL))
 
 import baby_solver  # noqa: E402
 from research_system.curriculum import load_problem  # noqa: E402
-from research_system.protocol import ExecutionResult  # noqa: E402
+from research_system.protocol import ExecutionResult, ProblemSpec  # noqa: E402
 from research_system.verifier import OfficialLeanVerifier  # noqa: E402
 
 
@@ -51,8 +51,12 @@ def split_top_level_equation(formula: str) -> tuple[str, str]:
 
 def parse_tptp_term(text: str) -> baby_solver.Term:
     text = text.strip()
-    if text.startswith("f(") and text.endswith(")"):
-        inner = text[2:-1]
+    operation = next(
+        (name for name in ("f", "op") if text.startswith(f"{name}(") and text.endswith(")")),
+        None,
+    )
+    if operation is not None:
+        inner = text[len(operation) + 1 : -1]
         depth = 0
         for index, char in enumerate(inner):
             if char == "(":
@@ -69,6 +73,21 @@ def parse_tptp_term(text: str) -> baby_solver.Term:
     if re.fullmatch(r"X\d+", text):
         return ("var", f"v{text[1:]}")
     raise ValueError(f"unsupported TPTP term: {text}")
+
+
+def load_input_problem(problem_id: str, problem_file: Path | None) -> ProblemSpec:
+    if problem_file is None:
+        return load_problem(problem_id)
+    text = problem_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"empty problem file: {problem_file}")
+    rows = json.loads(text) if text.startswith("[") else [
+        json.loads(line) for line in text.splitlines() if line.strip()
+    ]
+    for row in rows:
+        if isinstance(row, dict) and row.get("id") == problem_id:
+            return ProblemSpec.from_mapping(row)
+    raise KeyError(f"problem not found in {problem_file}: {problem_id}")
 
 
 def balanced_chunk(text: str, start: int) -> tuple[str, int]:
@@ -674,8 +693,11 @@ def rewrite_normalization_replay(
                     binder not in substitution for binder in binders
                 ):
                     continue
+                if default_arg is not None:
+                    for binder in binders:
+                        substitution.setdefault(binder, default_arg)
                 call_args = [
-                    substitution.get(binder, default_arg)
+                    substitution[binder]
                     for binder in binders
                 ]
                 call = (
@@ -799,7 +821,7 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    problem = load_problem(args.problem_id)
+    problem = load_input_problem(args.problem_id, args.problem_file)
     h_eq = baby_solver.parse_equation(problem.equation1)
     g_eq = baby_solver.parse_equation(problem.equation2)
     trace = parse_trace(args.trace)
@@ -945,6 +967,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.body_output:
         args.body_output.parent.mkdir(parents=True, exist_ok=True)
         args.body_output.write_text(final_body + "\n", encoding="utf-8")
+    if args.certificate_output:
+        args.certificate_output.parent.mkdir(parents=True, exist_ok=True)
+        args.certificate_output.write_text(
+            baby_solver.make_true_code(final_body),
+            encoding="utf-8",
+        )
     return {
         "problem_id": problem.id,
         "trace": str(args.trace),
@@ -954,6 +982,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "target_state": compact_state(target_state),
         "verification": verification.to_mapping(),
         "body_output": str(args.body_output) if args.body_output else None,
+        "certificate_output": (
+            str(args.certificate_output) if args.certificate_output else None
+        ),
         "elapsed_seconds": round(time.monotonic() - started, 6),
     }
 
@@ -962,6 +993,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("problem_id")
     parser.add_argument("trace", type=Path)
+    parser.add_argument("--problem-file", type=Path)
     parser.add_argument("--focused-rounds", type=int, default=3)
     parser.add_argument("--focused-budget", type=float, default=8.0)
     parser.add_argument("--linear-depth", type=int, default=5)
@@ -971,6 +1003,7 @@ def main() -> None:
     parser.add_argument("--target-budget", type=float, default=12.0)
     parser.add_argument("--lean-timeout", type=int, default=45)
     parser.add_argument("--body-output", type=Path)
+    parser.add_argument("--certificate-output", type=Path)
     parser.add_argument("--report-output", type=Path)
     args = parser.parse_args()
     report = run(args)

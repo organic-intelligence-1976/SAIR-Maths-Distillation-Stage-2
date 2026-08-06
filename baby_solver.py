@@ -613,6 +613,18 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "aliases": ["collapse_cert", "carrier_collapse", "trivial_magma_cert"],
         "description": "Try proof-carrying collapse certificates: derive a variable-freeing equation and close the goal by carrier collapse.",
     },
+    "rigidity_collapse_ladder": {
+        "domain": "true",
+        "scope": "whole_goal",
+        "cost": "medium",
+        "feedback_quality": "rich",
+        "native_import": "collab_protocol",
+        "aliases": ["collapse_ladder", "rigidity_ladder", "dependency_collapse"],
+        "description": (
+            "Prove an ordered family of square/cancellation laws and retain each "
+            "proof-carrying rung until carrier collapse or a precise blocked rung."
+        ),
+    },
     "proof_battery": {
         "domain": "true",
         "scope": "whole_goal",
@@ -889,6 +901,10 @@ CAPABILITY_DEPENDENCIES: dict[str, list[str]] = {
     "goal_superposition": ["primitive:proof_carrying_superposition"],
     "standard_aux_superposition": ["primitive:proof_carrying_superposition"],
     "ordered_completion": ["primitive:proof_carrying_superposition"],
+    "rigidity_collapse_ladder": [
+        "primitive:generic_midpoint_prover",
+        "primitive:proof_carrying_superposition",
+    ],
     "false_model_search": ["primitive:finite_model_search"],
     "false_model_family": ["primitive:symbolic_family_evaluator", "primitive:finite_model_search"],
     "residue_ray_countermodel": [
@@ -1452,6 +1468,155 @@ def small_false_search(h_eq: dict[str, Any], g_eq: dict[str, Any], budget: float
         if is_counterexample(h_eq, g_eq, table):
             return n, table
     return None
+
+
+def small_model_rigidity_scout(
+    h_eq: dict[str, Any],
+    *,
+    max_n: int = 4,
+    budget: float = 0.6,
+    node_cap: int = 250_000,
+    assignment_cap: int = 16_384,
+) -> dict[str, Any]:
+    """Exhaustively seek a nontrivial H-model at small completed sizes.
+
+    This state is routing evidence only.  In particular, absence through a
+    finite size never proves carrier collapse and cannot certify a verdict.
+    """
+    started = time.monotonic()
+    cpu_started = time.process_time()
+    deadline = started + max(0.02, budget)
+    complete_sizes: list[int] = []
+    size_attempts: list[dict[str, Any]] = []
+    total_nodes = 0
+
+    for n in range(2, max(2, max_n) + 1):
+        assignment_count = n ** len(h_eq["variables"])
+        if assignment_count > assignment_cap:
+            return protocol_state(
+                "SmallModelRigiditySignal",
+                "incomplete",
+                "small_model_rigidity_scout",
+                complete_sizes=complete_sizes,
+                incomplete_size=n,
+                stop_reason="assignment_cap",
+                assignment_count=assignment_count,
+                assignment_cap=assignment_cap,
+                models_seen=0,
+                attempts=size_attempts,
+                total_nodes=total_nodes,
+                elapsed_seconds=round(time.monotonic() - started, 4),
+                cpu_seconds=round(time.process_time() - cpu_started, 4),
+                routing_only=True,
+                need_hint=(
+                    "The H-only scout skipped an oversized assignment space. Do "
+                    "not infer rigidity or suppress countermodel routes."
+                ),
+            )
+        envs = [
+            dict(zip(h_eq["variables"], values))
+            for values in product(range(n), repeat=len(h_eq["variables"]))
+        ]
+        nodes = 0
+        stop_reason = "exhausted"
+
+        def pick_cell(table: list[list[int | None]]) -> tuple[int, int] | None:
+            for env in envs:
+                for side in (h_eq["lhs"], h_eq["rhs"]):
+                    _value, blocked = mf_eval(side, env, table)
+                    if blocked is not None and table[blocked[0]][blocked[1]] is None:
+                        return blocked
+            for left in range(n):
+                for right in range(n):
+                    if table[left][right] is None:
+                        return left, right
+            return None
+
+        def search(table: list[list[int | None]]) -> list[list[int]] | None:
+            nonlocal nodes, total_nodes, stop_reason
+            if time.monotonic() >= deadline:
+                stop_reason = "time_budget"
+                return None
+            if total_nodes >= node_cap:
+                stop_reason = "node_cap"
+                return None
+            nodes += 1
+            total_nodes += 1
+            trial = [row[:] for row in table]
+            if not mf_propagate(trial, envs, h_eq["lhs"], h_eq["rhs"]):
+                return None
+            cell = pick_cell(trial)
+            if cell is None:
+                complete = [[int(value) for value in row] for row in trial]
+                return complete if eq_holds(h_eq, complete) else None
+            left, right = cell
+            for value in range(n):
+                trial[left][right] = value
+                found = search(trial)
+                if found is not None:
+                    return found
+                if stop_reason != "exhausted":
+                    return None
+                trial[left][right] = None
+            return None
+
+        found = search([[None] * n for _ in range(n)])
+        size_attempts.append({
+            "size": n,
+            "status": "model_found" if found is not None else stop_reason,
+            "nodes": nodes,
+        })
+        if found is not None:
+            return protocol_state(
+                "SmallModelRigiditySignal",
+                "nontrivial_model_found",
+                "small_model_rigidity_scout",
+                complete_sizes=complete_sizes,
+                model_size=n,
+                models_seen=1,
+                attempts=size_attempts,
+                total_nodes=total_nodes,
+                elapsed_seconds=round(time.monotonic() - started, 4),
+                cpu_seconds=round(time.process_time() - cpu_started, 4),
+                routing_only=True,
+            )
+        if stop_reason != "exhausted":
+            return protocol_state(
+                "SmallModelRigiditySignal",
+                "incomplete",
+                "small_model_rigidity_scout",
+                complete_sizes=complete_sizes,
+                incomplete_size=n,
+                stop_reason=stop_reason,
+                models_seen=0,
+                attempts=size_attempts,
+                total_nodes=total_nodes,
+                elapsed_seconds=round(time.monotonic() - started, 4),
+                cpu_seconds=round(time.process_time() - cpu_started, 4),
+                routing_only=True,
+                need_hint=(
+                    "Small-model absence was not established. Do not infer rigidity "
+                    "or suppress countermodel routes."
+                ),
+            )
+        complete_sizes.append(n)
+
+    return protocol_state(
+        "SmallModelRigiditySignal",
+        "no_nontrivial_model_through",
+        "small_model_rigidity_scout",
+        complete_sizes=complete_sizes,
+        models_seen=0,
+        attempts=size_attempts,
+        total_nodes=total_nodes,
+        elapsed_seconds=round(time.monotonic() - started, 4),
+        cpu_seconds=round(time.process_time() - cpu_started, 4),
+        routing_only=True,
+        trust_boundary=(
+            "Absence at completed finite sizes changes search priority only; every "
+            "collapse rung and final verdict still requires a Lean-checkable proof."
+        ),
+    )
 
 
 def trace_eval(t: Term, env: dict[str, int], table: list[list[int]], touched: list[tuple[int, int]]) -> int:
@@ -7484,6 +7649,148 @@ def ordered_completion_attempt(
     }
 
 
+RIGIDITY_COLLAPSE_LADDER: tuple[tuple[str, str, float], ...] = (
+    (
+        "square_overlap_bridge",
+        "(((x * x) * y) * (x * y)) = x * (x * x)",
+        4.0,
+    ),
+    ("squares_equal", "x * x = y * y", 22.0),
+    ("square_left_identity", "(x * x) * y = y", 6.0),
+    ("t_cancellation", "(x * (x * y)) * y = x", 6.0),
+    ("square_absorption", "(x * (y * y)) * x = x", 6.0),
+    ("square_transport", "x * (y * y) = x * x", 6.0),
+    ("carrier_collapse", "x = y", 12.0),
+)
+
+
+def compact_proof_state(state: dict[str, Any] | None) -> dict[str, Any]:
+    source = state if isinstance(state, dict) else {}
+    superposition = source.get("superposition_state")
+    if not isinstance(superposition, dict) and source.get("kind") == "SuperpositionState":
+        superposition = source
+    superposition = superposition if isinstance(superposition, dict) else {}
+    return {
+        "kind": source.get("kind"),
+        "status": source.get("status"),
+        "stop_reason": superposition.get("stop_reason"),
+        "records_generated": (
+            superposition.get("records_generated")
+            or superposition.get("equations_generated")
+            or superposition.get("record_count")
+        ),
+        "derivation_length": superposition.get("derivation_length"),
+        "need_hint": source.get("need_hint") or superposition.get("need_hint"),
+    }
+
+
+def rigidity_collapse_ladder_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Build a proof-carrying collapse plan, retaining every proved rung."""
+    call = call or {}
+    total_budget = float(call.get("budget") or call.get("time_budget") or 45.0)
+    started = time.monotonic()
+    cpu_started = time.process_time()
+    deadline = started + max(1.0, total_budget)
+    assumptions: list[UniversalEquation] = []
+    declarations: list[str] = []
+    attempts: list[dict[str, Any]] = []
+
+    for index, (name, equation_text, preferred_budget) in enumerate(
+        RIGIDITY_COLLAPSE_LADDER,
+        start=1,
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.5:
+            return None, protocol_state(
+                "RigidityCollapsePlanState",
+                "budget_exhausted",
+                "rigidity_collapse_ladder",
+                tool="rigidity_collapse_ladder",
+                proved_rungs=[assumption.name for assumption in assumptions],
+                blocked_rung=name,
+                attempts=attempts,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                cpu_seconds=round(time.process_time() - cpu_started, 3),
+                need_hint={
+                    "kind": "collapse_rung_budget_exhausted",
+                    "equation": equation_text,
+                    "next_action": "Retry only this blocked rung using the proved-rung equations as assumptions.",
+                },
+            )
+        equation = parse_equation(equation_text)
+        rung_started = time.monotonic()
+        proof_body, proof_state = prove_with_assumptions_detailed(
+            h_eq,
+            equation,
+            assumptions,
+            superposition_budget=min(preferred_budget, max(0.5, remaining)),
+        )
+        rung_state = {
+            "index": index,
+            "name": name,
+            "equation": equation["text"],
+            "status": "proved" if proof_body else "stuck",
+            "elapsed_seconds": round(time.monotonic() - rung_started, 3),
+            "proof_state": compact_proof_state(proof_state),
+        }
+        attempts.append(rung_state)
+        if proof_body is None:
+            return None, protocol_state(
+                "RigidityCollapsePlanState",
+                "blocked",
+                "rigidity_collapse_ladder",
+                tool="rigidity_collapse_ladder",
+                proved_rungs=[
+                    {"name": assumption.name, "equation": assumption.eq["text"]}
+                    for assumption in assumptions
+                ],
+                blocked_rung={"name": name, "equation": equation["text"]},
+                attempts=attempts,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                cpu_seconds=round(time.process_time() - cpu_started, 3),
+                need_hint={
+                    "kind": "collapse_plan_missing_dependency",
+                    "target": equation["text"],
+                    "proved_facts": [assumption.eq["text"] for assumption in assumptions],
+                    "mechanical_state": compact_proof_state(proof_state),
+                    "next_action": (
+                        "Propose one helper equation connecting the proved collapse "
+                        "rungs to this blocked rung; do not restart the whole ladder."
+                    ),
+                },
+            )
+        declarations.extend([
+            f"have {name} : {lemma_statement(equation)} := by",
+            indent(proof_body, 2),
+        ])
+        assumptions.append(UniversalEquation(name, equation, []))
+
+    if g_eq["variables"]:
+        declarations.append(f"intro {' '.join(g_eq['variables'])}")
+    declarations.append("exact carrier_collapse _ _")
+    return "\n".join(declarations), protocol_state(
+        "RigidityCollapsePlanState",
+        "body_built",
+        "rigidity_collapse_ladder",
+        tool="rigidity_collapse_ladder",
+        proved_rungs=[
+            {"name": assumption.name, "equation": assumption.eq["text"]}
+            for assumption in assumptions
+        ],
+        attempts=attempts,
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        cpu_seconds=round(time.process_time() - cpu_started, 3),
+        trust_boundary=(
+            "The small-model signal only scheduled this plan. Every rung and the "
+            "final collapse are present in the emitted Lean certificate."
+        ),
+    )
+
+
 def collapse_witness_vars(t: Term, acc: set[str] | None = None) -> set[str]:
     acc = acc if acc is not None else set()
     if t[0] == "var":
@@ -10176,6 +10483,13 @@ def run_tool_call_detailed(
             candidate_count=len(bodies),
             need_hint=None if body else "No carrier-collapse witness was derived within the bounded certificate search; try standard_aux_superposition, goal_superposition, or a midpoint.",
         )
+    if tool == "rigidity_collapse_ladder":
+        body, state = rigidity_collapse_ladder_attempt(h_eq, g_eq, call)
+        return body, protocolize_state(
+            state,
+            "rigidity_collapse_ladder",
+            status="proved" if body else state.get("status", "stuck"),
+        )
     if tool == "grounding_h":
         bodies = list(grounding_h_certificate_bodies(h_eq, g_eq))
         body = bodies[-1][1] if bodies else None
@@ -12845,6 +13159,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     false_failure_feedback: list[dict[str, Any]] = []
     early_true_feedback: list[dict[str, Any]] = []
     candidate_blackboard = CandidateBlackboard()
+    rigidity_state: dict[str, Any] | None = None
 
     # Research deployments may attach equation-level semantic metadata. The
     # packed solver consumes only the generic status contract: System 2 must
@@ -12928,6 +13243,19 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             if status:
                 return status
 
+    # Complete H-only searches at very small carrier sizes provide a useful
+    # scheduling signal when ordinary countermodel ranking has no models to
+    # compare. Absence here is never verdict evidence: it can only prioritize
+    # a proof-carrying collapse plan whose every rung is independently checked.
+    if finite_countermodel_search_allowed(semantic_context):
+        rigidity_state = small_model_rigidity_scout(
+            h_eq,
+            max_n=4,
+            budget=min(0.75, max(0.12, budget * 0.002)),
+        )
+        if rigidity_state.get("status") == "no_nontrivial_model_through":
+            early_true_feedback.append(rigidity_state)
+
     # Cheap false witnesses first.
     found = None
     if finite_countermodel_search_allowed(semantic_context):
@@ -12948,6 +13276,53 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         return "accepted_false_v2"
     if not found and isinstance(false_state, dict):
         false_failure_feedback.append(false_state)
+
+    if (
+        rigidity_state is not None
+        and rigidity_state.get("status") == "no_nontrivial_model_through"
+    ):
+        remaining = max(0.0, budget - (time.monotonic() - solve_started))
+        if remaining >= 20.0:
+            collapse_budget = min(
+                45.0,
+                remaining,
+                max(26.0, remaining * 0.08),
+            )
+            collapse_body, collapse_state = rigidity_collapse_ladder_attempt(
+                h_eq,
+                g_eq,
+                {"budget": collapse_budget},
+            )
+            if collapse_body:
+                result = judge_true_attributed(
+                    "native:true:rigidity_collapse_ladder",
+                    collapse_body,
+                    source="native_rigidity_plan",
+                    detail={
+                        "family": "dependency_aware_collapse",
+                        "small_model_signal": {
+                            "complete_sizes": rigidity_state.get("complete_sizes"),
+                            "models_seen": rigidity_state.get("models_seen"),
+                            "routing_only": True,
+                        },
+                        "proved_rungs": collapse_state.get("proved_rungs"),
+                    },
+                )
+                if result.get("status") == "accepted":
+                    return "accepted_true_rigidity_collapse_ladder"
+                collapse_state = protocol_state(
+                    "RigidityCollapsePlanState",
+                    "judge_rejected",
+                    "rigidity_collapse_ladder",
+                    plan_state=collapse_state,
+                    judge_diagnostic=compact_judge_diagnostic(result, 1000),
+                    need_hint=(
+                        "The collapse plan built a complete body but Lean rejected it; "
+                        "repair the reported certificate issue rather than changing "
+                        "the semantic strategy."
+                    ),
+                )
+            early_true_feedback.append(collapse_state)
 
     # Compact extensions are cheap enough to scout before the broad true
     # battery, and occupy a different search language from arbitrary tables.

@@ -86,6 +86,49 @@ def main() -> int:
             "false_model_search",
         )
     )
+    rigid_h = baby_solver.parse_equation(
+        "x = (y ◇ z) ◇ ((x ◇ (x ◇ y)) ◇ z)"
+    )
+    rigidity_signal = baby_solver.small_model_rigidity_scout(
+        rigid_h,
+        budget=0.5,
+    )
+    nonrigid_signal = baby_solver.small_model_rigidity_scout(
+        baby_solver.parse_equation("x = x"),
+        budget=0.2,
+    )
+    checks["small_model_rigidity_is_routing_only"] = (
+        "rigidity_collapse_ladder" in baby_solver.TOOL_REGISTRY
+        and rigidity_signal.get("status") == "no_nontrivial_model_through"
+        and rigidity_signal.get("complete_sizes") == [2, 3, 4]
+        and rigidity_signal.get("routing_only") is True
+        and nonrigid_signal.get("status") == "nontrivial_model_found"
+        and nonrigid_signal.get("model_size") == 2
+    )
+    false_rigid_h = baby_solver.parse_equation(
+        "x = y ◇ (((x ◇ y) ◇ x) ◇ y)"
+    )
+    false_rigid_g = baby_solver.parse_equation(
+        "x = ((x ◇ (y ◇ z)) ◇ z) ◇ y"
+    )
+    false_rigid_signal = baby_solver.small_model_rigidity_scout(
+        false_rigid_h,
+        budget=0.5,
+    )
+    false_collapse_body, false_collapse_state = (
+        baby_solver.rigidity_collapse_ladder_attempt(
+            false_rigid_h,
+            false_rigid_g,
+            {"budget": 1.0},
+        )
+    )
+    checks["rigidity_signal_cannot_certify_false_positive"] = (
+        false_rigid_signal.get("status") == "no_nontrivial_model_through"
+        and false_collapse_body is None
+        and false_collapse_state.get("status") == "blocked"
+        and (false_collapse_state.get("blocked_rung") or {}).get("name")
+        == "square_overlap_bridge"
+    )
     replacement_h = baby_solver.parse_equation("(x ◇ y) = (z ◇ x)")
     replacement_g = baby_solver.parse_equation("(a ◇ b) = (c ◇ a)")
     grounding_bodies = list(baby_solver.grounding_h_certificate_bodies(replacement_h, replacement_g))
