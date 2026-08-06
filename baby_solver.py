@@ -4602,7 +4602,7 @@ def hint_score(hint: UniversalEquation, g_eq: dict[str, Any]) -> tuple[int, int,
 
 
 def ordered_hints_for_payload(payload: dict[str, Any], hints: list[UniversalEquation], g_eq: dict[str, Any]) -> list[UniversalEquation]:
-    kind = payload.get("kind") or payload.get("tool")
+    kind = payload.get("tool") if payload.get("kind") == "tool_call" else payload.get("kind")
     if kind in {"midpoint_chain", "lemma_chain"}:
         return hints
     return sorted(hints, key=lambda hint: hint_score(hint, g_eq))
@@ -4970,7 +4970,10 @@ class CandidateBlackboard:
         *,
         round_index: int,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        hints = expand_hint_variants(parse_universal_equations(action), g_eq)
+        action_kind = action.get("tool") if action.get("kind") == "tool_call" else action.get("kind")
+        ordered_chain = action_kind in {"midpoint_chain", "lemma_chain"}
+        parsed_hints = parse_universal_equations(action)
+        hints = parsed_hints if ordered_chain else expand_hint_variants(parsed_hints, g_eq)
         if not hints:
             return action, protocol_state(
                 "CandidateBlackboardState",
@@ -5063,6 +5066,7 @@ class CandidateBlackboard:
         materialized = {
             "kind": "midpoint_chain",
             "_variants_expanded": True,
+            "_ordered_chain": ordered_chain,
             "lemmas": [
                 {
                     "name": hint.name,
@@ -8106,6 +8110,14 @@ def superposition_state(
     derived_scored.sort(key=lambda item: item["similarity"], reverse=True)
     shape_rows.sort(key=lambda item: (len(item.get("shape_tags", [])), item["similarity"]), reverse=True)
     target_shape = target_aux_shape(target_eq)
+    frontier_action = None
+    if status != "proved" and target_shape == "const" and derived_scored:
+        frontier = derived_scored[0]
+        frontier_action = {
+            "kind": "midpoint",
+            "lemma": f"{frontier['lhs']} = {frontier['rhs']}",
+            "why": "proof-carrying frontier equation is an easier first rung toward collapse",
+        }
     state = {
         "kind": "SuperpositionState",
         "status": status,
@@ -8123,12 +8135,14 @@ def superposition_state(
         "closest_equations": scored[:5],
         "derived_closest_equations": derived_scored[:5],
         "shape_diagnostics": shape_rows[:8],
-        "need_hint": {
+        "need_hint": None if status == "proved" else {
             "kind": "superposition_subgoal",
             "reason": "proof-carrying superposition did not reach the target; propose a smaller universal midpoint near a closest_equations row",
             "target": target_eq["text"],
             "closest_equation": (derived_scored[0] if derived_scored else scored[0]) if scored else None,
+            "recommended_next_action": frontier_action,
         },
+        "suggested_next_actions": [frontier_action] if frontier_action else [],
     }
     if target_shape == "rowconst":
         opconst_like = next((row for row in shape_rows if "opconst_like" in row.get("shape_tags", [])), None)
@@ -8166,7 +8180,7 @@ def superposition_state(
             ],
             "reason": "If rowconst itself is hard to prove or insufficient, these derived shapes are useful follow-up bridge candidates.",
         }
-        if recommended_next_action:
+        if recommended_next_action and isinstance(state.get("need_hint"), dict):
             state["need_hint"]["recommended_next_action"] = recommended_next_action
     return state
 
@@ -8438,6 +8452,35 @@ def standard_aux_tail(kind: str, g_eq: dict[str, Any], h_eq: dict[str, Any], aux
     return goal_body, goal_state
 
 
+def grounded_assumption_grind_body(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    assumptions: list[UniversalEquation],
+    h_limit: int = 16,
+    lemma_limit: int = 32,
+) -> tuple[str | None, dict[str, Any]]:
+    if not g_eq["variables"]:
+        return None, {"kind": "GroundedConsumeState", "status": "no_goal_variables"}
+    lines = ["intro " + " ".join(g_eq["variables"])]
+    h_rows = candidate_h_args(h_eq, g_eq, h_limit)
+    lines.extend(
+        f"have gh{i} := h " + " ".join(map(lean_arg, args))
+        for i, args in enumerate(h_rows, 1)
+    )
+    lemma_instances = 0
+    for j, assumption in enumerate(assumptions, 1):
+        for i, args in enumerate(candidate_lemma_args(assumption.eq, g_eq, lemma_limit), 1):
+            lines.append(f"have gl{j}_{i} := {assumption.name} " + " ".join(map(lean_arg, args)))
+            lemma_instances += 1
+    lines.append("grind")
+    return "\n".join(lines), {
+        "kind": "GroundedConsumeState",
+        "status": "candidate_built",
+        "h_instances": len(h_rows),
+        "lemma_instances": lemma_instances,
+    }
+
+
 def standard_aux_superposition_attempt(
     h_eq: dict[str, Any],
     g_eq: dict[str, Any],
@@ -8529,21 +8572,27 @@ def standard_aux_superposition_attempt(
         secondary_state = None
         if tail is None:
             secondary_tail, secondary_state = secondary_bridge_attempt(h_eq, g_eq, aux, kind, deadline)
+        grounded_tail = None
+        grounded_state = None
+        if tail is None and secondary_tail is None:
+            grounded_tail, grounded_state = grounded_assumption_grind_body(h_eq, g_eq, [aux])
+        built_tail = tail or secondary_tail or grounded_tail
         attempts.append({
             "kind": kind,
-            "status": "proved" if (tail or secondary_tail) else "proved_not_consumed",
+            "status": "grounded_candidate_built" if grounded_tail else ("proved" if built_tail else "proved_not_consumed"),
             "equation": eq["text"],
             "attempt_budget": round(attempt_budget, 3),
             "implied_by_scout": kind in implied_kinds,
             "proof_state": proof_state,
             "consume_state": consume_state,
             "secondary_state": secondary_state,
+            "grounded_state": grounded_state,
         })
-        if tail or secondary_tail:
+        if built_tail:
             body = "\n".join([
                 f"have {kind} : {lemma_statement(eq)} := by",
                 indent(proof_body, 2),
-                tail or secondary_tail or "",
+                built_tail,
             ])
             return body, {
                 "kind": "StandardAuxSuperpositionState",
@@ -8551,6 +8600,7 @@ def standard_aux_superposition_attempt(
                 "used_aux": kind,
                 "implied_aux": implied_kinds,
                 "used_secondary_bridge": secondary_state.get("bridge") if isinstance(secondary_state, dict) else None,
+                "used_grounded_consumer": grounded_tail is not None,
                 "attempts": attempts,
             }
     need_hint = None
@@ -8750,17 +8800,26 @@ def generic_midpoint_chain_attempt(
     *,
     budget_policy: dict[str, Any] | MidpointBudgetPolicy | None = None,
     total_budget: float | None = None,
+    ordered_chain: bool = False,
 ) -> tuple[str | None, dict[str, Any]]:
     limited_hints = hints[:10]
-    policy = (
-        budget_policy
-        if isinstance(budget_policy, MidpointBudgetPolicy)
-        else MidpointBudgetPolicy.from_mapping(
-            budget_policy,
+    if isinstance(budget_policy, MidpointBudgetPolicy):
+        policy = budget_policy
+    else:
+        raw_policy = dict(budget_policy) if isinstance(budget_policy, dict) else {}
+        if ordered_chain:
+            total_hint = raw_policy.get("total_budget", raw_policy.get("total", total_budget))
+            default_total = max(10.0, 10.0 * (max(1, min(5, len(limited_hints))) + 1))
+            chain_total = _clamped_float(total_hint, default_total, 1.0, 600.0)
+            first_pass_grant = chain_total / max(2, len(limited_hints) + 1)
+            raw_policy.setdefault("initial_grant", min(8.0, first_pass_grant))
+            raw_policy.setdefault("max_grant", 12.0)
+            raw_policy.setdefault("max_grants_per_task", 2)
+        policy = MidpointBudgetPolicy.from_mapping(
+            raw_policy,
             candidate_count=len(limited_hints),
             requested_total=total_budget,
         )
-    )
     broker = RenewableBudgetBroker(policy)
     proof_lines: list[str] = []
     proved: list[UniversalEquation] = []
@@ -8840,13 +8899,17 @@ def generic_midpoint_chain_attempt(
             f"candidate:{index}:consume",
             base_score=policy.consume_priority + common_score,
             metadata={**metadata, "leg": "consume"},
+            enabled=not ordered_chain,
         )
         broker.register(
             f"candidate:{index}:attain",
             base_score=policy.attain_priority + common_score,
             metadata={**metadata, "leg": "attain"},
+            enabled=not ordered_chain,
         )
 
+    if ordered_chain and candidates:
+        broker.update(f"candidate:{min(candidates)}:attain", enabled=True)
     broker.register(
         "root:consume",
         base_score=policy.goal_priority,
@@ -8894,10 +8957,17 @@ def generic_midpoint_chain_attempt(
                     detail={"proved_lemma": hint.name},
                 )
                 broker.advance_context()
-                broker.update("root:consume", enabled=True)
-                broker.update(f"candidate:{index}:consume", companion_succeeded=True)
-                if candidate.get("consume_body"):
-                    solution_body = "\n".join([*proof_lines, candidate["consume_body"]])
+                if ordered_chain:
+                    remaining = [i for i in sorted(candidates) if i not in proved_indices]
+                    if remaining:
+                        broker.update(f"candidate:{remaining[0]}:attain", enabled=True)
+                    else:
+                        broker.update("root:consume", enabled=True)
+                else:
+                    broker.update("root:consume", enabled=True)
+                    broker.update(f"candidate:{index}:consume", companion_succeeded=True)
+                    if candidate.get("consume_body"):
+                        solution_body = "\n".join([*proof_lines, candidate["consume_body"]])
                 continue
         elif leg == "consume" and candidate is not None:
             hint = candidate["hint"]
@@ -9032,6 +9102,7 @@ def generic_midpoint_chain_attempt(
         "kind": "midpoint_chain_attempt",
         "status": "stuck",
         "source": "generic_midpoint_chain",
+        "ordered_chain": ordered_chain,
         "proposed_lemmas": [
             {
                 "name": hint.name,
@@ -9103,7 +9174,7 @@ def generic_midpoint_chain_body(
     hints: list[UniversalEquation],
 ) -> str | None:
     """Prove LLM-proposed lemmas in order, then use the proved assumptions."""
-    body, _state = generic_midpoint_chain_attempt(h_eq, g_eq, hints)
+    body, _state = generic_midpoint_chain_attempt(h_eq, g_eq, hints, ordered_chain=True)
     return body
 
 
@@ -9114,8 +9185,12 @@ def hint_payload_attempt(
     *,
     capability_mask: Any = None,
 ) -> tuple[str | None, dict[str, Any]]:
+    ordered_chain = payload.get("_ordered_chain")
+    if ordered_chain is None:
+        action_kind = payload.get("tool") if payload.get("kind") == "tool_call" else payload.get("kind")
+        ordered_chain = action_kind in {"midpoint_chain", "lemma_chain"}
     hints = parse_universal_equations(payload)
-    if not payload.get("_variants_expanded"):
+    if not payload.get("_variants_expanded") and not ordered_chain:
         hints = expand_hint_variants(hints, g_eq)
     hints = ordered_hints_for_payload(payload, hints, g_eq)
     body, state = generic_midpoint_chain_attempt(
@@ -9124,6 +9199,7 @@ def hint_payload_attempt(
         hints,
         budget_policy=payload.get("budget_policy"),
         total_budget=payload.get("budget") or payload.get("time_budget"),
+        ordered_chain=bool(ordered_chain),
     )
     if body:
         return body, state
@@ -9918,6 +9994,7 @@ def helper_chain_portfolio_attempt(
             hints,
             budget_policy=raw_policy,
             total_budget=attempt_budget,
+            ordered_chain=True,
         )
         attempts.append({
             "chain": spec["name"],
@@ -10363,6 +10440,8 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["proj_l","proj_r"],"budget":10}',
         "If H has repeated self-absorption form x = T[x,x,...], use a short concrete lemma_chain of absorption/contraction bridges instead of repeating the whole goal as one midpoint:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"absorb_step","equation":"<fill from closest_pairs>"},{"name":"goal_bridge","equation":"<fill from the remaining gap>"}]}',
+        "Collapse repair: if a = b times out but the proof-carrying frontier reaches a = a ◇ a, use the ordered ladder idempotence, left projection, then collapse:",
+        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"idempotence","equation":"a = a ◇ a"},{"name":"proj_l","equation":"a ◇ b = a"},{"name":"collapse","equation":"a = b"}]}',
         "Repair example: for right-square absorption, do not stop after one helper; use the two-lemma chain:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
         "Repair example: for square-sandwich hypotheses, square_const/right_id alone may be proved_not_consumed; add sandwich helpers:",
@@ -11675,6 +11754,29 @@ def feedback_json(feedback: list[dict[str, Any]]) -> str:
     return json.dumps(fallback, ensure_ascii=False)
 
 
+def latest_midpoint_recommendation(feedback: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def find(value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            action = value.get("recommended_next_action")
+            if isinstance(action, dict) and action.get("kind") == "midpoint":
+                return action
+            for child in value.values():
+                found = find(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find(child)
+                if found:
+                    return found
+        return None
+    for state in reversed(feedback):
+        found = find(state)
+        if found:
+            return found
+    return None
+
+
 def llm_context(
     h_eq: dict[str, Any],
     g_eq: dict[str, Any],
@@ -11746,11 +11848,20 @@ def llm_context(
             "and a concrete refutation of G. After rejection, patch only failed_parts."
         )
     else:
-        symbolic_advice = tool_advice(
-            h_eq,
-            g_eq,
-            prefer_false=advice_prefer_false,
-        )
+        frontier_action = latest_midpoint_recommendation(mechanical_feedback)
+        if frontier_action and not advice_prefer_false:
+            symbolic_advice = {
+                "kind": "proof_carrying_frontier_recommendation",
+                "recommended_next_action": frontier_action,
+                "instruction": "Use this mechanically reached equation as the first rung of an ordered lemma_chain; do not repeat the failed direct tool call.",
+            }
+            phase_directive += " Follow the proof-carrying frontier recommendation before generic tool advice. Later chain rungs may use every earlier proved lemma."
+        else:
+            symbolic_advice = tool_advice(
+                h_eq,
+                g_eq,
+                prefer_false=advice_prefer_false,
+            )
         cards_for_prompt = strategy_cards_text(
             h_eq,
             g_eq,
