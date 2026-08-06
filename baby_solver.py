@@ -10433,15 +10433,16 @@ def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
         '{"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"derived opconst-like bridge was not refuted and would consume row/product goals"}',
         "Repair example: if rowconst `a ◇ b = a ◇ c` is proved but not consumed, add a non-refuted follow-up helper rather than repeating rowconst alone:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"rowconst","equation":"a ◇ b = a ◇ c"},{"name":"right_contract","equation":"a ◇ ((b ◇ c) ◇ d) = a ◇ b"}]}',
-        "Repair example: if one projection is proved but not consumed, add the opposite projection in the same lemma_chain:",
-        '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"proj_l","equation":"a ◇ b = a"},{"name":"proj_r","equation":"a ◇ b = b"}]}',
-        "Projection warning: a proved closest-pair midpoint can still be too goal-specific; if projection-shaped feedback is visible, prefer the reusable projection pair.",
+        "Dependency warning: proj_l and proj_r are normally competing alternatives, not consecutive rungs. Put independent alternatives in candidate_bundle; use lemma_chain only when each later lemma plausibly follows using earlier proved lemmas.",
+        '{"kind":"candidate_bundle","candidates":[{"lemma":"a ◇ b = a"},{"lemma":"a ◇ b = b"}],"why":"rank alternative projection families; do not spend one ordered chain on incompatible branches"}',
+        "Projection warning: a proved closest-pair midpoint can still be too goal-specific; if projection-shaped feedback is visible, test reusable projection alternatives separately.",
         "If feedback says a projection aux was proved but not consumed, ask standard_aux_superposition for the opposite projection too:",
         '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["proj_l","proj_r"],"budget":10}',
         "If H has repeated self-absorption form x = T[x,x,...], use a short concrete lemma_chain of absorption/contraction bridges instead of repeating the whole goal as one midpoint:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"absorb_step","equation":"<fill from closest_pairs>"},{"name":"goal_bridge","equation":"<fill from the remaining gap>"}]}',
-        "Collapse repair: if a = b times out but the proof-carrying frontier reaches a = a ◇ a, use the ordered ladder idempotence, left projection, then collapse:",
+        "Negative-to-repair example: a large literal frontier followed by proj_l and proj_r is a bad ordered chain: the large first rung can consume the budget, and the two projections are alternatives. Abstract the frontier first. If a = b times out but the proof-carrying evidence reaches idempotence, use the dependency ladder idempotence, one supported projection, then collapse:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"idempotence","equation":"a = a ◇ a"},{"name":"proj_l","equation":"a ◇ b = a"},{"name":"collapse","equation":"a = b"}]}',
+        "If the frontier does not support collapse, strip its repeated outer context and propose a small absorption, factor-irrelevance, or contraction law. Never repeat a large unproved_with_budget frontier unchanged.",
         "Repair example: for right-square absorption, do not stop after one helper; use the two-lemma chain:",
         '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}',
         "Repair example: for square-sandwich hypotheses, square_const/right_id alone may be proved_not_consumed; add sandwich helpers:",
@@ -11777,6 +11778,113 @@ def latest_midpoint_recommendation(feedback: list[dict[str, Any]]) -> dict[str, 
     return None
 
 
+def frontier_prompt_advice(
+    action: dict[str, Any],
+    h_eq: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Turn a proof frontier into either an exact rung or abstraction evidence."""
+    lemma = str(action.get("lemma") or "").strip()
+    equation: dict[str, Any] | None = None
+    try:
+        equation = parse_equation(lemma)
+        node_count = term_size(equation["lhs"]) + term_size(equation["rhs"])
+    except (TypeError, ValueError):
+        node_count = 999
+    idempotence_frontier = False
+    if equation is not None:
+        for variable_side, product_side in (
+            (equation["lhs"], equation["rhs"]),
+            (equation["rhs"], equation["lhs"]),
+        ):
+            if (
+                variable_side[0] == "var"
+                and product_side[0] == "op"
+                and product_side[1] == variable_side
+                and product_side[2] == variable_side
+            ):
+                idempotence_frontier = True
+                break
+    collapse_ladder = {
+        "kind": "tool_call",
+        "tool": "lemma_chain",
+        "target": "goal",
+        "lemmas": [
+            {"name": "idempotence", "equation": "a = a ◇ a"},
+            {"name": "proj_l", "equation": "a ◇ b = a"},
+            {"name": "collapse", "equation": "a = b"},
+        ],
+    }
+    large_frontier = node_count > 18 or len(lemma) > 120
+    if not large_frontier:
+        if idempotence_frontier and one_sided_variables(h_eq) and (
+            h_eq["lhs"][0] == "var" or h_eq["rhs"][0] == "var"
+        ):
+            return ({
+                "kind": "proof_carrying_collapse_ladder_recommendation",
+                "frontier_evidence": action,
+                "recommended_next_action": collapse_ladder,
+                "instruction": (
+                    "Idempotence is a proved or mechanically reached first rung under "
+                    "a collapse-shaped hypothesis. Complete the dependency ladder: "
+                    "idempotence, one supported projection, then a = b. Do not stop after "
+                    "resubmitting proved-but-not-connected rungs; the final collapse is the "
+                    "new bridge that lets arbitrary goals close."
+                ),
+            }, (
+                " The compact frontier is idempotence in a collapse-shaped problem. Complete "
+                "the full idempotence-to-projection-to-collapse ladder. If earlier rungs are "
+                "already proved_but_not_connected, add a = b instead of repeating only them."
+            ))
+        return ({
+            "kind": "proof_carrying_frontier_recommendation",
+            "recommended_next_action": action,
+            "instruction": (
+                "Use this compact mechanically reached equation as the first rung "
+                "of an ordered lemma_chain; do not repeat the failed direct tool call."
+            ),
+        }, (
+            " Follow the compact proof-carrying frontier recommendation before generic "
+            "tool advice. Later chain rungs may use every earlier proved lemma."
+        ))
+
+    advice = {
+        "kind": "frontier_abstraction_recommendation",
+        "frontier_evidence": action,
+        "frontier_nodes": node_count,
+        "instruction": (
+            "This frontier is too large to copy as a midpoint. Treat it as evidence: "
+            "remove repeated contexts and propose the smallest reusable law or ordered "
+            "dependency ladder that explains the movement. Do not return the literal "
+            "frontier unchanged. An ordered chain contains dependencies, not competing "
+            "alternatives; put alternatives in candidate_bundle."
+        ),
+        "candidate_families": [
+            "idempotence or absorption",
+            "one projection direction",
+            "row/factor irrelevance",
+            "contraction after a shared context is removed",
+        ],
+    }
+    if one_sided_variables(h_eq) and (
+        h_eq["lhs"][0] == "var" or h_eq["rhs"][0] == "var"
+    ):
+        advice["conditional_repair"] = {
+            "trigger": (
+                "H has a lone-variable side and one-sided variables, so a collapse "
+                "ladder is structurally plausible. Try it only as an ordered proof plan; "
+                "the mechanical consumer will reject any unproved rung."
+            ),
+            "action": collapse_ladder,
+        }
+    directive = (
+        " The proof-carrying frontier is large: use it as structural evidence, not as "
+        "a mandatory literal first rung. Propose a smaller reusable law or dependency "
+        "ladder. Do not repeat an unchanged unproved_with_budget candidate. Do not place "
+        "incompatible alternatives such as both projections in one ordered chain."
+    )
+    return advice, directive
+
+
 def llm_context(
     h_eq: dict[str, Any],
     g_eq: dict[str, Any],
@@ -11850,12 +11958,11 @@ def llm_context(
     else:
         frontier_action = latest_midpoint_recommendation(mechanical_feedback)
         if frontier_action and not advice_prefer_false:
-            symbolic_advice = {
-                "kind": "proof_carrying_frontier_recommendation",
-                "recommended_next_action": frontier_action,
-                "instruction": "Use this mechanically reached equation as the first rung of an ordered lemma_chain; do not repeat the failed direct tool call.",
-            }
-            phase_directive += " Follow the proof-carrying frontier recommendation before generic tool advice. Later chain rungs may use every earlier proved lemma."
+            symbolic_advice, frontier_directive = frontier_prompt_advice(
+                frontier_action,
+                h_eq,
+            )
+            phase_directive += frontier_directive
         else:
             symbolic_advice = tool_advice(
                 h_eq,

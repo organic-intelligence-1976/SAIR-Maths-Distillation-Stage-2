@@ -1062,6 +1062,55 @@ def main() -> int:
         and bundle_state is not None
         and bundle_state.get("status") == "syntax_repaired"
     )
+    collapse_h = baby_solver.parse_equation(
+        "x = (y ◇ ((z ◇ w) ◇ y)) ◇ (x ◇ y)"
+    )
+    large_frontier = {
+        "kind": "midpoint",
+        "lemma": (
+            "((w ◇ ((x ◇ x) ◇ w)) ◇ (x ◇ w)) = "
+            "(((w ◇ ((x ◇ x) ◇ w)) ◇ ((y ◇ z) ◇ w)) ◇ "
+            "((y ◇ (z ◇ y)) ◇ w))"
+        ),
+    }
+    large_advice, large_directive = baby_solver.frontier_prompt_advice(
+        large_frontier,
+        collapse_h,
+    )
+    compact_frontier = {
+        "kind": "midpoint",
+        "lemma": "a ◇ (b ◇ c) = a ◇ b",
+    }
+    compact_advice, compact_directive = baby_solver.frontier_prompt_advice(
+        compact_frontier,
+        collapse_h,
+    )
+    idempotence_advice, idempotence_directive = baby_solver.frontier_prompt_advice(
+        {"kind": "midpoint", "lemma": "v0 = v0 ◇ v0"},
+        collapse_h,
+    )
+    checks["large_frontier_abstraction_policy"] = (
+        large_advice.get("kind") == "frontier_abstraction_recommendation"
+        and (large_advice.get("conditional_repair") or {}).get("action", {}).get("tool")
+        == "lemma_chain"
+        and "structural evidence" in large_directive
+        and compact_advice.get("kind") == "proof_carrying_frontier_recommendation"
+        and "compact" in compact_directive
+        and idempotence_advice.get("kind")
+        == "proof_carrying_collapse_ladder_recommendation"
+        and (
+            idempotence_advice.get("recommended_next_action", {}).get("lemmas", [])[-1].get("equation")
+            == "a = b"
+        )
+        and "proved_but_not_connected" in idempotence_directive
+    )
+    fewshots = baby_solver.sidecar_fewshots(collapse_h)
+    checks["frontier_repair_fewshot_contract"] = (
+        "large literal frontier" in fewshots
+        and "competing alternatives" in fewshots
+        and "idempotence" in fewshots
+        and "Never repeat a large unproved_with_budget frontier unchanged" in fewshots
+    )
     h0202 = baby_solver.parse_equation(
         "x = (x ◇ (y ◇ z)) ◇ (y ◇ w)"
     )

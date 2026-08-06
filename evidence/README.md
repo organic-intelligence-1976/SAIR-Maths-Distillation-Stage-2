@@ -18,6 +18,9 @@ consumption result, and Lean judge outcome.
 - `case_study_hard3_0202_repair.md`: real false-route/over-strong-lemma
   failure trajectory repaired into a contraction midpoint, plus a reproducible
   normalization probe that accepts a specialized version of the same idea.
+- `case_study_evaluation_order5_0006_frontier_abstraction.md`: a provider-stable
+  true-side repair where a large literal frontier is abstracted into an ordered
+  idempotence, projection, and collapse ladder accepted by Lean.
 - `case_study_hard1_0009_false.md`: end-to-end false-side route-selection case.
 - `case_study_structured_infinite_repair.md`: structured infinite-model
   assembly, exact Lean repair feedback, and load-bearing teacher-to-student
