@@ -445,6 +445,39 @@ def main() -> int:
         and renewed_state is not None
         and renewed_state.get("status") == "budget_repaired"
     )
+    collapse_retry_h = baby_solver.parse_equation(
+        "x = (y ◇ ((z ◇ w) ◇ y)) ◇ (x ◇ y)"
+    )
+    collapse_retry_action, collapse_retry_state = (
+        baby_solver.feedback_driven_aux_retry_action(
+            collapse_retry_h,
+            {
+                "kind": "StandardAuxSuperpositionState",
+                "status": "stuck",
+                "attempts": [{
+                    "kind": "const",
+                    "status": "budget_starved",
+                    "attempt_budget": 8,
+                    "proof_state": {
+                        "need_hint": {
+                            "recommended_next_action": {
+                                "kind": "midpoint",
+                                "lemma": "v0 = v0 ◇ v0",
+                            },
+                        },
+                    },
+                }],
+            },
+            100,
+        )
+    )
+    checks["proof_frontier_renews_starved_aux"] = (
+        collapse_retry_action is not None
+        and collapse_retry_action.get("lemmas") == ["const"]
+        and collapse_retry_action.get("budget") == 16
+        and collapse_retry_state is not None
+        and collapse_retry_state.get("status") == "frontier_supported_retry"
+    )
     family_h = baby_solver.parse_equation("x ◇ y = x")
     family_g = baby_solver.parse_equation("x ◇ y = y")
     family_action, family_adapter = baby_solver.normalize_llm_action({

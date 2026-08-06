@@ -65,3 +65,19 @@ mismatches.
 
 The result is therefore a collaboration gain, not a replacement of prior
 mechanical coverage.
+
+## Distillation Follow-up
+
+A later playground run exposed a provider-availability failure: the solver
+stopped after a rejected 48-instance `HAVE+GRIND` probe and never reached the
+accepted LLM chain above. The early auxiliary scout had already reported a
+more useful fact, however: its attempt to prove universal collapse was
+budget-starved after reaching a proof-carrying idempotence frontier.
+
+The production scheduler now preserves that state. When a collapse-shaped
+hypothesis produces this compact frontier, it retries only the starved helper
+with a bounded renewed budget. The trigger is structural and contains no
+problem identifier or exact equation. On this case the distilled route proves
+universal collapse and obtains an accepted certificate in 23.4 seconds with
+one judge call and no LLM call. The trajectory above remains the discovery
+evidence; the new route is the recurring discovery hardened into System 1.
