@@ -6437,13 +6437,33 @@ def pc_saturate(
     max_eqs: int = 900,
     max_size: int = 20,
     time_budget: float | None = None,
+    cpu_budget: float | None = None,
     allow_var_overlap: bool = False,
 ) -> tuple[int | None, list[dict[str, Any]], dict[str, Any]]:
     deadline = (time.monotonic() + time_budget) if time_budget else None
+    cpu_deadline = (time.process_time() + cpu_budget) if cpu_budget else None
     counter = [0]
     recs: list[dict[str, Any]] = []
     seen: dict[tuple[str, str], int] = {}
-    meta = {"rounds": 0, "stop_reason": "saturated", "max_rounds": max_rounds, "max_eqs": max_eqs, "max_size": max_size}
+    meta = {
+        "rounds": 0,
+        "stop_reason": "saturated",
+        "max_rounds": max_rounds,
+        "max_eqs": max_eqs,
+        "max_size": max_size,
+        "budget_clock": "cpu_with_wall_cap" if cpu_deadline is not None else "wall",
+    }
+
+    def budget_exhausted() -> bool:
+        if deadline is not None and time.monotonic() > deadline:
+            meta["stop_reason"] = "time_budget"
+            meta["limit_clock"] = "wall"
+            return True
+        if cpu_deadline is not None and time.process_time() > cpu_deadline:
+            meta["stop_reason"] = "time_budget"
+            meta["limit_clock"] = "cpu"
+            return True
+        return False
 
     def add(l: Term, r: Term, binders: list[str], deriv, base=None) -> int | None:
         cl, cr = pc_canon(l, r)
@@ -6468,10 +6488,11 @@ def pc_saturate(
         added = False
         ids = list(range(len(recs)))
         for i in ids:
-            if deadline is not None and time.monotonic() > deadline:
-                meta["stop_reason"] = "time_budget"
+            if budget_exhausted():
                 return None, recs, meta
             for j in ids:
+                if budget_exhausted():
+                    return None, recs, meta
                 for rl, rr, binders, args_a, args_b, proof_info in pc_paramodulants(
                     recs[i],
                     recs[j],
@@ -7663,6 +7684,22 @@ RIGIDITY_COLLAPSE_LADDER: tuple[tuple[str, str, float], ...] = (
     ("carrier_collapse", "x = y", 12.0),
 )
 
+RIGIDITY_COLLAPSE_FAMILIES: tuple[dict[str, Any], ...] = (
+    {
+        "name": "square_collapse_ladder",
+        "entry_equation": RIGIDITY_COLLAPSE_LADDER[0][1],
+        "entry_cpu_budget": 4.0,
+        "continuation": "ordered_lemma_ladder",
+    },
+    {
+        "name": "auxiliary_total_collapse",
+        "entry_equation": "a = b",
+        "entry_cpu_budget": 4.0,
+        "renewal_cpu_budget": 16.0,
+        "continuation": "frontier_supported_superposition",
+    },
+)
+
 
 def compact_proof_state(state: dict[str, Any] | None) -> dict[str, Any]:
     source = state if isinstance(state, dict) else {}
@@ -7695,6 +7732,8 @@ def rigidity_collapse_ladder_attempt(
     started = time.monotonic()
     cpu_started = time.process_time()
     deadline = started + max(1.0, total_budget)
+    cpu_budgeted = bool(call.get("cpu_budgeted"))
+    seeded_entry = call.get("_seeded_entry")
     assumptions: list[UniversalEquation] = []
     declarations: list[str] = []
     attempts: list[dict[str, Any]] = []
@@ -7723,18 +7762,33 @@ def rigidity_collapse_ladder_attempt(
             )
         equation = parse_equation(equation_text)
         rung_started = time.monotonic()
-        proof_body, proof_state = prove_with_assumptions_detailed(
-            h_eq,
-            equation,
-            assumptions,
-            superposition_budget=min(preferred_budget, max(0.5, remaining)),
-        )
+        if (
+            index == 1
+            and isinstance(seeded_entry, dict)
+            and seeded_entry.get("equation") == equation["text"]
+            and isinstance(seeded_entry.get("proof_body"), str)
+        ):
+            proof_body = seeded_entry["proof_body"]
+            proof_state = seeded_entry.get("proof_state") or {
+                "kind": "SeededCollapseRungState",
+                "status": "proved",
+            }
+        else:
+            proof_body, proof_state = prove_with_assumptions_detailed(
+                h_eq,
+                equation,
+                assumptions,
+                superposition_budget=min(preferred_budget, max(0.5, remaining)),
+                superposition_cpu_budgeted=cpu_budgeted,
+                superposition_wall_budget=remaining if cpu_budgeted else None,
+            )
         rung_state = {
             "index": index,
             "name": name,
             "equation": equation["text"],
             "status": "proved" if proof_body else "stuck",
             "elapsed_seconds": round(time.monotonic() - rung_started, 3),
+            "budget_clock": "cpu_with_wall_cap" if cpu_budgeted else "wall",
             "proof_state": compact_proof_state(proof_state),
         }
         attempts.append(rung_state)
@@ -8499,6 +8553,8 @@ def superposition_prove_detailed(
     *,
     budget: float = 6.0,
     allow_var_overlap: bool = False,
+    cpu_budgeted: bool = False,
+    wall_budget: float | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     assumptions = assumptions or []
     start = [(h_eq["lhs"], h_eq["rhs"])] + [(a.eq["lhs"], a.eq["rhs"]) for a in assumptions]
@@ -8510,18 +8566,28 @@ def superposition_prove_detailed(
         configs.append((5, 1400, 22))
     if budget >= 12.0:
         configs.append((6, 1800, 24))
-    deadline = time.monotonic() + max(1.0, budget)
+    wall_allowance = (
+        max(1.0, wall_budget)
+        if cpu_budgeted and wall_budget is not None
+        else (max(2.0, budget * 6.0) if cpu_budgeted else max(1.0, budget))
+    )
+    deadline = time.monotonic() + wall_allowance
+    cpu_deadline = time.process_time() + max(0.1, budget) if cpu_budgeted else None
     for max_rounds, max_eqs, max_size in configs:
         rem = deadline - time.monotonic()
-        if rem <= 0.25:
+        cpu_rem = (cpu_deadline - time.process_time()) if cpu_deadline is not None else None
+        if rem <= 0.25 or (cpu_rem is not None and cpu_rem <= 0.1):
             break
+        slice_budget = max(0.5, budget / 2)
+        slice_cpu = min(cpu_rem, slice_budget) if cpu_rem is not None else None
         tid, recs, meta = pc_saturate(
             start,
             lambda eq: pc_canon(eq[0], eq[1]) == target_sig,
             max_rounds=max_rounds,
             max_eqs=max_eqs,
             max_size=max_size,
-            time_budget=min(rem, max(0.5, budget / 2)),
+            time_budget=(rem if cpu_budgeted else min(rem, slice_budget)),
+            cpu_budget=slice_cpu,
             allow_var_overlap=allow_var_overlap,
         )
         if tid is not None:
@@ -8802,7 +8868,14 @@ def standard_aux_superposition_attempt(
         remainder = [kind for kind in kinds if kind not in preferred]
         kinds = preferred + remainder
     total_budget = float(call.get("budget") or call.get("time_budget") or 10.0)
-    deadline = time.monotonic() + max(1.0, total_budget)
+    cpu_budgeted = bool(call.get("cpu_budgeted"))
+    wall_allowance = (
+        float(call.get("wall_budget"))
+        if cpu_budgeted and call.get("wall_budget") is not None
+        else (max(2.0, total_budget * 6.0) if cpu_budgeted else total_budget)
+    )
+    deadline = time.monotonic() + max(1.0, wall_allowance)
+    cpu_started = time.process_time()
     allow_overlap_fallback = bool(call.get("allow_var_overlap", True))
     attempts: list[dict[str, Any]] = []
     for idx, kind in enumerate(kinds):
@@ -8828,21 +8901,45 @@ def standard_aux_superposition_attempt(
         focused_floor = 1.0
         if kind in implied_kinds:
             focused_floor = 8.0 if kind in {"proj_l", "proj_r"} else 5.0
-        attempt_budget = min(rem, max(1.0, rem / remaining, focused_floor))
+        if cpu_budgeted:
+            cpu_rem = max(0.0, total_budget - (time.process_time() - cpu_started))
+            if cpu_rem <= 0.1:
+                attempts.append({
+                    "kind": kind,
+                    "status": "skipped_budget_exhausted",
+                    "equation": eq["text"],
+                    "budget_clock": "cpu_with_wall_cap",
+                })
+                continue
+            attempt_budget = min(
+                cpu_rem,
+                max(1.0, cpu_rem / remaining, focused_floor),
+            )
+        else:
+            attempt_budget = min(rem, max(1.0, rem / remaining, focused_floor))
         proof_body, proof_state = superposition_prove_detailed(
             h_eq,
             eq,
             budget=attempt_budget,
             allow_var_overlap=False,
+            cpu_budgeted=cpu_budgeted,
+            wall_budget=rem if cpu_budgeted else None,
         )
         if proof_body is None and allow_overlap_fallback:
             overlap_rem = deadline - time.monotonic()
-            if overlap_rem > 0.75:
+            overlap_cpu_rem = max(0.0, total_budget - (time.process_time() - cpu_started))
+            if overlap_rem > 0.75 and (not cpu_budgeted or overlap_cpu_rem > 0.25):
+                overlap_budget = min(
+                    overlap_cpu_rem if cpu_budgeted else overlap_rem,
+                    max(1.0, attempt_budget * 0.5),
+                )
                 overlap_body, overlap_state = superposition_prove_detailed(
                     h_eq,
                     eq,
-                    budget=min(overlap_rem, max(1.0, attempt_budget * 0.5)),
+                    budget=overlap_budget,
                     allow_var_overlap=True,
+                    cpu_budgeted=cpu_budgeted,
+                    wall_budget=overlap_rem if cpu_budgeted else None,
                 )
                 if isinstance(proof_state, dict):
                     proof_state = dict(proof_state)
@@ -8869,6 +8966,7 @@ def standard_aux_superposition_attempt(
                 "status": "budget_starved" if budget_starved else "not_proved",
                 "equation": eq["text"],
                 "attempt_budget": round(attempt_budget, 3),
+                "budget_clock": "cpu_with_wall_cap" if cpu_budgeted else "wall",
                 "implied_by_scout": kind in implied_kinds,
                 "proof_state": proof_state,
             })
@@ -8889,6 +8987,7 @@ def standard_aux_superposition_attempt(
             "status": "grounded_candidate_built" if grounded_tail else ("proved" if built_tail else "proved_not_consumed"),
             "equation": eq["text"],
             "attempt_budget": round(attempt_budget, 3),
+            "budget_clock": "cpu_with_wall_cap" if cpu_budgeted else "wall",
             "implied_by_scout": kind in implied_kinds,
             "proof_state": proof_state,
             "consume_state": consume_state,
@@ -8944,6 +9043,169 @@ def standard_aux_superposition_attempt(
             "next_action": "Propose a custom midpoint/lemma_chain or try a different tool.",
         },
     }
+
+
+def rigidity_collapse_portfolio_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Triage generic collapse families, then fund only supported continuations."""
+    call = call or {}
+    total_wall_budget = float(call.get("budget") or call.get("time_budget") or 60.0)
+    started = time.monotonic()
+    cpu_started = time.process_time()
+    deadline = started + max(1.0, total_wall_budget)
+    family_states: list[dict[str, Any]] = []
+    ranked: list[tuple[int, str]] = []
+    seeded_square: dict[str, Any] | None = None
+    aux_entry_state: dict[str, Any] | None = None
+
+    square_spec, aux_spec = RIGIDITY_COLLAPSE_FAMILIES
+    square_eq = parse_equation(str(square_spec["entry_equation"]))
+    remaining = deadline - time.monotonic()
+    if remaining > 1.0:
+        entry_started = time.monotonic()
+        square_body, square_state = prove_with_assumptions_detailed(
+            h_eq,
+            square_eq,
+            superposition_budget=float(square_spec["entry_cpu_budget"]),
+            superposition_cpu_budgeted=True,
+            superposition_wall_budget=remaining,
+        )
+        square_row = {
+            "family": square_spec["name"],
+            "entry_equation": square_eq["text"],
+            "entry_status": "proved" if square_body else "stuck",
+            "entry_elapsed_seconds": round(time.monotonic() - entry_started, 3),
+            "entry_state": compact_proof_state(square_state),
+        }
+        family_states.append(square_row)
+        if square_body:
+            ranked.append((3, str(square_spec["name"])))
+            seeded_square = {
+                "equation": square_eq["text"],
+                "proof_body": square_body,
+                "proof_state": square_state,
+            }
+
+    remaining = deadline - time.monotonic()
+    if remaining > 1.0:
+        entry_started = time.monotonic()
+        aux_body, aux_entry_state = standard_aux_superposition_attempt(
+            h_eq,
+            g_eq,
+            {
+                "lemmas": ["const"],
+                "budget": float(aux_spec["entry_cpu_budget"]),
+                "wall_budget": remaining,
+                "cpu_budgeted": True,
+            },
+        )
+        frontier = latest_midpoint_recommendation([aux_entry_state])
+        frontier_advice = None
+        if frontier is not None:
+            frontier_advice, _directive = frontier_prompt_advice(frontier, h_eq)
+        frontier_supported = bool(
+            isinstance(frontier_advice, dict)
+            and frontier_advice.get("kind")
+            == "proof_carrying_collapse_ladder_recommendation"
+        )
+        aux_row = {
+            "family": aux_spec["name"],
+            "entry_equation": aux_spec["entry_equation"],
+            "entry_status": "proved" if aux_body else (
+                "frontier_supported" if frontier_supported else "stuck"
+            ),
+            "entry_elapsed_seconds": round(time.monotonic() - entry_started, 3),
+            "entry_state": compact_proof_state(aux_entry_state),
+            "frontier_advice": frontier_advice,
+        }
+        family_states.append(aux_row)
+        if aux_body:
+            return aux_body, protocol_state(
+                "RigidityCollapsePortfolioState",
+                "body_built",
+                "rigidity_collapse_portfolio",
+                winning_family=aux_spec["name"],
+                family_states=family_states,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                cpu_seconds=round(time.process_time() - cpu_started, 3),
+            )
+        if frontier_supported:
+            ranked.append((2, str(aux_spec["name"])))
+
+    ranked.sort(reverse=True)
+    continuation_states: list[dict[str, Any]] = []
+    for _score, family_name in ranked:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            break
+        if family_name == square_spec["name"] and seeded_square is not None:
+            body, state = rigidity_collapse_ladder_attempt(
+                h_eq,
+                g_eq,
+                {
+                    "budget": remaining,
+                    "cpu_budgeted": True,
+                    "_seeded_entry": seeded_square,
+                },
+            )
+        elif family_name == aux_spec["name"] and aux_entry_state is not None:
+            body, state = standard_aux_superposition_attempt(
+                h_eq,
+                g_eq,
+                {
+                    "lemmas": ["const"],
+                    "budget": float(aux_spec["renewal_cpu_budget"]),
+                    "wall_budget": remaining,
+                    "cpu_budgeted": True,
+                },
+            )
+        else:
+            continue
+        continuation_states.append({
+            "family": family_name,
+            "status": "body_built" if body else "stuck",
+            "state": state,
+        })
+        if body:
+            return body, protocol_state(
+                "RigidityCollapsePortfolioState",
+                "body_built",
+                "rigidity_collapse_portfolio",
+                winning_family=family_name,
+                family_states=family_states,
+                continuations=continuation_states,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                cpu_seconds=round(time.process_time() - cpu_started, 3),
+                trust_boundary=(
+                    "The no-small-model signal only schedules the portfolio; the "
+                    "winning collapse family is fully represented in the Lean body."
+                ),
+            )
+
+    return None, protocol_state(
+        "RigidityCollapsePortfolioState",
+        "stuck",
+        "rigidity_collapse_portfolio",
+        family_states=family_states,
+        ranked_families=[name for _score, name in ranked],
+        continuations=continuation_states,
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        cpu_seconds=round(time.process_time() - cpu_started, 3),
+        need_hint={
+            "kind": "collapse_portfolio_exhausted",
+            "reason": (
+                "No registered collapse family produced a complete proof-carrying "
+                "certificate within its CPU/work lease and the global wall cap."
+            ),
+            "next_action": (
+                "Propose a new first rung from the strongest family frontier; keep "
+                "proved rungs and do not infer truth from the rigidity signal."
+            ),
+        },
+    )
 
 
 def native_deep_true_candidates(
@@ -9011,6 +9273,8 @@ def prove_with_assumptions_detailed(
     *,
     extra_h_args: list[tuple[str, ...]] | None = None,
     superposition_budget: float = 5.0,
+    superposition_cpu_budgeted: bool = False,
+    superposition_wall_budget: float | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
     last_state: dict[str, Any] | None = None
     tiers = [
@@ -9048,6 +9312,8 @@ def prove_with_assumptions_detailed(
         target_eq,
         assumptions,
         budget=superposition_budget,
+        cpu_budgeted=superposition_cpu_budgeted,
+        wall_budget=superposition_wall_budget,
     )
     if pc_body is None and (assumptions or target_aux_shape(target_eq)):
         overlap_budget = max(1.0, min(3.0, superposition_budget / 3.0))
@@ -9057,6 +9323,8 @@ def prove_with_assumptions_detailed(
             assumptions,
             budget=overlap_budget,
             allow_var_overlap=True,
+            cpu_budgeted=superposition_cpu_budgeted,
+            wall_budget=superposition_wall_budget,
         )
     if pc_body:
         return pc_body, pc_state
@@ -10952,7 +11220,43 @@ def emit_attribution_attempt(route: str, verdict: str, *, source: str = "baby_so
     print("ATTRIBUTION " + json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
 
 
+def resource_heavy_grind_probe(route: str, body: str) -> dict[str, Any] | None:
+    """Keep broad HAVE+GRIND outputs as discovery data, not judge candidates."""
+    route_name = route.lower()
+    if "grind" not in body or not any(
+        family in route_name for family in ("deep_saturation", "old_haves_grind")
+    ):
+        return None
+    instance_count = len(re.findall(r"(?m)^\s*have\s+(?:sat|h)\d+\s*:?=", body))
+    if instance_count < 40:
+        return None
+    return {
+        "reason": "resource_heavy_grind_probe",
+        "instance_count": instance_count,
+        "policy": (
+            "Broad 40-plus-instance grind bodies may guide structured proof search "
+            "but are not submitted to the judge."
+        ),
+    }
+
+
 def judge_true_attributed(route: str, body: str, *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    skipped = resource_heavy_grind_probe(route, body)
+    if skipped is not None:
+        payload = {
+            "protocol_version": PROTOCOL_VERSION,
+            "event": "judge_candidate_skipped",
+            "route": route,
+            "verdict": "true",
+            "source": source,
+            "detail": {**(detail or {}), **skipped},
+        }
+        print(
+            "ATTRIBUTION " + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"status": "skipped", **skipped}
     emit_attribution_attempt(route, "true", source=source, detail=detail)
     return call_judge("true", make_true_code(body))
 
@@ -12105,6 +12409,7 @@ def frontier_prompt_advice(
     except (TypeError, ValueError):
         node_count = 999
     idempotence_frontier = False
+    self_embedding_frontier = False
     if equation is not None:
         for variable_side, product_side in (
             (equation["lhs"], equation["rhs"]),
@@ -12118,6 +12423,13 @@ def frontier_prompt_advice(
             ):
                 idempotence_frontier = True
                 break
+            if (
+                variable_side[0] == "var"
+                and product_side[0] == "op"
+                and product_side[1] == variable_side
+                and variable_side[1] in pc_vars_of(product_side[2])
+            ):
+                self_embedding_frontier = True
     collapse_ladder = {
         "kind": "tool_call",
         "tool": "lemma_chain",
@@ -12130,22 +12442,25 @@ def frontier_prompt_advice(
     }
     large_frontier = node_count > 18 or len(lemma) > 120
     if not large_frontier:
-        if idempotence_frontier and one_sided_variables(h_eq) and (
+        if (idempotence_frontier or self_embedding_frontier) and one_sided_variables(h_eq) and (
             h_eq["lhs"][0] == "var" or h_eq["rhs"][0] == "var"
         ):
             return ({
                 "kind": "proof_carrying_collapse_ladder_recommendation",
                 "frontier_evidence": action,
+                "frontier_shape": (
+                    "idempotence" if idempotence_frontier else "self_embedding_absorption"
+                ),
                 "recommended_next_action": collapse_ladder,
                 "instruction": (
-                    "Idempotence is a proved or mechanically reached first rung under "
-                    "a collapse-shaped hypothesis. Complete the dependency ladder: "
+                    "A compact self-embedding absorption law is a mechanically reached "
+                    "first rung under a collapse-shaped hypothesis. Complete the dependency ladder: "
                     "idempotence, one supported projection, then a = b. Do not stop after "
                     "resubmitting proved-but-not-connected rungs; the final collapse is the "
                     "new bridge that lets arbitrary goals close."
                 ),
             }, (
-                " The compact frontier is idempotence in a collapse-shaped problem. Complete "
+                " The compact frontier is self-embedding absorption in a collapse-shaped problem. Complete "
                 "the full idempotence-to-projection-to-collapse ladder. If earlier rungs are "
                 "already proved_but_not_connected, add a = b instead of repeating only them."
             ))
@@ -13284,36 +13599,36 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         remaining = max(0.0, budget - (time.monotonic() - solve_started))
         if remaining >= 20.0:
             collapse_budget = min(
-                45.0,
+                180.0,
                 remaining,
-                max(26.0, remaining * 0.08),
+                max(40.0, remaining * 0.30),
             )
-            collapse_body, collapse_state = rigidity_collapse_ladder_attempt(
+            collapse_body, collapse_state = rigidity_collapse_portfolio_attempt(
                 h_eq,
                 g_eq,
                 {"budget": collapse_budget},
             )
             if collapse_body:
                 result = judge_true_attributed(
-                    "native:true:rigidity_collapse_ladder",
+                    "native:true:rigidity_collapse_portfolio",
                     collapse_body,
                     source="native_rigidity_plan",
                     detail={
-                        "family": "dependency_aware_collapse",
+                        "family": collapse_state.get("winning_family"),
                         "small_model_signal": {
                             "complete_sizes": rigidity_state.get("complete_sizes"),
                             "models_seen": rigidity_state.get("models_seen"),
                             "routing_only": True,
                         },
-                        "proved_rungs": collapse_state.get("proved_rungs"),
+                        "portfolio_status": collapse_state.get("status"),
                     },
                 )
                 if result.get("status") == "accepted":
-                    return "accepted_true_rigidity_collapse_ladder"
+                    return "accepted_true_rigidity_collapse_portfolio"
                 collapse_state = protocol_state(
-                    "RigidityCollapsePlanState",
+                    "RigidityCollapsePortfolioState",
                     "judge_rejected",
-                    "rigidity_collapse_ladder",
+                    "rigidity_collapse_portfolio",
                     plan_state=collapse_state,
                     judge_diagnostic=compact_judge_diagnostic(result, 1000),
                     need_hint=(

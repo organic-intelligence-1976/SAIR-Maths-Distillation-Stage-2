@@ -75,6 +75,29 @@ time, then committed broker budget. Held-out families and repeated seeds are
 still required before calling a policy better; the scoreboard is selection
 machinery, not statistical evidence by itself.
 
+## Packed rigidity portfolio
+
+The packed submission now applies the same renewable-grant principle when an
+exhaustive size-2-through-4 scan finds no nontrivial model of the hypothesis.
+That scan remains routing evidence only. The scheduler probes one entry rung
+from each registered collapse family, ranks a proved entry above a compact
+proof-carrying frontier, and renews only supported continuations. Every winning
+route still emits the full Lean proof.
+
+These in-process superposition grants are charged against CPU time and bounded
+again by the problem's remaining wall-clock deadline. This prevents host load
+from shrinking a four-second search into a much smaller amount of mathematical
+work while preserving a hard real-time ceiling. Resource-heavy 40-plus-instance
+`HAVE+GRIND` bodies remain useful discovery telemetry, but are not sent to the
+judge unless converted into a structured certificate.
+
+Capability checks on 2026-08-06:
+
+- both known collapse families certify at a 60-second advertised budget with
+  zero LLM calls and one judge call;
+- both still certify while six independent CPU burners run concurrently;
+- the 20-case true/false risk set certifies 20/20 with no verdict mismatch.
+
 ## Current limitations
 
 - A grant controls the bounded superposition portion of a worker, while some

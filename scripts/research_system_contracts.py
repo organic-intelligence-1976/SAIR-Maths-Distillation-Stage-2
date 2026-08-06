@@ -105,6 +105,17 @@ def main() -> int:
         and nonrigid_signal.get("status") == "nontrivial_model_found"
         and nonrigid_signal.get("model_size") == 2
     )
+    checks["rigidity_collapse_family_portfolio"] = (
+        [
+            family.get("name")
+            for family in baby_solver.RIGIDITY_COLLAPSE_FAMILIES
+        ]
+        == ["square_collapse_ladder", "auxiliary_total_collapse"]
+        and all(
+            float(family.get("entry_cpu_budget", 0)) > 0
+            for family in baby_solver.RIGIDITY_COLLAPSE_FAMILIES
+        )
+    )
     false_rigid_h = baby_solver.parse_equation(
         "x = y ◇ (((x ◇ y) ◇ x) ◇ y)"
     )
@@ -128,6 +139,30 @@ def main() -> int:
         and false_collapse_state.get("status") == "blocked"
         and (false_collapse_state.get("blocked_rung") or {}).get("name")
         == "square_overlap_bridge"
+    )
+    false_portfolio_body, false_portfolio_state = (
+        baby_solver.rigidity_collapse_portfolio_attempt(
+            false_rigid_h,
+            false_rigid_g,
+            {"budget": 1.0},
+        )
+    )
+    checks["rigidity_portfolio_cannot_certify_false_positive"] = (
+        false_portfolio_body is None
+        and false_portfolio_state.get("status") == "stuck"
+        and false_portfolio_state.get("source") == "rigidity_collapse_portfolio"
+    )
+    grind_48 = "\n".join(
+        ["intro x", *[f"have h{i} := h x" for i in range(1, 49)], "grind"]
+    )
+    grind_24 = "\n".join(
+        ["intro x", *[f"have h{i} := h x" for i in range(1, 25)], "grind"]
+    )
+    checks["resource_heavy_grind_is_discovery_only"] = (
+        baby_solver.resource_heavy_grind_probe("old_haves_grind_48", grind_48)
+        is not None
+        and baby_solver.resource_heavy_grind_probe("old_haves_grind_24", grind_24)
+        is None
     )
     replacement_h = baby_solver.parse_equation("(x ◇ y) = (z ◇ x)")
     replacement_g = baby_solver.parse_equation("(a ◇ b) = (c ◇ a)")
