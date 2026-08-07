@@ -98,6 +98,42 @@ Capability checks on 2026-08-06:
 - both still certify while six independent CPU burners run concurrently;
 - the 20-case true/false risk set certifies 20/20 with no verdict mismatch.
 
+## Robustness experiments
+
+These changes are staged conservatively. The larger search ceilings and fully
+resumable work ledger remain hypotheses; the scheduling-only changes are now
+implemented.
+
+1. **Raise thin collapse ceilings.** Test auxiliary-collapse renewal at 48
+   rather than 16 CPU seconds and the square-equality rung at 60 rather than 22.
+   Successful searches return immediately, so the expected fast-path cost is
+   unchanged. The risk is opportunity cost on a misleading rigidity/frontier
+   signal. Keep a hard wall deadline and reserve time for later routes.
+2. **Configuration availability is budget-independent (implemented).**
+   Register every superposition depth/size tier regardless of the requested
+   budget; let the cumulative CPU/work lease decide how far the search reaches.
+   Before starting a larger tier, require a small residual-work quantum and
+   preserve the outer wall reserve. This should prevent a slow host from losing
+   a whole tier at a numeric budget threshold, but may spend budget that a
+   shallow saturation previously returned unused.
+3. **Strengthen the rigidity gate (implemented, CPU-led interim).** The
+   complete size-2-through-4 scout now receives a CPU allowance plus a separate
+   wall safety cap, so ordinary host contention is less likely to suppress the
+   entire collapse portfolio. A future work-unit ledger remains preferable.
+4. **Prefer resumable tier growth.** The current tiers restart saturation. A
+   later experiment should preserve generated equations while widening limits;
+   otherwise larger ceilings buy robustness partly by repeating prior work.
+5. **Preserve outer recovery time (implemented).** The rigidity portfolio
+   receives its ordinary grant while a small remainder is kept for later native
+   and collaborative recovery routes whenever the total budget permits.
+6. **Deduplicate decisive judge failures (implemented).** An exact Lean body
+   rejected earlier in the same solve is not sent again. Timeouts and provider
+   failures are deliberately retryable.
+
+Acceptance requires both rigidity capability cases to pass in the playground,
+the 20-case risk set to remain 20/20, rigid false controls to remain
+uncertified by true routes, and judge/LLM call counts not to regress materially.
+
 ## Current limitations
 
 - A grant controls the bounded superposition portion of a worker, while some

@@ -91,7 +91,9 @@ def main() -> int:
     )
     rigidity_signal = baby_solver.small_model_rigidity_scout(
         rigid_h,
-        budget=0.5,
+        budget=3.0,
+        cpu_budget=0.5,
+        wall_budget=3.0,
     )
     nonrigid_signal = baby_solver.small_model_rigidity_scout(
         baby_solver.parse_equation("x = x"),
@@ -102,6 +104,7 @@ def main() -> int:
         and rigidity_signal.get("status") == "no_nontrivial_model_through"
         and rigidity_signal.get("complete_sizes") == [2, 3, 4]
         and rigidity_signal.get("routing_only") is True
+        and rigidity_signal.get("budget_clock") == "cpu_with_wall_cap"
         and nonrigid_signal.get("status") == "nontrivial_model_found"
         and nonrigid_signal.get("model_size") == 2
     )
@@ -164,6 +167,64 @@ def main() -> int:
         and baby_solver.resource_heavy_grind_probe("old_haves_grind_24", grind_24)
         is None
     )
+    captured_configs: list[tuple[int, int, int]] = []
+    original_pc_saturate = baby_solver.pc_saturate
+    try:
+        def capture_pc_saturate(_start, _target, **kwargs):
+            captured_configs.append((
+                int(kwargs["max_rounds"]),
+                int(kwargs["max_eqs"]),
+                int(kwargs["max_size"]),
+            ))
+            return None, [], {
+                "rounds": 0,
+                "stop_reason": "saturated",
+                "max_rounds": kwargs["max_rounds"],
+                "max_eqs": kwargs["max_eqs"],
+                "max_size": kwargs["max_size"],
+            }
+
+        baby_solver.pc_saturate = capture_pc_saturate
+        baby_solver.superposition_prove_detailed(
+            baby_solver.parse_equation("x = x"),
+            baby_solver.parse_equation("x = y"),
+            budget=1.0,
+        )
+    finally:
+        baby_solver.pc_saturate = original_pc_saturate
+    checks["superposition_tiers_do_not_depend_on_nominal_budget"] = (
+        captured_configs
+        == [(3, 360, 14), (4, 650, 16), (5, 900, 20), (5, 1400, 22), (6, 1800, 24)]
+    )
+
+    judge_calls: list[tuple[str, str]] = []
+    original_call_judge = baby_solver.call_judge
+    try:
+        baby_solver._DECISIVE_TRUE_JUDGE_REJECTIONS.clear()
+
+        def reject_judge(verdict: str, code: str):
+            judge_calls.append((verdict, code))
+            return {"status": "incorrect"}
+
+        baby_solver.call_judge = reject_judge
+        first_rejection = baby_solver.judge_true_attributed(
+            "contract:first", "intro x\nexact rfl"
+        )
+        duplicate_rejection = baby_solver.judge_true_attributed(
+            "contract:duplicate", "intro x\nexact rfl"
+        )
+    finally:
+        baby_solver.call_judge = original_call_judge
+        baby_solver._DECISIVE_TRUE_JUDGE_REJECTIONS.clear()
+    checks["decisive_judge_rejections_are_deduplicated_per_solve"] = (
+        first_rejection.get("status") == "incorrect"
+        and duplicate_rejection.get("status") == "skipped"
+        and len(judge_calls) == 1
+    )
+    checks["judge_timeout_is_retryable"] = not baby_solver.decisive_true_judge_rejection({
+        "status": "incorrect",
+        "stderr": "Lean process timed out",
+    })
     replacement_h = baby_solver.parse_equation("(x ◇ y) = (z ◇ x)")
     replacement_g = baby_solver.parse_equation("(a ◇ b) = (c ◇ a)")
     grounding_bodies = list(baby_solver.grounding_h_certificate_bodies(replacement_h, replacement_g))

@@ -139,6 +139,10 @@ def call_llm(context: dict[str, Any]) -> dict[str, Any]:
 
 PROTOCOL_VERSION = "sair-collab-protocol-v0"
 
+# Exact rejected bodies are not useful twice in one solve.  Keep this cache
+# deliberately per-problem and retain transient judge failures for retry.
+_DECISIVE_TRUE_JUDGE_REJECTIONS: set[str] = set()
+
 
 @dataclass(frozen=True)
 class ProtocolIssue:
@@ -1475,6 +1479,8 @@ def small_model_rigidity_scout(
     *,
     max_n: int = 4,
     budget: float = 0.6,
+    cpu_budget: float | None = None,
+    wall_budget: float | None = None,
     node_cap: int = 250_000,
     assignment_cap: int = 16_384,
 ) -> dict[str, Any]:
@@ -1485,10 +1491,17 @@ def small_model_rigidity_scout(
     """
     started = time.monotonic()
     cpu_started = time.process_time()
-    deadline = started + max(0.02, budget)
+    wall_allowance = max(0.02, wall_budget if wall_budget is not None else budget)
+    deadline = started + wall_allowance
+    cpu_deadline = (
+        cpu_started + max(0.02, cpu_budget)
+        if cpu_budget is not None
+        else None
+    )
     complete_sizes: list[int] = []
     size_attempts: list[dict[str, Any]] = []
     total_nodes = 0
+    limit_clock: str | None = None
 
     for n in range(2, max(2, max_n) + 1):
         assignment_count = n ** len(h_eq["variables"])
@@ -1507,6 +1520,8 @@ def small_model_rigidity_scout(
                 total_nodes=total_nodes,
                 elapsed_seconds=round(time.monotonic() - started, 4),
                 cpu_seconds=round(time.process_time() - cpu_started, 4),
+                budget_clock="cpu_with_wall_cap" if cpu_deadline is not None else "wall",
+                limit_clock=limit_clock,
                 routing_only=True,
                 need_hint=(
                     "The H-only scout skipped an oversized assignment space. Do "
@@ -1533,9 +1548,14 @@ def small_model_rigidity_scout(
             return None
 
         def search(table: list[list[int | None]]) -> list[list[int]] | None:
-            nonlocal nodes, total_nodes, stop_reason
+            nonlocal nodes, total_nodes, stop_reason, limit_clock
             if time.monotonic() >= deadline:
                 stop_reason = "time_budget"
+                limit_clock = "wall"
+                return None
+            if cpu_deadline is not None and time.process_time() >= cpu_deadline:
+                stop_reason = "time_budget"
+                limit_clock = "cpu"
                 return None
             if total_nodes >= node_cap:
                 stop_reason = "node_cap"
@@ -1578,6 +1598,8 @@ def small_model_rigidity_scout(
                 total_nodes=total_nodes,
                 elapsed_seconds=round(time.monotonic() - started, 4),
                 cpu_seconds=round(time.process_time() - cpu_started, 4),
+                budget_clock="cpu_with_wall_cap" if cpu_deadline is not None else "wall",
+                limit_clock=limit_clock,
                 routing_only=True,
             )
         if stop_reason != "exhausted":
@@ -1593,6 +1615,8 @@ def small_model_rigidity_scout(
                 total_nodes=total_nodes,
                 elapsed_seconds=round(time.monotonic() - started, 4),
                 cpu_seconds=round(time.process_time() - cpu_started, 4),
+                budget_clock="cpu_with_wall_cap" if cpu_deadline is not None else "wall",
+                limit_clock=limit_clock,
                 routing_only=True,
                 need_hint=(
                     "Small-model absence was not established. Do not infer rigidity "
@@ -1611,6 +1635,8 @@ def small_model_rigidity_scout(
         total_nodes=total_nodes,
         elapsed_seconds=round(time.monotonic() - started, 4),
         cpu_seconds=round(time.process_time() - cpu_started, 4),
+        budget_clock="cpu_with_wall_cap" if cpu_deadline is not None else "wall",
+        limit_clock=limit_clock,
         routing_only=True,
         trust_boundary=(
             "Absence at completed finite sizes changes search priority only; every "
@@ -8561,11 +8587,16 @@ def superposition_prove_detailed(
     base_names = ["h"] + [a.name for a in assumptions]
     target_sig = pc_canon(target_eq["lhs"], target_eq["rhs"])
     last_state: dict[str, Any] | None = None
-    configs = [(3, 360, 14), (4, 650, 16), (5, 900, 20)]
-    if budget >= 8.0 or assumptions:
-        configs.append((5, 1400, 22))
-    if budget >= 12.0:
-        configs.append((6, 1800, 24))
+    # Configuration availability is independent of the nominal time grant.
+    # The cumulative CPU/wall deadlines below still bound total work, while a
+    # cheap saturated tier may hand its unused allowance to the next tier.
+    configs = [
+        (3, 360, 14),
+        (4, 650, 16),
+        (5, 900, 20),
+        (5, 1400, 22),
+        (6, 1800, 24),
+    ]
     wall_allowance = (
         max(1.0, wall_budget)
         if cpu_budgeted and wall_budget is not None
@@ -11240,6 +11271,23 @@ def resource_heavy_grind_probe(route: str, body: str) -> dict[str, Any] | None:
     }
 
 
+def decisive_true_judge_rejection(result: dict[str, Any]) -> bool:
+    """Distinguish stable Lean rejection from retryable infrastructure limits."""
+    if result.get("status") not in {"incorrect", "rejected", "invalid"}:
+        return False
+    diagnostic = json.dumps(result, ensure_ascii=False).lower()
+    return not any(
+        marker in diagnostic
+        for marker in (
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "connection error",
+            "provider error",
+        )
+    )
+
+
 def judge_true_attributed(route: str, body: str, *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> dict[str, Any]:
     skipped = resource_heavy_grind_probe(route, body)
     if skipped is not None:
@@ -11257,8 +11305,31 @@ def judge_true_attributed(route: str, body: str, *, source: str = "baby_solver",
             flush=True,
         )
         return {"status": "skipped", **skipped}
+    code = make_true_code(body)
+    if code in _DECISIVE_TRUE_JUDGE_REJECTIONS:
+        payload = {
+            "protocol_version": PROTOCOL_VERSION,
+            "event": "judge_candidate_skipped",
+            "route": route,
+            "verdict": "true",
+            "source": source,
+            "detail": {
+                **(detail or {}),
+                "reason": "duplicate_decisive_rejection",
+                "policy": "Exact Lean bodies decisively rejected earlier in this solve are not resubmitted.",
+            },
+        }
+        print(
+            "ATTRIBUTION " + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"status": "skipped", "reason": "duplicate_decisive_rejection"}
     emit_attribution_attempt(route, "true", source=source, detail=detail)
-    return call_judge("true", make_true_code(body))
+    result = call_judge("true", code)
+    if decisive_true_judge_rejection(result):
+        _DECISIVE_TRUE_JUDGE_REJECTIONS.add(code)
+    return result
 
 
 def try_true_attributed(route: str, body: str, *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> bool:
@@ -13464,6 +13535,7 @@ def try_llm_collaboration(
 
 def solve(problem: dict[str, Any], budget: float) -> str:
     solve_started = time.monotonic()
+    _DECISIVE_TRUE_JUDGE_REJECTIONS.clear()
     try:
         h_eq = parse_equation(problem["equation1"])
         g_eq = parse_equation(problem["equation2"])
@@ -13563,10 +13635,14 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     # compare. Absence here is never verdict evidence: it can only prioritize
     # a proof-carrying collapse plan whose every rung is independently checked.
     if finite_countermodel_search_allowed(semantic_context):
+        scout_cpu_budget = min(0.75, max(0.12, budget * 0.002))
+        scout_wall_budget = min(4.0, max(1.0, scout_cpu_budget * 6.0))
         rigidity_state = small_model_rigidity_scout(
             h_eq,
             max_n=4,
-            budget=min(0.75, max(0.12, budget * 0.002)),
+            budget=scout_wall_budget,
+            cpu_budget=scout_cpu_budget,
+            wall_budget=scout_wall_budget,
         )
         if rigidity_state.get("status") == "no_nontrivial_model_through":
             early_true_feedback.append(rigidity_state)
@@ -13597,11 +13673,17 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         and rigidity_state.get("status") == "no_nontrivial_model_through"
     ):
         remaining = max(0.0, budget - (time.monotonic() - solve_started))
-        if remaining >= 20.0:
+        desired_reserve = min(60.0, max(8.0, budget * 0.10))
+        outer_recovery_reserve = min(
+            desired_reserve,
+            max(0.0, remaining - 40.0),
+        )
+        portfolio_available = max(0.0, remaining - outer_recovery_reserve)
+        if portfolio_available >= 20.0:
             collapse_budget = min(
                 180.0,
-                remaining,
-                max(40.0, remaining * 0.30),
+                portfolio_available,
+                max(40.0, portfolio_available * 0.30),
             )
             collapse_body, collapse_state = rigidity_collapse_portfolio_attempt(
                 h_eq,
@@ -13621,6 +13703,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                             "routing_only": True,
                         },
                         "portfolio_status": collapse_state.get("status"),
+                        "outer_recovery_reserve": round(outer_recovery_reserve, 3),
                     },
                 )
                 if result.get("status") == "accepted":
@@ -13637,6 +13720,9 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                         "the semantic strategy."
                     ),
                 )
+            collapse_state = dict(collapse_state)
+            collapse_state["outer_recovery_reserve"] = round(outer_recovery_reserve, 3)
+            collapse_state["portfolio_available"] = round(portfolio_available, 3)
             early_true_feedback.append(collapse_state)
 
     # Compact extensions are cheap enough to scout before the broad true
