@@ -57,8 +57,8 @@ Strategy cards:
 Phase directive:
 {solver.phase_directive}
 
-Previous attempts:
-{history.attempts}
+Solver-controlled judge-attempt summary:
+{solver.judge_feedback}
 
 Mechanical feedback from solver-side hint attempts:
 {solver.mechanical_feedback}
@@ -142,6 +142,7 @@ PROTOCOL_VERSION = "sair-collab-protocol-v0"
 # Exact rejected bodies are not useful twice in one solve.  Keep this cache
 # deliberately per-problem and retain transient judge failures for retry.
 _DECISIVE_TRUE_JUDGE_REJECTIONS: set[str] = set()
+_JUDGE_FEEDBACK_JOURNAL: list[dict[str, Any]] = []
 
 
 @dataclass(frozen=True)
@@ -5535,6 +5536,149 @@ def short_text(text: str, limit: int = 120) -> str:
 def compact_judge_diagnostic(result: dict[str, Any], limit: int = 800) -> str:
     raw = str(result.get("stderr") or result.get("message") or "").strip()
     return raw if len(raw) <= limit else "..." + raw[-limit + 3 :]
+
+
+def classify_judge_failure(result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "unknown").lower()
+    if status == "accepted":
+        return "accepted"
+    if status == "skipped":
+        return str(result.get("reason") or "skipped")
+    raw = str(result.get("stderr") or result.get("message") or "")
+    lowered = raw.lower()
+    if "maximum number of instances generated" in lowered:
+        return "grind_instance_limit"
+    if "maximum number of heartbeats" in lowered or "heartbeat" in lowered and "exceeded" in lowered:
+        return "heartbeat_limit"
+    if "lean_timeout" in lowered or "timed out" in lowered or "timeout" in lowered:
+        return "lean_timeout"
+    if "unknown identifier" in lowered:
+        return "unknown_identifier"
+    if "type mismatch" in lowered or "application type mismatch" in lowered:
+        return "type_mismatch"
+    if "declaration uses 'sorry'" in lowered or "declaration uses ‘sorry’" in lowered:
+        return "disallowed_sorry"
+    if "unsolved goals" in lowered:
+        return "unsolved_goals"
+    if "`grind` failed" in lowered or "grind failed" in lowered:
+        return "grind_failed"
+    if "unexpected token" in lowered or "parser" in lowered or "syntax" in lowered:
+        return "lean_syntax_error"
+    if result.get("error") or status in {"error", "provider_error"}:
+        return "judge_infrastructure_error"
+    return f"judge_{status}"
+
+
+def judge_diagnostic_signals(result: dict[str, Any]) -> dict[str, Any]:
+    """Extract useful Lean signals without retaining bulk grind diagnostics."""
+    raw = str(result.get("stderr") or result.get("message") or "").strip()
+    lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
+    errors: list[str] = []
+    goals: list[str] = []
+    limits: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if "error:" in stripped.lower() and stripped not in errors:
+            errors.append(short_text(stripped, 360))
+        if stripped.startswith("⊢") and stripped not in goals:
+            goals.append(short_text(stripped[1:].strip(), 360))
+        if (
+            stripped.startswith("[limit]")
+            or "maximum number of instances generated" in stripped.lower()
+            or "maximum number of heartbeats" in stripped.lower()
+        ) and stripped not in limits:
+            limits.append(short_text(stripped, 360))
+    out: dict[str, Any] = {}
+    if errors:
+        out["error_lines"] = errors[:2]
+    if goals:
+        out["unresolved_goals"] = goals[-2:]
+    if limits:
+        out["limits_reached"] = limits[:3]
+    if not out and raw:
+        out["diagnostic_excerpt"] = compact_judge_diagnostic(result, 500)
+    return out
+
+
+def record_judge_feedback(
+    route: str,
+    verdict: str,
+    code: str,
+    result: dict[str, Any],
+    *,
+    source: str = "baby_solver",
+) -> None:
+    entry: dict[str, Any] = {
+        "attempt": len(_JUDGE_FEEDBACK_JOURNAL) + 1,
+        "route": route,
+        "verdict": verdict,
+        "status": str(result.get("status") or "unknown"),
+        "failure_class": classify_judge_failure(result),
+        "source": source,
+        "certificate": {
+            "characters": len(code),
+            "have_count": len(re.findall(r"(?m)^\s*have\s+", code)),
+            "uses_grind": bool(re.search(r"(?m)^\s*grind\b", code)),
+        },
+        **judge_diagnostic_signals(result),
+    }
+    _JUDGE_FEEDBACK_JOURNAL.append(entry)
+    if len(_JUDGE_FEEDBACK_JOURNAL) > 16:
+        del _JUDGE_FEEDBACK_JOURNAL[:-16]
+
+
+def judge_feedback_json(*, attempt_limit: int = 6, char_limit: int = 6000) -> str:
+    if not _JUDGE_FEEDBACK_JOURNAL:
+        return json.dumps({
+            "kind": "JudgeAttemptSummary",
+            "attempt_count": 0,
+            "attempts": [],
+        })
+    attempts = _JUDGE_FEEDBACK_JOURNAL[-max(1, attempt_limit):]
+    payload = {
+        "kind": "JudgeAttemptSummary",
+        "attempt_count": len(_JUDGE_FEEDBACK_JOURNAL),
+        "omitted_older_attempts": max(0, len(_JUDGE_FEEDBACK_JOURNAL) - len(attempts)),
+        "attempts": attempts,
+        "instruction": (
+            "Use failure_class, unresolved_goals, and limits_reached to change "
+            "strategy; do not request the same failed certificate again."
+        ),
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) <= char_limit:
+        return text
+    compact_attempts = [
+        {
+            key: value
+            for key, value in attempt.items()
+            if key not in {"error_lines", "diagnostic_excerpt"}
+        }
+        for attempt in attempts[-3:]
+    ]
+    payload["attempts"] = compact_attempts
+    payload["omitted_older_attempts"] = max(
+        0,
+        len(_JUDGE_FEEDBACK_JOURNAL) - len(compact_attempts),
+    )
+    text = json.dumps(payload, ensure_ascii=False)
+    while len(text) > char_limit and len(payload["attempts"]) > 1:
+        payload["attempts"] = payload["attempts"][1:]
+        payload["omitted_older_attempts"] += 1
+        text = json.dumps(payload, ensure_ascii=False)
+    if len(text) <= char_limit:
+        return text
+    last = payload["attempts"][-1]
+    return json.dumps({
+        "kind": "JudgeAttemptSummary",
+        "attempt_count": len(_JUDGE_FEEDBACK_JOURNAL),
+        "omitted_older_attempts": max(0, len(_JUDGE_FEEDBACK_JOURNAL) - 1),
+        "attempts": [{
+            key: last.get(key)
+            for key in ("attempt", "route", "verdict", "status", "failure_class")
+        }],
+        "truncated": True,
+    }, ensure_ascii=False)
 
 
 def right_context_contraction_actions(h_eq: dict[str, Any], target_eq: dict[str, Any]) -> list[dict[str, Any]]:
@@ -11217,12 +11361,16 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
 
 
 def try_true(body: str) -> bool:
-    result = call_judge("true", make_true_code(body))
+    code = make_true_code(body)
+    result = call_judge("true", code)
+    record_judge_feedback("legacy:true", "true", code, result, source="legacy_helper")
     return result.get("status") == "accepted"
 
 
 def try_false(n: int, table: list[list[int]]) -> bool:
-    result = call_judge("false", make_false_code(n, table))
+    code = make_false_code(n, table)
+    result = call_judge("false", code)
+    record_judge_feedback("legacy:false_table", "false", code, result, source="legacy_helper")
     return result.get("status") == "accepted"
 
 
@@ -11230,7 +11378,9 @@ def try_false_artifact(found: tuple[Any, ...]) -> bool:
     n = int(found[0])
     table = found[1]
     if len(found) >= 3 and isinstance(found[2], str) and found[2].strip():
-        result = call_judge("false", make_false_formula_code(n, found[2]))
+        code = make_false_formula_code(n, found[2])
+        result = call_judge("false", code)
+        record_judge_feedback("legacy:false_formula", "false", code, result, source="legacy_helper")
         if result.get("status") == "accepted":
             return True
     return try_false(n, table)
@@ -11325,6 +11475,7 @@ def judge_true_attributed(route: str, body: str, *, source: str = "baby_solver",
         return {"status": "skipped", "reason": "duplicate_decisive_rejection"}
     emit_attribution_attempt(route, "true", source=source, detail=detail)
     result = call_judge("true", code)
+    record_judge_feedback(route, "true", code, result, source=source)
     if decisive_true_judge_rejection(result):
         _DECISIVE_TRUE_JUDGE_REJECTIONS.add(code)
     return result
@@ -11337,19 +11488,29 @@ def try_true_attributed(route: str, body: str, *, source: str = "baby_solver", d
 
 def try_false_attributed(route: str, n: int, table: list[list[int]], *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> bool:
     emit_attribution_attempt(route, "false", source=source, detail=detail)
-    return try_false(n, table)
+    code = make_false_code(n, table)
+    result = call_judge("false", code)
+    record_judge_feedback(route, "false", code, result, source=source)
+    return result.get("status") == "accepted"
 
 
 def try_false_artifact_attributed(route: str, found: tuple[Any, ...], *, source: str = "baby_solver", detail: dict[str, Any] | None = None) -> bool:
     n = int(found[0])
     table = found[1]
     if len(found) >= 3 and isinstance(found[2], str) and found[2].strip():
-        emit_attribution_attempt(f"{route}:formula", "false", source=source, detail=detail)
-        result = call_judge("false", make_false_formula_code(n, found[2]))
+        formula_route = f"{route}:formula"
+        emit_attribution_attempt(formula_route, "false", source=source, detail=detail)
+        code = make_false_formula_code(n, found[2])
+        result = call_judge("false", code)
+        record_judge_feedback(formula_route, "false", code, result, source=source)
         if result.get("status") == "accepted":
             return True
-    emit_attribution_attempt(f"{route}:table", "false", source=source, detail=detail)
-    return try_false(n, table)
+    table_route = f"{route}:table"
+    emit_attribution_attempt(table_route, "false", source=source, detail=detail)
+    code = make_false_code(n, table)
+    result = call_judge("false", code)
+    record_judge_feedback(table_route, "false", code, result, source=source)
+    return result.get("status") == "accepted"
 
 
 def judge_infinite_model_artifact_attributed(
@@ -11364,7 +11525,9 @@ def judge_infinite_model_artifact_attributed(
         "artifact_bytes": len(code.encode("utf-8")),
         **(detail or {}),
     })
-    return call_judge("false", code)
+    result = call_judge("false", code)
+    record_judge_feedback(route, "false", code, result, source=source)
+    return result
 
 
 def is_hint_payload(data: dict[str, Any]) -> bool:
@@ -12684,6 +12847,7 @@ def llm_context(
         "tool_advice": symbolic_advice,
         "strategy_cards": cards_for_prompt,
         "phase_directive": phase_directive,
+        "judge_feedback": judge_feedback_json(),
         "mechanical_feedback": feedback_json(mechanical_feedback),
         "candidate_blackboard": json.dumps(
             candidate_blackboard.snapshot() if candidate_blackboard else {
@@ -13234,7 +13398,15 @@ def try_llm_collaboration(
                         "family_summary": family_state.get("family_summary"),
                     },
                 )
-                result = call_judge("false", make_false_code(n, table))
+                code = make_false_code(n, table)
+                result = call_judge("false", code)
+                record_judge_feedback(
+                    "llm:false_model_family:table",
+                    "false",
+                    code,
+                    result,
+                    source="llm_symbolic_family",
+                )
                 if result.get("status") == "accepted":
                     return "accepted_false_model_family_llm"
                 mechanical_feedback.append(protocol_state(
@@ -13534,6 +13706,7 @@ def try_llm_collaboration(
 def solve(problem: dict[str, Any], budget: float) -> str:
     solve_started = time.monotonic()
     _DECISIVE_TRUE_JUDGE_REJECTIONS.clear()
+    _JUDGE_FEEDBACK_JOURNAL.clear()
     try:
         h_eq = parse_equation(problem["equation1"])
         g_eq = parse_equation(problem["equation2"])

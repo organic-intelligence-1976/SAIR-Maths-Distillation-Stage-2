@@ -262,16 +262,18 @@ Interpretation:
 
 ## Priority 3: Share More Proof Context With The LLM
 
-The proxy currently includes judge statuses and truncated Lean errors in
-`history.attempts`, but not the full generated Lean code for failed attempts.
+This is now solver-controlled. The prompt deliberately omits the proxy-owned
+`history.attempts` placeholder because deployed environments may expand it with
+unbounded Lean diagnostics. A bounded judge journal instead records route,
+verdict, status, certificate shape, failure class, unresolved goals, and
+resource limits. Bulk grind facts and equivalence classes are discarded.
 
 Potential later improvement:
 
-- summarize failed mechanical proof attempts and derived lemmas in
-  `solver.analysis`;
-- include the last generated candidate body or distilled lemma list when useful.
-
-This is lower priority until the deterministic stitcher can exploit good hints.
+- add more structural classifications when a failed proof exposes a useful
+  congruence frontier;
+- include a distilled lemma list from the failed candidate when it is smaller
+  than the existing mechanical SearchState.
 
 ## Priority 4: Recursive Midpoint Proving
 

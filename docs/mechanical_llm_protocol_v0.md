@@ -381,6 +381,10 @@ Recommended v0 statuses:
 - protocol metadata on generic midpoint-chain attempts;
 - cross-round `candidate-blackboard-v1` state shared by every LLM checkpoint;
 - per-candidate first-leg and second-leg diagnostics;
+- a solver-owned, bounded judge-attempt journal that replaces the
+  environment-dependent `history.attempts` placeholder and preserves only
+  classified errors, unresolved goals, limit lines, routes, and certificate
+  shape;
 - ranked candidate-bundle parsing and bounded specialization/generalization
   variants;
 - tool feedback from `run_tool_call_detailed()` normalized into protocol-aware
