@@ -8609,16 +8609,14 @@ def superposition_prove_detailed(
         cpu_rem = (cpu_deadline - time.process_time()) if cpu_deadline is not None else None
         if rem <= 0.25 or (cpu_rem is not None and cpu_rem <= 0.1):
             break
-        slice_budget = max(0.5, budget / 2)
-        slice_cpu = min(cpu_rem, slice_budget) if cpu_rem is not None else None
         tid, recs, meta = pc_saturate(
             start,
             lambda eq: pc_canon(eq[0], eq[1]) == target_sig,
             max_rounds=max_rounds,
             max_eqs=max_eqs,
             max_size=max_size,
-            time_budget=(rem if cpu_budgeted else min(rem, slice_budget)),
-            cpu_budget=slice_cpu,
+            time_budget=rem,
+            cpu_budget=cpu_rem,
             allow_var_overlap=allow_var_overlap,
         )
         if tid is not None:

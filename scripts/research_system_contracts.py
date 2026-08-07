@@ -168,6 +168,7 @@ def main() -> int:
         is None
     )
     captured_configs: list[tuple[int, int, int]] = []
+    captured_leases: list[tuple[float, float | None]] = []
     original_pc_saturate = baby_solver.pc_saturate
     try:
         def capture_pc_saturate(_start, _target, **kwargs):
@@ -175,6 +176,14 @@ def main() -> int:
                 int(kwargs["max_rounds"]),
                 int(kwargs["max_eqs"]),
                 int(kwargs["max_size"]),
+            ))
+            captured_leases.append((
+                float(kwargs["time_budget"]),
+                (
+                    float(kwargs["cpu_budget"])
+                    if kwargs.get("cpu_budget") is not None
+                    else None
+                ),
             ))
             return None, [], {
                 "rounds": 0,
@@ -190,11 +199,30 @@ def main() -> int:
             baby_solver.parse_equation("x = y"),
             budget=1.0,
         )
+        wall_leases = list(captured_leases)
+        captured_leases.clear()
+        baby_solver.superposition_prove_detailed(
+            baby_solver.parse_equation("x = x"),
+            baby_solver.parse_equation("x = y"),
+            budget=1.0,
+            cpu_budgeted=True,
+            wall_budget=3.0,
+        )
+        cpu_leases = list(captured_leases)
     finally:
         baby_solver.pc_saturate = original_pc_saturate
     checks["superposition_tiers_do_not_depend_on_nominal_budget"] = (
         captured_configs
-        == [(3, 360, 14), (4, 650, 16), (5, 900, 20), (5, 1400, 22), (6, 1800, 24)]
+        == [
+            (3, 360, 14), (4, 650, 16), (5, 900, 20),
+            (5, 1400, 22), (6, 1800, 24),
+            (3, 360, 14), (4, 650, 16), (5, 900, 20),
+            (5, 1400, 22), (6, 1800, 24),
+        ]
+        and len(wall_leases) == 5
+        and all(wall > 0.75 and cpu is None for wall, cpu in wall_leases)
+        and len(cpu_leases) == 5
+        and all(wall > 2.5 and cpu is not None and cpu > 0.75 for wall, cpu in cpu_leases)
     )
 
     judge_calls: list[tuple[str, str]] = []

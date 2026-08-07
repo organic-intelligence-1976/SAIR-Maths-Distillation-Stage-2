@@ -111,11 +111,12 @@ implemented.
    signal. Keep a hard wall deadline and reserve time for later routes.
 2. **Configuration availability is budget-independent (implemented).**
    Register every superposition depth/size tier regardless of the requested
-   budget; let the cumulative CPU/work lease decide how far the search reaches.
-   Before starting a larger tier, require a small residual-work quantum and
-   preserve the outer wall reserve. This should prevent a slow host from losing
-   a whole tier at a numeric budget threshold, but may spend budget that a
-   shallow saturation previously returned unused.
+   budget. Each tier sees the remaining cumulative CPU/wall lease rather than a
+   fixed per-tier time slice; its deterministic round, equation-count, and term
+   size bounds decide whether the next tier is reached. Before starting a
+   larger tier, require a small residual-work quantum and preserve the outer
+   wall reserve. This prevents a nominal-budget threshold or an exhausted local
+   slice from suppressing a tier while keeping the total lease unchanged.
 3. **Strengthen the rigidity gate (implemented, CPU-led interim).** The
    complete size-2-through-4 scout now receives a CPU allowance plus a separate
    wall safety cap, so ordinary host contention is less likely to suppress the
