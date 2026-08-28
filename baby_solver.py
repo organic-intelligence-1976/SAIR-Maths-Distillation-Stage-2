@@ -7893,6 +7893,90 @@ RIGIDITY_COLLAPSE_FAMILIES: tuple[dict[str, Any], ...] = (
 )
 
 
+
+
+def rigidity_completion_loop_attempt(
+    h_eq: dict[str, Any],
+    g_eq: dict[str, Any],
+    call: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Bank small proof-carrying consequences of H and re-saturate with them
+    until collapse derives. Structural only; the signal never certifies."""
+    call = call or {}
+    total_budget = float(call.get("budget") or 600.0)
+    started = time.monotonic()
+    deadline = started + max(30.0, total_budget)
+    collapse_sig = pc_canon(("var", "a"), ("var", "b"))
+
+    banked: list[UniversalEquation] = []
+    blocks: list[str] = []
+    seen_sigs: set[Any] = set()
+    rounds = 0
+    while time.monotonic() < deadline - 5.0:
+        rounds += 1
+        start = [(h_eq["lhs"], h_eq["rhs"])] + [(u.eq["lhs"], u.eq["rhs"]) for u in banked]
+        names = ["h"] + [u.name for u in banked]
+        slice_budget = min(95.0, max(10.0, deadline - time.monotonic() - 5.0))
+        tid, recs, meta = pc_saturate(
+            start,
+            lambda eq: pc_canon(eq[0], eq[1]) == collapse_sig,
+            max_rounds=10,
+            max_eqs=12000,
+            max_size=44,
+            time_budget=slice_budget,
+        )
+        if tid is not None:
+            body = pc_render(tid, recs, ["a", "b"], goal_lhs=("var", "a"),
+                             goal_rhs=("var", "b"), base_names=names)
+            blocks.append("have collapse : ∀ a b : G, a = b := by" + "\n" + indent(body, 2))
+            goal_intro = ("intro " + " ".join(g_eq["variables"]) + "\n") if g_eq["variables"] else ""
+            full = "\n".join(blocks + [goal_intro + "exact collapse _ _"])
+            return full, protocol_state(
+                "RigidityCompletionState", "body_built", "rigidity_completion_loop",
+                rounds=rounds, banked=len(banked),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                trust_boundary="signal schedules only; all lemmas Lean-checked")
+        fresh = []
+        for i, rec in enumerate(recs):
+            l, r = rec["lhs"], rec["rhs"]
+            if l == r:
+                continue
+            size = term_size(l) + term_size(r)
+            if size > 18:
+                continue
+            sig = pc_canon(l, r)
+            if sig in seen_sigs:
+                continue
+            fresh.append((size, i, l, r, sig))
+        fresh.sort(key=lambda x: x[0])
+        added = 0
+        for _size, i, l, r, sig in fresh[:12]:
+            variables = sorted(set(term_variables(l)) | set(term_variables(r)))
+            try:
+                body = pc_render(i, recs, variables, goal_lhs=l,
+                                 goal_rhs=r, base_names=names)
+            except Exception:
+                continue
+            seen_sigs.add(sig)
+            name = "bk" + str(len(banked))
+            lemma = {"lhs": l, "rhs": r, "variables": variables,
+                     "lhs_text": term_to_str(l), "rhs_text": term_to_str(r),
+                     "text": term_to_str(l) + " = " + term_to_str(r)}
+            blocks.append(
+                "have " + name + " : ∀ " + " ".join(variables) + " : G, "
+                + lemma["lhs_text"] + " = " + lemma["rhs_text"] + " := by" + "\n"
+                + indent(body, 2))
+            banked.append(UniversalEquation(name, lemma, []))
+            added += 1
+        if added == 0:
+            break
+    return None, protocol_state(
+        "RigidityCompletionState", "stuck", "rigidity_completion_loop",
+        rounds=rounds, banked=len(banked),
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        need_hint={"kind": "completion_bank_dry",
+                   "next_action": "propose midpoints bridging banked laws to a = b"})
+
 def compact_proof_state(state: dict[str, Any] | None) -> dict[str, Any]:
     source = state if isinstance(state, dict) else {}
     superposition = source.get("superposition_state")
@@ -13961,6 +14045,35 @@ def solve(problem: dict[str, Any], budget: float) -> str:
             collapse_state["outer_recovery_reserve"] = round(outer_recovery_reserve, 3)
             collapse_state["portfolio_available"] = round(portfolio_available, 3)
             early_true_feedback.append(collapse_state)
+            # Deep-rigid fallback: iterated lemma-banking completion loop.
+            remaining = max(0.0, budget - (time.monotonic() - solve_started))
+            if remaining >= 240.0:
+                loop_body, loop_state = rigidity_completion_loop_attempt(
+                    h_eq,
+                    g_eq,
+                    {"budget": min(900.0, remaining * 0.45)},
+                )
+                if loop_body:
+                    result = judge_true_attributed(
+                        "native:true:rigidity_completion_loop",
+                        loop_body,
+                        source="native_rigidity_plan",
+                        detail={
+                            "rounds": loop_state.get("rounds"),
+                            "banked": loop_state.get("banked"),
+                            "small_model_signal": {"routing_only": True},
+                        },
+                    )
+                    if result.get("status") == "accepted":
+                        return "accepted_true_rigidity_completion_loop"
+                    loop_state = protocol_state(
+                        "RigidityCompletionState",
+                        "judge_rejected",
+                        "rigidity_completion_loop",
+                        plan_state=loop_state,
+                        judge_diagnostic=compact_judge_diagnostic(result, 1000),
+                    )
+                early_true_feedback.append(loop_state)
 
     # Compact extensions are cheap enough to scout before the broad true
     # battery, and occupy a different search language from arbitrary tables.
