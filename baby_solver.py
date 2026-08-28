@@ -132,9 +132,20 @@ def call_judge(verdict: str, code: str) -> dict[str, Any]:
     return read_msg()
 
 
-def call_llm(context: dict[str, Any]) -> dict[str, Any]:
-    send_msg({"call": "llm", "context": context})
+def call_llm(context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    msg: dict[str, Any] = {"call": "llm", "context": context}
+    if model:
+        # The evaluation proxy serves any model on its pinned allowlist and
+        # refuses unpinned names; omitting the field keeps the default model.
+        msg["model"] = model
+    send_msg(msg)
     return read_msg()
+
+
+# Second allowlisted evaluation model. Proposal rounds alternate onto it after
+# two default-model rounds: model diversity is a recovery path when the default
+# config (e.g. low reasoning effort) repeatedly fails to produce a usable plan.
+LLM_ALTERNATE_MODEL = "google/gemma-4-31b-it"
 
 
 PROTOCOL_VERSION = "sair-collab-protocol-v0"
@@ -8725,6 +8736,7 @@ def superposition_prove_detailed(
     allow_var_overlap: bool = False,
     cpu_budgeted: bool = False,
     wall_budget: float | None = None,
+    deep_sizes: bool = False,
 ) -> tuple[str | None, dict[str, Any]]:
     assumptions = assumptions or []
     start = [(h_eq["lhs"], h_eq["rhs"])] + [(a.eq["lhs"], a.eq["rhs"]) for a in assumptions]
@@ -8741,6 +8753,11 @@ def superposition_prove_detailed(
         (5, 1400, 22),
         (6, 1800, 24),
     ]
+    if deep_sizes:
+        # Rigid theories can need intermediate terms far above the standard
+        # size caps (measured: rungs unprovable at 24 prove at 40+). The deep
+        # tier runs last, on the same cumulative lease.
+        configs.append((8, 6000, 40))
     wall_allowance = (
         max(1.0, wall_budget)
         if cpu_budgeted and wall_budget is not None
@@ -9245,6 +9262,7 @@ def rigidity_collapse_portfolio_attempt(
             superposition_budget=float(square_spec["entry_cpu_budget"]),
             superposition_cpu_budgeted=True,
             superposition_wall_budget=remaining,
+            deep_sizes=True,
         )
         square_row = {
             "family": square_spec["name"],
@@ -9269,7 +9287,7 @@ def rigidity_collapse_portfolio_attempt(
             h_eq,
             g_eq,
             {
-                "lemmas": ["const"],
+                "lemmas": ["const", "proj_l", "proj_r", "rowconst"],
                 "budget": float(aux_spec["entry_cpu_budget"]),
                 "wall_budget": remaining,
                 "cpu_budgeted": True,
@@ -9329,7 +9347,7 @@ def rigidity_collapse_portfolio_attempt(
                 h_eq,
                 g_eq,
                 {
-                    "lemmas": ["const"],
+                    "lemmas": ["const", "proj_l", "proj_r", "rowconst"],
                     "budget": float(aux_spec["renewal_cpu_budget"]),
                     "wall_budget": remaining,
                     "cpu_budgeted": True,
@@ -9448,6 +9466,7 @@ def prove_with_assumptions_detailed(
     superposition_budget: float = 5.0,
     superposition_cpu_budgeted: bool = False,
     superposition_wall_budget: float | None = None,
+    deep_sizes: bool = False,
 ) -> tuple[str | None, dict[str, Any]]:
     last_state: dict[str, Any] | None = None
     tiers = [
@@ -9487,6 +9506,7 @@ def prove_with_assumptions_detailed(
         budget=superposition_budget,
         cpu_budgeted=superposition_cpu_budgeted,
         wall_budget=superposition_wall_budget,
+        deep_sizes=deep_sizes,
     )
     if pc_body is None and (assumptions or target_aux_shape(target_eq)):
         overlap_budget = max(1.0, min(3.0, superposition_budget / 3.0))
@@ -13163,9 +13183,18 @@ def try_llm_collaboration(
     active_symbolic_plan: dict[str, Any] | None = None
     deadline = time.monotonic() + max(8.0, min(90.0, budget * 0.35))
     rounds = 0
+    alternate_model_enabled = True
     while rounds < max_rounds and time.monotonic() < deadline:
         rounds += 1
         blackboard_round = candidate_blackboard.next_round()
+        # Rounds 1-2 use the default evaluation model; later rounds alternate
+        # onto the second allowlisted model so one model's systematic failure
+        # mode cannot exhaust the whole collaboration pass.
+        round_model = (
+            LLM_ALTERNATE_MODEL
+            if alternate_model_enabled and rounds >= 3 and rounds % 2 == 1
+            else None
+        )
         resp = call_llm(llm_context(
             h_eq,
             g_eq,
@@ -13177,8 +13206,20 @@ def try_llm_collaboration(
             allow_infinite_model_artifacts=allow_infinite_model_artifacts,
             active_symbolic_plan=active_symbolic_plan,
             candidate_blackboard=candidate_blackboard,
-        ))
+        ), model=round_model)
         if resp.get("error"):
+            if round_model is not None:
+                # Only the alternate failed (not allowlisted here, or provider
+                # hiccup): disable rotation and keep going on the default.
+                alternate_model_enabled = False
+                mechanical_feedback.append(protocol_state(
+                    "LLMAdapterState",
+                    "alternate_model_unavailable",
+                    "llm_provider",
+                    errors=[ProtocolIssue("provider_error", short_text(str(resp.get("error")), 300)).to_dict()],
+                    need_hint="Alternate model unavailable; continuing on the default model.",
+                ))
+                continue
             mechanical_feedback.append(protocol_state(
                 "LLMAdapterState",
                 "provider_error",

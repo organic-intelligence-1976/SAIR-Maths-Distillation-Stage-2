@@ -983,7 +983,7 @@ def main() -> int:
         },
     ]
     try:
-        def fake_call_llm(context):
+        def fake_call_llm(context, model=None):
             infinite_contexts.append(context)
             response = infinite_responses[min(len(infinite_contexts) - 1, 1)]
             return {"response": json.dumps(response)}
@@ -1449,7 +1449,7 @@ def main() -> int:
         },
     ])
 
-    def fake_call_llm(_context):
+    def fake_call_llm(_context, model=None):
         return {"response": json.dumps(next(scripted_responses))}
 
     def fake_hint_attempt(payload, _h, _g, **_kwargs):
