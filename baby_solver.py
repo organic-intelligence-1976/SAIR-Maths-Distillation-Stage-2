@@ -132,7 +132,12 @@ def call_judge(verdict: str, code: str) -> dict[str, Any]:
     return read_msg()
 
 
+_LLM_CALLS_THIS_SOLVE = 0
+
+
 def call_llm(context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    global _LLM_CALLS_THIS_SOLVE
+    _LLM_CALLS_THIS_SOLVE += 1
     msg: dict[str, Any] = {"call": "llm", "context": context}
     if model:
         # The evaluation proxy serves any model on its pinned allowlist and
@@ -13174,6 +13179,10 @@ def try_llm_collaboration(
     candidate_blackboard: CandidateBlackboard | None = None,
 ) -> str | None:
     mechanical_feedback: list[dict[str, Any]] = list(initial_feedback or [])
+    # Snapshot of the pass-opening context: what a first call sees. Alternate-
+    # model rounds use this (second-opinion semantics) instead of the default
+    # model's accumulated failure trajectory.
+    opening_feedback: list[dict[str, Any]] = list(mechanical_feedback)
     finite_search_allowed = finite_countermodel_search_allowed(semantic_context)
     if semantic_context and semantic_context.get("semantic_class") != "unclassified":
         mechanical_feedback.insert(0, semantic_status_state(semantic_context))
@@ -13192,13 +13201,20 @@ def try_llm_collaboration(
         # mode cannot exhaust the whole collaboration pass.
         round_model = (
             LLM_ALTERNATE_MODEL
-            if alternate_model_enabled and rounds >= 3 and rounds % 2 == 1
+            if alternate_model_enabled
+            and _LLM_CALLS_THIS_SOLVE >= 1
+            and _LLM_CALLS_THIS_SOLVE % 2 == 1
             else None
         )
+        # Second-opinion semantics: the alternate model gets a fresh context
+        # (problem + persistent blackboard, not the default model's failed
+        # trajectory) — measured: accumulated failure feedback steers a model
+        # away from proposals it finds immediately from scratch.
+        round_feedback = opening_feedback if round_model is not None else mechanical_feedback
         resp = call_llm(llm_context(
             h_eq,
             g_eq,
-            mechanical_feedback,
+            round_feedback,
             collaboration_goal,
             prefer_false=prefer_false,
             semantic_context=semantic_context,
@@ -13748,6 +13764,8 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     solve_started = time.monotonic()
     _DECISIVE_TRUE_JUDGE_REJECTIONS.clear()
     _JUDGE_FEEDBACK_JOURNAL.clear()
+    global _LLM_CALLS_THIS_SOLVE
+    _LLM_CALLS_THIS_SOLVE = 0
     try:
         h_eq = parse_equation(problem["equation1"])
         g_eq = parse_equation(problem["equation2"])
