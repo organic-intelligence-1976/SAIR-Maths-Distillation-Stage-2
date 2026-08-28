@@ -4551,7 +4551,9 @@ def false_model_search_detailed(
             if not m_model:
                 continue
             n = int(m_model.group(1))
-            if n < 2 or n > 8:
+            # 9 admits the square-order witness families (e.g. central
+            # groupoids exist only at n^2: 4, 9, ...) that 8 silently excluded.
+            if n < 2 or n > 9:
                 continue
             m_seed = re.search(r"seed=?(\d+)", route_l)
             seed = int(m_seed.group(1)) if m_seed else 0xC0FFEE
@@ -11354,6 +11356,7 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool =
             "local_search:n=7:seed=0",
             "model_finder_v2:n=7",
             "model_finder_v2:n=8",
+            "model_finder_v2:n=9",
             "sympy_sat:n=6",
             "skew_product:2x3",
             "cp_sat:n=5",
@@ -14252,6 +14255,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
                 "local_search:n=6:seed=2",
                 "model_finder_v2:n=7",
                 "model_finder_v2:n=8",
+            "model_finder_v2:n=9",
                 "sympy_sat:n=6",
                 "cp_sat:n=6",
                 "poly_ce:tier=2:nmax=13",
