@@ -4557,7 +4557,11 @@ def false_model_search_detailed(
                 continue
             m_seed = re.search(r"seed=?(\d+)", route_l)
             seed = int(m_seed.group(1)) if m_seed else 0xC0FFEE
-            status, table, meta = goal_directed_model_finder(h_eq, g_eq, n, per, seed=seed)
+            # Order-9 needs a wider window than an equal split: its restart
+            # schedule scales with the grant (measured: some square-order
+            # witnesses land at ~20-40 s, none benefit past that).
+            slice_n9 = min(45.0, max(per, budget * 0.5)) if n >= 9 else per
+            status, table, meta = goal_directed_model_finder(h_eq, g_eq, n, slice_n9, seed=seed)
             trials.append({"route": route_s, "status": status, "template": "model_finder_v2", **meta})
             if table is not None and is_counterexample(h_eq, g_eq, table):
                 return (n, table), protocolize_state({
