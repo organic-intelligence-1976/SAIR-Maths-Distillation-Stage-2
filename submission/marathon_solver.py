@@ -28,6 +28,8 @@ def send_msg(msg: dict[str, Any]) -> None:
     print(json.dumps(msg), flush=True)
 
 def call_judge(verdict: str, code: str) -> dict[str, Any]:
+    if _MARATHON_MODE:
+        return _marathon_judge_surrogate(verdict, code)
     send_msg({'call': 'judge', 'verdict': verdict, 'code': code})
     return read_msg()
 _LLM_CALLS_THIS_SOLVE = 0
@@ -35,6 +37,8 @@ _LLM_CALLS_THIS_SOLVE = 0
 def call_llm(context: dict[str, Any], model: str | None=None) -> dict[str, Any]:
     global _LLM_CALLS_THIS_SOLVE
     _LLM_CALLS_THIS_SOLVE += 1
+    if _MARATHON_MODE:
+        return _marathon_call_llm(context, model)
     msg: dict[str, Any] = {'call': 'llm', 'context': context}
     if model:
         msg['model'] = model
@@ -1498,78 +1502,10 @@ def goal_directed_model_finder(h_eq: dict[str, Any], g_eq: dict[str, Any], n: in
 _CP_SAT_AVAILABLE: bool | None = None
 
 def cp_sat_available() -> bool:
-    global _CP_SAT_AVAILABLE
-    if _CP_SAT_AVAILABLE is not None:
-        return _CP_SAT_AVAILABLE
-    try:
-        from ortools.sat.python import cp_model
-        _CP_SAT_AVAILABLE = True
-    except Exception:
-        _CP_SAT_AVAILABLE = False
-    return _CP_SAT_AVAILABLE
+    return False
 
-def cp_sat_counterexample_search(h_eq: dict[str, Any], g_eq: dict[str, Any], n: int, time_budget: float=8.0, workers: int=8) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
-    if not cp_sat_available():
-        return ('unavailable', None, {'n': n, 'reason': 'ortools.sat.python.cp_model is not available'})
-    from ortools.sat.python import cp_model
-    gvars = g_eq['variables']
-    skolems = canonical_skolem_assignments(len(gvars), n) if gvars else [()]
-    deadline = time.monotonic() + max(0.2, time_budget)
-    trials: list[dict[str, Any]] = []
-
-    def build_and_solve(skolem: tuple[int, ...], sub_budget: float) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
-        model = cp_model.CpModel()
-        op = {(i, j): model.NewIntVar(0, n - 1, f'op_{i}_{j}') for i in range(n) for j in range(n)}
-        flat = [op[i, j] for i in range(n) for j in range(n)]
-        aux_id = 0
-
-        def cp_eval(term: Term, env: dict[str, int]) -> Any:
-            nonlocal aux_id
-            if term[0] == 'var':
-                return env[term[1]]
-            left = cp_eval(term[1], env)
-            right = cp_eval(term[2], env)
-            if isinstance(left, int) and isinstance(right, int):
-                return op[left, right]
-            idx = model.NewIntVar(0, n * n - 1, f'idx_{aux_id}')
-            out = model.NewIntVar(0, n - 1, f'val_{aux_id}')
-            aux_id += 1
-            model.Add(idx == left * n + right)
-            model.AddElement(idx, flat, out)
-            return out
-        for vals in product(range(n), repeat=len(h_eq['variables'])):
-            env = dict(zip(h_eq['variables'], vals))
-            model.Add(cp_eval(h_eq['lhs'], env) == cp_eval(h_eq['rhs'], env))
-        goal_env = dict(zip(gvars, skolem))
-        model.Add(cp_eval(g_eq['lhs'], goal_env) != cp_eval(g_eq['rhs'], goal_env))
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = max(0.1, sub_budget)
-        solver.parameters.num_search_workers = max(1, min(int(workers), 16))
-        status = solver.Solve(model)
-        name = solver.StatusName(status)
-        meta = {'skolem': dict(goal_env), 'status': name, 'wall_time': round(float(solver.WallTime()), 3), 'branches': int(solver.NumBranches()), 'conflicts': int(solver.NumConflicts()), 'aux_terms': aux_id}
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            table = [[int(solver.Value(op[i, j])) for j in range(n)] for i in range(n)]
-            return ('found', table, meta)
-        if status == cp_model.INFEASIBLE:
-            return ('infeasible', None, meta)
-        return ('unknown', None, meta)
-    final_status = 'none'
-    for idx, skolem in enumerate(skolems):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.05:
-            final_status = 'budget'
-            break
-        sub_budget = remaining / max(1, len(skolems) - idx)
-        status, table, meta = build_and_solve(skolem, sub_budget)
-        trials.append(meta)
-        if status == 'found' and table is not None:
-            return ('found', table, {'n': n, 'time_budget': time_budget, 'skolem_count': len(skolems), 'trials': trials})
-        if status in {'unknown', 'budget'}:
-            final_status = 'budget'
-        elif final_status == 'none':
-            final_status = 'infeasible'
-    return (final_status, None, {'n': n, 'time_budget': time_budget, 'skolem_count': len(skolems), 'trials': trials, 'cp_sat_infeasible_skolems': sum((1 for t in trials if t.get('status') == 'INFEASIBLE')), 'cp_sat_unknown_skolems': sum((1 for t in trials if t.get('status') not in {'INFEASIBLE', 'OPTIMAL', 'FEASIBLE'}))})
+def cp_sat_counterexample_search(h_eq, g_eq, n, time_budget=8.0, workers=8):
+    return ('unavailable', None, {'n': n, 'reason': 'ortools absent in sandbox'})
 
 def affine_skew_fiber_library(size: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -1605,337 +1541,21 @@ def skew_equation_failure(equation: dict[str, Any], table: list[list[int]], dead
             return {key: int(value) for key, value in env.items()}
     return None
 
-def pure_python_skew_product_search(h_eq: dict[str, Any], g_eq: dict[str, Any], control_size: int, fiber_size: int, time_budget: float, *, require_quotient_goal: bool) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
-    started = time.monotonic()
-    deadline = started + max(0.5, float(time_budget))
-    carrier_size = control_size * fiber_size
-    library = affine_skew_fiber_library(fiber_size)
-    selector_order = sorted(range(len(library)), key=lambda index: (0 if library[index]['params'][:2] == [1, 0] else 1 if library[index]['params'][:2] == [0, 1] else 2 if library[index]['params'][0] != 0 and library[index]['params'][1] == 0 else 3 if library[index]['params'][:2] == [0, 0] else 4 if library[index]['params'][0] == 0 else 5, library[index]['params'][2], library[index]['params'][0], library[index]['params'][1]))
-    quotient_tables_checked = 0
-    quotient_candidates = 0
-    selector_tuples_checked = 0
-    try:
-        for flat_control in product(range(control_size), repeat=control_size * control_size):
-            if time.monotonic() >= deadline:
-                raise TimeoutError
-            quotient_tables_checked += 1
-            control_table = [list(flat_control[row * control_size:(row + 1) * control_size]) for row in range(control_size)]
-            if skew_equation_failure(h_eq, control_table, deadline) is not None:
-                continue
-            if require_quotient_goal and skew_equation_failure(g_eq, control_table, deadline) is not None:
-                continue
-            quotient_candidates += 1
-            for selectors in product(selector_order, repeat=control_size * control_size):
-                selector_tuples_checked += 1
-                if selector_tuples_checked & 255 == 0 and time.monotonic() >= deadline:
-                    raise TimeoutError
-                table: list[list[int]] = []
-                for left in range(carrier_size):
-                    left_control, left_fiber = divmod(left, fiber_size)
-                    row = []
-                    for right in range(carrier_size):
-                        right_control, right_fiber = divmod(right, fiber_size)
-                        selector = selectors[left_control * control_size + right_control]
-                        fiber_value = library[selector]['table'][left_fiber * fiber_size + right_fiber]
-                        row.append(control_table[left_control][right_control] * fiber_size + int(fiber_value))
-                    table.append(row)
-                goal_witness = skew_equation_failure(g_eq, table, deadline)
-                if goal_witness is None:
-                    continue
-                if skew_equation_failure(h_eq, table, deadline) is not None:
-                    continue
-                return ('found', table, {'template': 'skew_product', 'status': 'verified_countermodel', 'backend': 'pure_python_enumeration', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'quotient_tables_checked': quotient_tables_checked, 'quotient_candidates': quotient_candidates, 'selector_tuples_checked': selector_tuples_checked, 'control_table': control_table, 'fiber_parameters': {f'{left},{right}': list(library[selectors[left * control_size + right]]['params']) for left in range(control_size) for right in range(control_size)}, 'goal_witness': goal_witness, 'seconds': round(time.monotonic() - started, 3)})
-    except TimeoutError:
-        return ('budget', None, {'template': 'skew_product', 'status': 'search_incomplete', 'backend': 'pure_python_enumeration', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'quotient_tables_checked': quotient_tables_checked, 'quotient_candidates': quotient_candidates, 'selector_tuples_checked': selector_tuples_checked, 'seconds': round(time.monotonic() - started, 3), 'suggested_factorizations': [[fiber_size, control_size], [control_size, min(8, fiber_size + 1)]]})
-    return ('infeasible', None, {'template': 'skew_product', 'status': 'family_infeasible', 'backend': 'pure_python_enumeration', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'quotient_tables_checked': quotient_tables_checked, 'quotient_candidates': quotient_candidates, 'selector_tuples_checked': selector_tuples_checked, 'seconds': round(time.monotonic() - started, 3), 'suggested_factorizations': [[fiber_size, control_size], [control_size, min(8, fiber_size + 1)]]})
+def pure_python_skew_product_search(h_eq, g_eq, control_size, fiber_size, time_budget, *, require_quotient_goal):
+    return ('unavailable', None, {'reason': 'skew_product stubbed for size'})
 
-def skew_product_counterexample_search(h_eq: dict[str, Any], g_eq: dict[str, Any], control_size: int=2, fiber_size: int=3, time_budget: float=4.0, *, require_quotient_goal: bool=True, max_iterations: int=64, violation_batch: int=12, workers: int=8, seed: int=0) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
-    control_size = max(1, min(6, int(control_size)))
-    fiber_size = max(2, min(8, int(fiber_size)))
-    carrier_size = control_size * fiber_size
-    if carrier_size > 40:
-        return ('invalid_factorization', None, {'template': 'skew_product', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'reason': 'compact skew search is limited to 40 elements'})
-    if not cp_sat_available():
-        return pure_python_skew_product_search(h_eq, g_eq, control_size, fiber_size, time_budget, require_quotient_goal=require_quotient_goal)
-    from ortools.sat.python import cp_model
-    started = time.monotonic()
-    deadline = started + max(0.5, float(time_budget))
-    library = affine_skew_fiber_library(fiber_size)
-    model = cp_model.CpModel()
-    control = {(left, right): model.NewIntVar(0, control_size - 1, f'skew_control_{left}_{right}') for left in range(control_size) for right in range(control_size)}
-    selectors = {(left, right): model.NewIntVar(0, len(library) - 1, f'skew_selector_{left}_{right}') for left in range(control_size) for right in range(control_size)}
-    operation = {(left, right): model.NewIntVar(0, carrier_size - 1, f'skew_operation_{left}_{right}') for left in range(carrier_size) for right in range(carrier_size)}
-    flat_control = [control[left, right] for left in range(control_size) for right in range(control_size)]
-    flat_operation = [operation[left, right] for left in range(carrier_size) for right in range(carrier_size)]
-    for left in range(carrier_size):
-        left_control, left_fiber = divmod(left, fiber_size)
-        for right in range(carrier_size):
-            right_control, right_fiber = divmod(right, fiber_size)
-            fiber_value = model.NewIntVar(0, fiber_size - 1, f'skew_fiber_value_{left}_{right}')
-            outputs = [int(row['table'][left_fiber * fiber_size + right_fiber]) for row in library]
-            model.AddElement(selectors[left_control, right_control], outputs, fiber_value)
-            model.Add(operation[left, right] == control[left_control, right_control] * fiber_size + fiber_value)
-    quotient_aux = [0]
-    quotient_obligations = 0
-
-    def add_quotient_equation(equation: dict[str, Any], label: str) -> None:
-        nonlocal quotient_obligations
-        for values in product(range(control_size), repeat=len(equation['variables'])):
-            env = dict(zip(equation['variables'], values))
-            left = skew_cp_eval(model, equation['lhs'], env, flat_control, control_size, quotient_aux, f'skew_quotient_{label}')
-            right = skew_cp_eval(model, equation['rhs'], env, flat_control, control_size, quotient_aux, f'skew_quotient_{label}')
-            model.Add(left == right)
-            quotient_obligations += 1
-    add_quotient_equation(h_eq, 'h')
-    if require_quotient_goal:
-        add_quotient_equation(g_eq, 'g')
-    goal_aux = [0]
-    goal_env = {variable: model.NewIntVar(0, carrier_size - 1, f'skew_goal_witness_{variable}') for variable in g_eq['variables']}
-    goal_left = skew_cp_eval(model, g_eq['lhs'], goal_env, flat_operation, carrier_size, goal_aux, 'skew_goal')
-    goal_right = skew_cp_eval(model, g_eq['rhs'], goal_env, flat_operation, carrier_size, goal_aux, 'skew_goal')
-    model.Add(goal_left != goal_right)
-    h_constraints: set[tuple[int, ...]] = set()
-    lifted_aux = [0]
-
-    def add_h_assignment(values: tuple[int, ...]) -> None:
-        if values in h_constraints:
-            return
-        h_constraints.add(values)
-        env = dict(zip(h_eq['variables'], values))
-        left = skew_cp_eval(model, h_eq['lhs'], env, flat_operation, carrier_size, lifted_aux, 'skew_lifted_h')
-        right = skew_cp_eval(model, h_eq['rhs'], env, flat_operation, carrier_size, lifted_aux, 'skew_lifted_h')
-        model.Add(left == right)
-    for values in product(range(control_size), repeat=len(h_eq['variables'])):
-        add_h_assignment(tuple((value * fiber_size for value in values)))
-    for value in range(carrier_size):
-        add_h_assignment(tuple((value for _ in h_eq['variables'])))
-    events: list[dict[str, Any]] = []
-    assignments_checked = 0
-    for iteration in range(1, max(1, min(int(max_iterations), 500)) + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.05:
-            break
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = max(0.05, remaining)
-        solver.parameters.num_search_workers = max(1, min(int(workers), 16))
-        solver.parameters.random_seed = int(seed) + iteration - 1
-        cp_status = solver.Solve(model)
-        event: dict[str, Any] = {'iteration': iteration, 'cp_status': solver.StatusName(cp_status), 'wall_time': round(float(solver.WallTime()), 3), 'branches': int(solver.NumBranches()), 'conflicts': int(solver.NumConflicts()), 'lifted_h_constraints': len(h_constraints)}
-        events.append(event)
-        if cp_status == cp_model.INFEASIBLE:
-            return ('infeasible', None, {'template': 'skew_product', 'status': 'family_infeasible', 'backend': 'ortools_cp_sat_cegis', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'quotient_obligations': quotient_obligations, 'lifted_h_constraints': len(h_constraints), 'iterations': iteration, 'events': events[-6:], 'suggested_factorizations': [[fiber_size, control_size], [control_size, min(8, fiber_size + 1)]]})
-        if cp_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break
-        table = [[int(solver.Value(operation[left, right])) for right in range(carrier_size)] for left in range(carrier_size)]
-        witness_env = {variable: int(solver.Value(value)) for variable, value in goal_env.items()}
-        violations: list[tuple[int, ...]] = []
-        scan_complete = True
-        checked = 0
-        for values in product(range(carrier_size), repeat=len(h_eq['variables'])):
-            if time.monotonic() >= deadline:
-                scan_complete = False
-                break
-            checked += 1
-            env = dict(zip(h_eq['variables'], values))
-            if eval_term(h_eq['lhs'], env, table) == eval_term(h_eq['rhs'], env, table):
-                continue
-            violations.append(tuple((int(value) for value in values)))
-            if len(violations) >= max(1, min(int(violation_batch), 64)):
-                scan_complete = False
-                break
-        assignments_checked += checked
-        event.update({'h_assignments_checked': checked, 'h_scan_complete': scan_complete, 'h_violations_found': len(violations), 'goal_witness': {'env': witness_env, 'lhs': eval_term(g_eq['lhs'], witness_env, table), 'rhs': eval_term(g_eq['rhs'], witness_env, table)}})
-        if scan_complete and (not violations):
-            if not is_counterexample(h_eq, g_eq, table):
-                return ('internal_error', None, {'template': 'skew_product', 'status': 'verification_mismatch', 'backend': 'ortools_cp_sat_cegis', 'events': events[-6:]})
-            selectors_out = {f'{left},{right}': list(library[int(solver.Value(selectors[left, right]))]['params']) for left in range(control_size) for right in range(control_size)}
-            control_table = [[int(solver.Value(control[left, right])) for right in range(control_size)] for left in range(control_size)]
-            return ('found', table, {'template': 'skew_product', 'status': 'verified_countermodel', 'backend': 'ortools_cp_sat_cegis', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'quotient_obligations': quotient_obligations, 'lifted_h_constraints': len(h_constraints), 'iterations': iteration, 'h_assignments_checked_total': assignments_checked, 'control_table': control_table, 'fiber_parameters': selectors_out, 'goal_witness': event['goal_witness'], 'events': events[-6:], 'seconds': round(time.monotonic() - started, 3)})
-        if not violations:
-            break
-        for values in violations:
-            add_h_assignment(values)
-    return ('budget', None, {'template': 'skew_product', 'status': 'search_incomplete', 'backend': 'ortools_cp_sat_cegis', 'control_size': control_size, 'fiber_size': fiber_size, 'carrier_size': carrier_size, 'quotient_obligations': quotient_obligations, 'lifted_h_constraints': len(h_constraints), 'iterations': len(events), 'h_assignments_checked_total': assignments_checked, 'events': events[-6:], 'seconds': round(time.monotonic() - started, 3), 'suggested_factorizations': [[fiber_size, control_size], [control_size, min(8, fiber_size + 1)]]})
+def skew_product_counterexample_search(h_eq, g_eq, control_size=2, fiber_size=3, time_budget=4.0, *, require_quotient_goal=True, max_iterations=64):
+    return ('unavailable', None, {'reason': 'skew_product stubbed for size'})
 _SYMPY_SAT_AVAILABLE: bool | None = None
 
 def sympy_sat_available() -> bool:
-    global _SYMPY_SAT_AVAILABLE
-    if _SYMPY_SAT_AVAILABLE is not None:
-        return _SYMPY_SAT_AVAILABLE
-    try:
-        from sympy.logic.inference import satisfiable
-        _SYMPY_SAT_AVAILABLE = True
-    except Exception:
-        _SYMPY_SAT_AVAILABLE = False
-    return _SYMPY_SAT_AVAILABLE
+    return False
 
 class SympySatTimeout(Exception):
     pass
 
-def sympy_sat_counterexample_search(h_eq: dict[str, Any], g_eq: dict[str, Any], n: int, time_budget: float=120.0) -> tuple[str, list[list[int]] | None, dict[str, Any]]:
-    if n < 5:
-        return ('skipped_small_size', None, {'n': n, 'reason': 'sympy_sat deliberately skips n < 5; tiny UNSAT searches are slow and not the target niche'})
-    if not sympy_sat_available():
-        return ('unavailable', None, {'n': n, 'reason': 'sympy.logic.inference.satisfiable is not available'})
-    from sympy import Symbol
-    from sympy.logic.algorithms.dpll2 import EncodedCNF
-    from sympy.logic.inference import satisfiable
-    gvars = g_eq['variables']
-    skolems = noncollapsed_skolem_order(canonical_skolem_assignments(len(gvars), n)) if gvars else [()]
-    envs_h = [dict(zip(h_eq['variables'], vals)) for vals in product(range(n), repeat=len(h_eq['variables']))]
-    true_lit: int | None = None
-    false_lit = 0
-    symbols: list[Any] = []
-    clauses: list[set[int]] = []
-    cell_vars: dict[tuple[int, int, int], int] = {}
-
-    def new_var(name: str) -> int:
-        symbols.append(Symbol(name))
-        return len(symbols)
-    for i in range(n):
-        for j in range(n):
-            vars_ij = [new_var(f's_{n}_{i}_{j}_{k}') for k in range(n)]
-            for k, var in enumerate(vars_ij):
-                cell_vars[i, j, k] = var
-            clauses.append(set(vars_ij))
-            for a in range(n):
-                for b in range(a + 1, n):
-                    clauses.append({-vars_ij[a], -vars_ij[b]})
-
-    def add_clause(lits: list[int | None]) -> None:
-        if any((lit is true_lit for lit in lits)):
-            return
-        reduced = {int(lit) for lit in lits if lit != false_lit}
-        clauses.append(reduced if reduced else {false_lit})
-
-    def add_unit(lit: int | None) -> None:
-        add_clause([lit])
-
-    def neg(lit: int | None) -> int | None:
-        if lit is true_lit:
-            return false_lit
-        if lit == false_lit:
-            return true_lit
-        return -int(lit)
-
-    def and_gate(inputs: list[int | None]) -> int | None:
-        if any((lit == false_lit for lit in inputs)):
-            return false_lit
-        active = [int(lit) for lit in inputs if lit is not true_lit]
-        if not active:
-            return true_lit
-        if len(active) == 1:
-            return active[0]
-        out = new_var(f'a_{len(symbols) + 1}')
-        for lit in active:
-            add_clause([neg(out), lit])
-        add_clause([out, *[neg(lit) for lit in active]])
-        return out
-
-    def or_gate(inputs: list[int | None]) -> int | None:
-        if any((lit is true_lit for lit in inputs)):
-            return true_lit
-        active = [int(lit) for lit in inputs if lit != false_lit]
-        if not active:
-            return false_lit
-        if len(active) == 1:
-            return active[0]
-        out = new_var(f'o_{len(symbols) + 1}')
-        for lit in active:
-            add_clause([neg(lit), out])
-        add_clause([neg(out), *active])
-        return out
-
-    def value_const(value: int) -> list[int | None]:
-        return [true_lit if k == value else false_lit for k in range(n)]
-
-    def eval_lits(term: Term, env: dict[str, int], memo: dict[Term, list[int | None]]) -> list[int | None]:
-        if term in memo:
-            return memo[term]
-        if term[0] == 'var':
-            out = value_const(env[term[1]])
-        else:
-            left = eval_lits(term[1], env, memo)
-            right = eval_lits(term[2], env, memo)
-            out = []
-            for k in range(n):
-                disjuncts: list[int | None] = []
-                for a in range(n):
-                    for b in range(n):
-                        disjuncts.append(and_gate([left[a], right[b], cell_vars[a, b, k]]))
-                out.append(or_gate(disjuncts))
-        memo[term] = out
-        return out
-
-    def require_equal(lhs: list[int | None], rhs: list[int | None]) -> None:
-        for k in range(n):
-            add_clause([neg(lhs[k]), rhs[k]])
-            add_clause([lhs[k], neg(rhs[k])])
-
-    def require_not_equal(lhs: list[int | None], rhs: list[int | None]) -> None:
-        witnesses: list[int | None] = []
-        for k in range(n):
-            witnesses.append(and_gate([lhs[k], neg(rhs[k])]))
-            witnesses.append(and_gate([rhs[k], neg(lhs[k])]))
-        add_unit(or_gate(witnesses))
-    deadline = time.monotonic() + max(0.5, time_budget)
-    for env_idx, env in enumerate(envs_h):
-        if env_idx % 8 == 0 and time.monotonic() >= deadline:
-            return ('timeout', None, {'n': n, 'time_budget': time_budget, 'phase': 'encoding_h', 'grounded_envs': env_idx, 'env_count': len(envs_h)})
-        memo_h: dict[Term, list[int | None]] = {}
-        require_equal(eval_lits(h_eq['lhs'], env, memo_h), eval_lits(h_eq['rhs'], env, memo_h))
-    base_clause_count = len(clauses)
-    base_symbol_count = len(symbols)
-    old_handler = signal.getsignal(signal.SIGALRM)
-    old_timer = signal.getitimer(signal.ITIMER_REAL)
-
-    def on_alarm(_signum: int, _frame: Any) -> None:
-        raise SympySatTimeout()
-    trials: list[dict[str, Any]] = []
-    try:
-        signal.signal(signal.SIGALRM, on_alarm)
-        for idx, skolem in enumerate(skolems):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.25:
-                return ('timeout', None, {'n': n, 'time_budget': time_budget, 'skolem_count': len(skolems), 'trials': trials})
-            if idx == 0 and len(skolems) > 1:
-                sub_budget = min(remaining, max(0.2, remaining * 0.8))
-            else:
-                sub_budget = max(0.2, remaining / max(1, len(skolems) - idx))
-            goal_env = dict(zip(gvars, skolem))
-            signal.setitimer(signal.ITIMER_REAL, sub_budget)
-            try:
-                symbols = symbols[:base_symbol_count]
-                clauses = [set(clause) for clause in clauses[:base_clause_count]]
-                goal_memo: dict[Term, list[int | None]] = {}
-                require_not_equal(eval_lits(g_eq['lhs'], goal_env, goal_memo), eval_lits(g_eq['rhs'], goal_env, goal_memo))
-                enc = EncodedCNF([set(clause) for clause in clauses], {sym: i + 1 for i, sym in enumerate(symbols)})
-                model = satisfiable(enc, algorithm='dpll2', all_models=False)
-            except SympySatTimeout:
-                trials.append({'skolem': dict(goal_env), 'status': 'timeout', 'sub_budget': round(sub_budget, 3)})
-                continue
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0.0)
-            if model is False:
-                trials.append({'skolem': dict(goal_env), 'status': 'unsat', 'sub_budget': round(sub_budget, 3)})
-                continue
-            table: list[list[int]] = []
-            for i in range(n):
-                row: list[int] = []
-                for j in range(n):
-                    chosen = [k for k in range(n) if bool(model.get(symbols[cell_vars[i, j, k] - 1], False))]
-                    row.append(int(chosen[0]) if chosen else 0)
-                table.append(row)
-            ok = is_counterexample(h_eq, g_eq, table)
-            trials.append({'skolem': dict(goal_env), 'status': 'sat' if ok else 'sat_but_local_check_failed', 'sub_budget': round(sub_budget, 3)})
-            if ok:
-                return ('found', table, {'n': n, 'time_budget': time_budget, 'skolem_count': len(skolems), 'trials': trials, 'backend': 'sympy.logic.inference.satisfiable'})
-        return ('unsat_or_timeout', None, {'n': n, 'time_budget': time_budget, 'skolem_count': len(skolems), 'trials': trials, 'backend': 'sympy.logic.inference.satisfiable'})
-    except SympySatTimeout:
-        return ('timeout', None, {'n': n, 'time_budget': time_budget, 'skolem_count': len(skolems), 'trials': trials})
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
-        signal.signal(signal.SIGALRM, old_handler)
+def sympy_sat_counterexample_search(h_eq, g_eq, n, time_budget=120.0):
+    return ('unavailable', None, {'n': n, 'reason': 'sympy absent in sandbox'})
 PCE_AFFINE = [(0, 0), (1, 0), (0, 1)]
 PCE_BILINEAR = [(0, 0), (1, 0), (0, 1), (1, 1)]
 PCE_QUADRATIC = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
@@ -3094,7 +2714,7 @@ def goal_generalization_actions(h_eq: dict[str, Any], target_eq: dict[str, Any])
                 aux = ['colconst']
             elif lemma == 'a = b':
                 aux = ['const']
-            action = {'kind': 'tool_call', 'tool': 'standard_aux_superposition', 'target': 'goal', 'lemmas': aux or ['const', 'proj_l', 'proj_r', 'rowconst'], 'budget': 10, 'why': reason}
+            action = {'kind': 'tool_call', 'tool': 'standard_aux_superposition', 'target': 'goal', 'lemmas': aux or ['const', 'proj_l', 'proj_r', 'rowconst', 'colconst'], 'budget': 10, 'why': reason}
         else:
             action = {'kind': 'midpoint', 'lemma': lemma, 'why': reason}
         actions.append({'card': card, 'lemma': lemma, 'reason': reason, 'action': action})
@@ -3915,6 +3535,11 @@ def pc_render(target_id: int, recs: list[dict[str, Any]], goal_vars: list[str], 
             if calc_line is not None:
                 lines.append(calc_line)
                 return '\n'.join(lines)
+    if target_rec['deriv'] is None and goal_lhs is not None and (goal_rhs is not None):
+        base_exact = pc_target_exact_line(lemma_name(target_id), target_rec['lhs'], target_rec['rhs'], target_rec['binders'], goal_lhs, goal_rhs)
+        if base_exact is not None:
+            lines.append(base_exact)
+            return '\n'.join(lines)
     lines.append('grind')
     return '\n'.join(lines)
 
@@ -4842,7 +4467,7 @@ def standard_aux_order(call: dict[str, Any] | None=None) -> list[str]:
     out: list[str] = []
     for item in raw:
         item = item.lower()
-        item = {'projection_left': 'proj_l', 'left_projection': 'proj_l', 'projection_right': 'proj_r', 'right_projection': 'proj_r', 'row_constant': 'rowconst', 'row_const': 'rowconst', 'column_constant': 'colconst', 'col_const': 'colconst', 'colconstant': 'colconst'}.get(item, item)
+        item = {'projection_left': 'proj_l', 'left_projection': 'proj_l', 'projection_right': 'proj_r', 'right_projection': 'proj_r', 'row_constant': 'rowconst', 'row_const': 'rowconst'}.get(item, item)
         if item in STANDARD_AUX_EQUATIONS and item not in out:
             out.append(item)
     return out
@@ -5051,7 +4676,7 @@ def rigidity_collapse_portfolio_attempt(h_eq: dict[str, Any], g_eq: dict[str, An
     remaining = deadline - time.monotonic()
     if remaining > 1.0:
         entry_started = time.monotonic()
-        aux_body, aux_entry_state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst'], 'budget': float(aux_spec['entry_cpu_budget']), 'wall_budget': remaining, 'cpu_budgeted': True})
+        aux_body, aux_entry_state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst', 'colconst'], 'budget': float(aux_spec['entry_cpu_budget']), 'wall_budget': remaining, 'cpu_budgeted': True})
         frontier = latest_midpoint_recommendation([aux_entry_state])
         frontier_advice = None
         if frontier is not None:
@@ -5072,7 +4697,7 @@ def rigidity_collapse_portfolio_attempt(h_eq: dict[str, Any], g_eq: dict[str, An
         if family_name == square_spec['name'] and seeded_square is not None:
             body, state = rigidity_collapse_ladder_attempt(h_eq, g_eq, {'budget': remaining, 'cpu_budgeted': True, '_seeded_entry': seeded_square})
         elif family_name == aux_spec['name'] and aux_entry_state is not None:
-            body, state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst'], 'budget': float(aux_spec['renewal_cpu_budget']), 'wall_budget': remaining, 'cpu_budgeted': True})
+            body, state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst', 'colconst'], 'budget': float(aux_spec['renewal_cpu_budget']), 'wall_budget': remaining, 'cpu_budgeted': True})
         else:
             continue
         continuation_states.append({'family': family_name, 'status': 'body_built' if body else 'stuck', 'state': state})
@@ -5097,7 +4722,7 @@ def native_deep_true_candidates(h_eq: dict[str, Any], g_eq: dict[str, Any], budg
             yield ('broad_grounding_derived', body, state)
     remaining = deadline - time.monotonic()
     if remaining > 1.0:
-        body, state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst'], 'budget': min(12.0, max(1.0, remaining * 0.35))})
+        body, state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst', 'colconst'], 'budget': min(12.0, max(1.0, remaining * 0.35))})
         if body:
             yield ('standard_aux_superposition', body, state)
     for route, body in native_saturation_bodies(h_eq, g_eq):
@@ -6017,7 +5642,7 @@ def tool_registry_text(capability_mask: Any=None, *, include_research_tools: boo
 def sidecar_fewshots(h_eq: dict[str, Any]) -> str:
     nargs = len(h_eq['variables'])
     example_args = ['x'] * nargs
-    return '\n'.join(['If H has right-square absorption shape, use:', '{"kind":"tool_call","tool":"right_square_chain","target":"goal","budget":15}', 'or the generic helper chain:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}', 'If H has repeated self-absorption but does not match a focused renderer, try the standard helper-chain portfolio:', '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["generic_right_square_absorption"],"budget":12}', 'If H has nested-tail absorption x = (y ◇ (z ◇ x)) ◇ (w ◇ x), use:', '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["nested_tail_absorption"],"budget":36}', 'If H has square-witness/sandwich shape, use:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}', 'If H has square-rowconst grounding shape, use:', '{"kind":"tool_call","tool":"grounding_derived","target":"goal","budget":12}', 'If H is orientable but seems to need a derived collapse/factor-irrelevance helper, use:', '{"kind":"tool_call","tool":"broad_grounding_derived","target":"goal","budget":12}', 'If shallow h-instances almost connect the goal, use graph-first proof battery:', '{"kind":"tool_call","tool":"proof_battery","target":"goal","max_graph_candidates":3}', 'If feedback asks for a bridge, use lemma_hint with equations and optional seed_h_args:', json.dumps({'kind': 'tool_call', 'tool': 'lemma_hint', 'target': 'goal', 'lemmas': [{'equation': '<left frontier> = <right frontier>', 'seed_h_args': [example_args]}]}, ensure_ascii=False), 'If graph search is stuck and no focused family applies, try broad proof-carrying superposition:', '{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8}', 'If the goal may collapse under a standard lemma, try auxiliary superposition:', '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10}', 'If feedback says a stronger helper was refuted_by_small_model, do not repeat that helper; use the closest non-refuted bridge instead.', 'Observed repair: if rowconst times out but closest_equations expose a narrower right-argument contraction, follow the frontier instead of repeating rowconst:', '{"kind":"candidate_bundle","candidates":[{"lemma":"a ◇ ((b ◇ c) ◇ d) = a ◇ b"},{"lemma":"a ◇ (b ◇ c) = a ◇ b"}],"why":"rank the closest mechanically reached contraction families"}', 'Repair example: if feedback says rowconst was the target but direct opconst is not refuted, opconst can be a useful stronger bridge:', '{"kind":"midpoint","lemma":"a ◇ b = c ◇ d","why":"derived opconst-like bridge was not refuted and would consume row/product goals"}', 'Repair example: if rowconst `a ◇ b = a ◇ c` is proved but not consumed, add a non-refuted follow-up helper rather than repeating rowconst alone:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"rowconst","equation":"a ◇ b = a ◇ c"},{"name":"right_contract","equation":"a ◇ ((b ◇ c) ◇ d) = a ◇ b"}]}', 'Dependency warning: proj_l and proj_r are normally competing alternatives, not consecutive rungs. Put independent alternatives in candidate_bundle; use lemma_chain only when each later lemma plausibly follows using earlier proved lemmas.', '{"kind":"candidate_bundle","candidates":[{"lemma":"a ◇ b = a"},{"lemma":"a ◇ b = b"}],"why":"rank alternative projection families; do not spend one ordered chain on incompatible branches"}', 'Projection warning: a proved closest-pair midpoint can still be too goal-specific; if projection-shaped feedback is visible, test reusable projection alternatives separately.', 'If feedback says a projection aux was proved but not consumed, ask standard_aux_superposition for the opposite projection too:', '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["proj_l","proj_r"],"budget":10}', 'If H has repeated self-absorption form x = T[x,x,...], use a short concrete lemma_chain of absorption/contraction bridges instead of repeating the whole goal as one midpoint:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"absorb_step","equation":"<fill from closest_pairs>"},{"name":"goal_bridge","equation":"<fill from the remaining gap>"}]}', 'Negative-to-repair example: a large literal frontier followed by proj_l and proj_r is a bad ordered chain: the large first rung can consume the budget, and the two projections are alternatives. Abstract the frontier first. If a = b times out but the proof-carrying evidence reaches idempotence, use the dependency ladder idempotence, one supported projection, then collapse:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"idempotence","equation":"a = a ◇ a"},{"name":"proj_l","equation":"a ◇ b = a"},{"name":"collapse","equation":"a = b"}]}', 'If the frontier does not support collapse, strip its repeated outer context and propose a small absorption, factor-irrelevance, or contraction law. Never repeat a large unproved_with_budget frontier unchanged.', 'Repair example: for right-square absorption, do not stop after one helper; use the two-lemma chain:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}', 'Repair example: for square-sandwich hypotheses, square_const/right_id alone may be proved_not_consumed; add sandwich helpers:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}', 'Repair example: if a proposed midpoint simply repeats the target goal, replace it with reusable helper lemmas; for square-sandwich feedback use the four-lemma chain above.', 'If false, prefer concrete untried routes:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"local_search","routes":["local_search:n=6:seed=2"],"budget":6}', 'Natural false-search hints are also accepted:', '{"kind":"false_model_hint","template":"local_search","sizes":[5,6,7],"seeds":[0,1,2],"time_budget":12}', 'For deterministic native witness families, use:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["structured_ce:max_n=7"],"budget":8}', 'If false and a complete small-size check is useful, ask for propagation model finding:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder","routes":["model_finder:n=4"],"budget":6}', 'If false and ordinary finite search is sparse, ask for the goal-directed model finder:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"model_finder_v2","routes":["model_finder_v2:n=6"],"budget":8}', 'If exact finite-domain CP-SAT is available and small sizes need proof/witness search, ask for:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"cp_sat","routes":["cp_sat:n=5"],"budget":10}', 'If ordinary table search stalls, try a compact quotient-by-fiber extension. A 2x3 route synthesizes a two-element quotient and affine local maps on three-element fibers; a failed state recommends changed factors:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"skew_product","routes":["skew_product:2x3"],"budget":4}', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"sympy_sat","routes":["sympy_sat:n=6"],"budget":120}', 'If false may need a structured larger witness, ask for polynomial magma search:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}', 'If fixed routes are exhausted, propose one coherent finite operation family. Prefer residue/block/diagonal/affine rules over arbitrary patches:', '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}', 'If family feedback says repair_h_preserve_g, keep the G-breaking example and change rules touching h_profile.hot_cells. If it says break_g_preserve_h, preserve the default law and add one coherent region that separates the goal.', 'If H has a lone variable returned through nested left translations, try an unbounded residue-controlled ray. The mechanical tool searches clamped-affine parameters and compiles only proof-supported candidates:', '{"kind":"tool_call","tool":"residue_ray_countermodel","target":"goal","moduli":[2],"a_values":[-1,0,1],"b_values":[-1,0,1],"c_values":[-1,0,1],"candidate_cap":2000,"budget":2}'])
+    return '\n'.join(['If H has right-square absorption shape, use:', '{"kind":"tool_call","tool":"right_square_chain","target":"goal","budget":15}', 'or the generic helper chain:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_absorb","equation":"u ◇ (v ◇ v) = v"},{"name":"right_square","equation":"u ◇ v = v ◇ v"}]}', 'If H has repeated self-absorption but does not match a focused renderer, try the standard helper-chain portfolio:', '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["generic_right_square_absorption"],"budget":12}', 'If H has nested-tail absorption x = (y ◇ (z ◇ x)) ◇ (w ◇ x), use:', '{"kind":"tool_call","tool":"helper_chain_portfolio","target":"goal","chains":["nested_tail_absorption"],"budget":36}', 'If H has square-witness/sandwich shape, use:', '{"kind":"tool_call","tool":"lemma_chain","target":"goal","lemmas":[{"name":"square_const","equation":"u ◇ u = v ◇ v"},{"name":"right_id_square","equation":"u ◇ (v ◇ v) = u"},{"name":"sandwich","equation":"(v ◇ u) ◇ v = u"},{"name":"left_sandwich","equation":"v ◇ (u ◇ v) = u"}]}', 'If H has square-rowconst grounding shape, use:', '{"kind":"tool_call","tool":"grounding_derived","target":"goal","budget":12}', 'If H is orientable but seems to need a derived collapse/factor-irrelevance helper, use:', '{"kind":"tool_call","tool":"broad_grounding_derived","target":"goal","budget":12}', 'If shallow h-instances almost connect the goal, use graph-first proof battery:', '{"kind":"tool_call","tool":"proof_battery","target":"goal","max_graph_candidates":3}', 'If feedback asks for a bridge, use lemma_hint with equations and optional seed_h_args:', json.dumps({'kind': 'tool_call', 'tool': 'lemma_hint', 'target': 'goal', 'lemmas': [{'equation': '<left frontier> = <right frontier>', 'seed_h_args': [example_args]}]}, ensure_ascii=False), 'If graph search is stuck and no focused family applies, try broad proof-carrying superposition:', '{"kind":"tool_call","tool":"goal_superposition","target":"goal","budget":8}', 'If the goal may collapse under a standard lemma, try auxiliary superposition:', '{"kind":"tool_call","tool":"standard_aux_superposition","target":"goal","lemmas":["const","proj_l","proj_r","rowconst"],"budget":10}', 'If false, prefer concrete untried routes:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"local_search","routes":["local_search:n=6:seed=2"],"budget":6}', 'Natural false-search hints are also accepted:', '{"kind":"false_model_hint","template":"local_search","sizes":[5,6,7],"seeds":[0,1,2],"time_budget":12}', 'For deterministic native witness families, use:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","routes":["structured_ce:max_n=7"],"budget":8}', 'If false and ordinary finite search is sparse, ask for the goal-directed model finder:', 'If false may need a structured larger witness, ask for polynomial magma search:', '{"kind":"tool_call","tool":"false_model_search","target":"goal","template":"poly_ce","routes":["poly_ce:tier=2:nmax=13"],"budget":8}', 'If fixed routes are exhausted, propose one coherent finite operation family. Prefer residue/block/diagonal/affine rules over arbitrary patches:', '{"kind":"false_model_family","carrier_size":8,"default":{"kind":"affine","params":[1,0,0]},"rules":[{"when":{"kind":"diagonal"},"value":"i+1"}],"budget":8}', 'If family feedback says repair_h_preserve_g, keep the G-breaking example and change rules touching h_profile.hot_cells. If it says break_g_preserve_h, preserve the default law and add one coherent region that separates the goal.', 'If H has a lone variable returned through nested left translations, try an unbounded residue-controlled ray. The mechanical tool searches clamped-affine parameters and compiles only proof-supported candidates:', '{"kind":"tool_call","tool":"residue_ray_countermodel","target":"goal","moduli":[2],"a_values":[-1,0,1],"b_values":[-1,0,1],"c_values":[-1,0,1],"candidate_cap":2000,"budget":2}'])
 
 def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool=False) -> str:
     ranked = []
@@ -6055,7 +5680,7 @@ def tool_advice(h_eq: dict[str, Any], g_eq: dict[str, Any], prefer_false: bool=F
     ranked.append({'tool': 'proof_battery', 'score': 46, 'why': 'Try old battery h-instance layers through the explicit equality graph before risky grind bodies.', 'call': {'kind': 'tool_call', 'tool': 'proof_battery', 'target': 'goal', 'max_graph_candidates': 3}})
     aux_score = 88 if standard_aux_plausible_h(h_eq) else 42
     aux_why = 'H has variables on only one side; try collapse/projection/rowconst lemmas through proof-carrying superposition.' if standard_aux_plausible_h(h_eq) else 'Try standard collapse/projection/rowconst lemmas through proof-carrying superposition and consume any proved helper.'
-    ranked.append({'tool': 'standard_aux_superposition', 'score': aux_score, 'why': aux_why, 'call': {'kind': 'tool_call', 'tool': 'standard_aux_superposition', 'target': 'goal', 'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst'], 'budget': 10}})
+    ranked.append({'tool': 'standard_aux_superposition', 'score': aux_score, 'why': aux_why, 'call': {'kind': 'tool_call', 'tool': 'standard_aux_superposition', 'target': 'goal', 'lemmas': ['const', 'proj_l', 'proj_r', 'rowconst', 'colconst'], 'budget': 10}})
     ranked.append({'tool': 'lemma_hint', 'score': 50, 'why': 'Use closest_pairs from mechanical feedback to propose a concrete bridge equation; never return the placeholder text.', 'call': {'kind': 'tool_call', 'tool': 'lemma_hint', 'target': 'goal', 'lemmas': ['<small bridge equation>']}})
     ranked.append({'tool': 'forward_saturation', 'score': 45, 'why': 'Try extra h-instantiation seed terms near the frontier.', 'call': {'kind': 'tool_call', 'tool': 'forward_saturation', 'target': 'goal', 'seed_terms': goal_terms(g_eq, 4), 'budget': 3}})
     ranked.append({'tool': 'goal_superposition', 'score': 43, 'why': 'Broad proof-carrying paramodulation consumer; useful when graph search needs unification-on-demand.', 'call': {'kind': 'tool_call', 'tool': 'goal_superposition', 'target': 'goal', 'budget': 8}})
@@ -6099,9 +5724,9 @@ def resource_heavy_grind_probe(route: str, body: str) -> dict[str, Any] | None:
     if 'grind' not in body or not any((family in route_name for family in ('deep_saturation', 'old_haves_grind'))):
         return None
     instance_count = len(re.findall('(?m)^\\s*have\\s+(?:sat|h)\\d+\\s*:?=', body))
-    if instance_count < 50:
+    if instance_count < 40:
         return None
-    return {'reason': 'resource_heavy_grind_probe', 'instance_count': instance_count, 'policy': 'Broad 50-plus-instance grind bodies may guide structured proof search but are not submitted to the judge.'}
+    return {'reason': 'resource_heavy_grind_probe', 'instance_count': instance_count, 'policy': 'Broad 40-plus-instance grind bodies may guide structured proof search but are not submitted to the judge.'}
 
 def decisive_true_judge_rejection(result: dict[str, Any]) -> bool:
     if result.get('status') not in {'incorrect', 'rejected', 'invalid'}:
@@ -6121,6 +5746,7 @@ def judge_true_attributed(route: str, body: str, *, source: str='baby_solver', d
         print('ATTRIBUTION ' + json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
         return {'status': 'skipped', 'reason': 'duplicate_decisive_rejection'}
     emit_attribution_attempt(route, 'true', source=source, detail=detail)
+    _marathon_set_route(route)
     result = call_judge('true', code)
     record_judge_feedback(route, 'true', code, result, source=source)
     if decisive_true_judge_rejection(result):
@@ -6134,6 +5760,7 @@ def try_true_attributed(route: str, body: str, *, source: str='baby_solver', det
 def try_false_attributed(route: str, n: int, table: list[list[int]], *, source: str='baby_solver', detail: dict[str, Any] | None=None) -> bool:
     emit_attribution_attempt(route, 'false', source=source, detail=detail)
     code = make_false_code(n, table)
+    _marathon_set_route(route)
     result = call_judge('false', code)
     record_judge_feedback(route, 'false', code, result, source=source)
     return result.get('status') == 'accepted'
@@ -6145,6 +5772,7 @@ def try_false_artifact_attributed(route: str, found: tuple[Any, ...], *, source:
         formula_route = f'{route}:formula'
         emit_attribution_attempt(formula_route, 'false', source=source, detail=detail)
         code = make_false_formula_code(n, found[2])
+        _marathon_set_route(formula_route)
         result = call_judge('false', code)
         record_judge_feedback(formula_route, 'false', code, result, source=source)
         if result.get('status') == 'accepted':
@@ -6152,12 +5780,14 @@ def try_false_artifact_attributed(route: str, found: tuple[Any, ...], *, source:
     table_route = f'{route}:table'
     emit_attribution_attempt(table_route, 'false', source=source, detail=detail)
     code = make_false_code(n, table)
+    _marathon_set_route(table_route)
     result = call_judge('false', code)
     record_judge_feedback(table_route, 'false', code, result, source=source)
     return result.get('status') == 'accepted'
 
 def judge_infinite_model_artifact_attributed(route: str, code: str, *, source: str='research_protocol', detail: dict[str, Any] | None=None) -> dict[str, Any]:
     emit_attribution_attempt(route, 'false', source=source, detail={'certificate_class': 'infinite_model', 'artifact_bytes': len(code.encode('utf-8')), **(detail or {})})
+    _marathon_set_route(route)
     result = call_judge('false', code)
     record_judge_feedback(route, 'false', code, result, source=source)
     return result
@@ -7121,6 +6751,855 @@ def try_llm_collaboration(h_eq: dict[str, Any], g_eq: dict[str, Any], budget: fl
         feedback_sink.clear()
         feedback_sink.extend([*mechanical_feedback[-9:], protocol_state('CandidateBlackboardState', 'snapshot', 'candidate_blackboard', blackboard=candidate_blackboard.snapshot())])
     return None
+import os as _os
+_MARATHON_MODE = False
+_MARATHON_PROBLEM: dict[str, Any] | None = None
+_MARATHON_OUT = None
+_MARATHON_ROUTE = ''
+_MARATHON_SLICE_DEADLINE = 0.0
+_MARATHON_WINNER: dict[str, Any] | None = None
+_MARATHON_FALLBACK: dict[str, Any] | None = None
+_MARATHON_FALLBACK_RANK = -1
+_MARATHON_PPCC_SEEDS: list = []
+_MARATHON_PPCC_SAT_TRIES = 0
+_MARATHON_PPCC_LAST_SAT = -1
+
+def _marathon_set_route(route: str) -> None:
+    global _MARATHON_ROUTE
+    _MARATHON_ROUTE = route
+
+def _marathon_cert_is_safe(verdict: str, code: str, route: str) -> bool:
+    if verdict == 'false' and 'residue_ray_countermodel' in route and ('Bool × Nat' in code):
+        return True
+    if not route.startswith('native:'):
+        return False
+    if verdict == 'false':
+        return 'decideFin!' in code
+    verified = _marathon_checker_verify(code)
+    if verified is not None:
+        return verified
+    lines = code.rstrip().splitlines()
+    if not lines:
+        return False
+    return not lines[-1].strip().startswith('grind')
+
+def _marathon_checker_verify(code: str):
+    fn = globals().get('_mc_verify_true_cert')
+    if fn is None:
+        return None
+    prob = _MARATHON_PROBLEM or {}
+    try:
+        ls, rs = str(prob['equation1']).split('=', 1)
+        gl, gr = str(prob['equation2']).split('=', 1)
+        hl = _mc_parse_term(ls)
+        hr = _mc_parse_term(rs)
+        return bool(fn(code, hl, hr, _mc_var_order(hl, hr), _mc_parse_term(gl), _mc_parse_term(gr)))
+    except Exception:
+        return False
+
+def _marathon_grind_args(code: str):
+    tuples = []
+    for line in code.splitlines():
+        m = re.match('\\s*have \\w+ := h (.+)$', line.rstrip())
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        atoms = []
+        depth = 0
+        cur = ''
+        for ch in rest:
+            if ch == '(':
+                depth += 1
+                cur += ch
+            elif ch == ')':
+                depth -= 1
+                cur += ch
+            elif ch == ' ' and depth == 0:
+                if cur:
+                    atoms.append(cur)
+                    cur = ''
+            else:
+                cur += ch
+        if cur:
+            atoms.append(cur)
+        try:
+            tuples.append(tuple((_mc_parse_term(a) for a in atoms)))
+        except Exception:
+            pass
+    return tuples
+
+def _marathon_ppcc_convert(code: str):
+    if '_pp_prove_from_instances' not in globals():
+        return None
+    prob = _MARATHON_PROBLEM or {}
+    try:
+        ls, rs = str(prob['equation1']).split('=', 1)
+        gl, gr = str(prob['equation2']).split('=', 1)
+        hl = _mc_parse_term(ls)
+        hr = _mc_parse_term(rs)
+        hv = _mc_var_order(hl, hr)
+        gL = _mc_parse_term(gl)
+        gR = _mc_parse_term(gr)
+        global _MARATHON_PPCC_SEEDS, _MARATHON_PPCC_SAT_TRIES, _MARATHON_PPCC_LAST_SAT
+        _MARATHON_PPCC_SEEDS.extend(_marathon_grind_args(code))
+        body = _pp_prove_from_instances(hl, hr, hv, gL, gR, _MARATHON_PPCC_SEEDS)
+        if not body or len(body.encode('utf-8')) > 95000:
+            grew = len(_MARATHON_PPCC_SEEDS) >= _MARATHON_PPCC_LAST_SAT + 6
+            if grew and _MARATHON_PPCC_SAT_TRIES < 3:
+                remaining = _MARATHON_SLICE_DEADLINE - time.monotonic()
+                if remaining > 30.0:
+                    _MARATHON_PPCC_SAT_TRIES += 1
+                    _MARATHON_PPCC_LAST_SAT = len(_MARATHON_PPCC_SEEDS)
+                    alt = _pp_saturate_and_prove(hl, hr, hv, gL, gR, seed_tuples=_MARATHON_PPCC_SEEDS, budget_s=min(120.0, remaining * 0.4))
+                    if alt is not None and (not body or len(alt) < len(body)):
+                        body = alt
+        if not body:
+            return None
+        cert = make_true_code(body)
+        if len(cert.encode('utf-8')) > 100000:
+            return None
+        if _mc_verify_true_cert(cert, hl, hr, hv, gL, gR):
+            return cert
+    except Exception:
+        return None
+    return None
+
+def _marathon_emit(entry: dict[str, Any]) -> None:
+    if _MARATHON_OUT is None or _MARATHON_PROBLEM is None:
+        return
+    _MARATHON_OUT.write(json.dumps({'id': _MARATHON_PROBLEM.get('id'), 'verdict': entry['verdict'], 'code': entry['code']}, ensure_ascii=False) + '\n')
+    _MARATHON_OUT.flush()
+    try:
+        _os.fsync(_MARATHON_OUT.fileno())
+    except OSError:
+        pass
+
+def _marathon_judge_surrogate(verdict: str, code: str) -> dict[str, Any]:
+    global _MARATHON_WINNER, _MARATHON_FALLBACK, _MARATHON_FALLBACK_RANK, _MARATHON_ROUTE
+    route, _MARATHON_ROUTE = (_MARATHON_ROUTE, '')
+    cap = 20000 if verdict == 'false' else 100000
+    if len(code.encode('utf-8')) > cap:
+        return {'status': 'malformed', 'reason': 'marathon_code_over_cap'}
+    if _marathon_cert_is_safe(verdict, code, route):
+        _MARATHON_WINNER = {'verdict': verdict, 'code': code}
+        _marathon_emit(_MARATHON_WINNER)
+        return {'status': 'accepted'}
+    if verdict == 'true':
+        _lg = code.rstrip().splitlines()
+        if _lg and _lg[-1].strip().startswith('grind'):
+            _alt = _marathon_ppcc_convert(code)
+            if _alt is not None:
+                _MARATHON_WINNER = {'verdict': 'true', 'code': _alt}
+                _marathon_emit(_MARATHON_WINNER)
+                return {'status': 'accepted'}
+    _last = code.rstrip().splitlines()
+    _grind = bool(_last) and _last[-1].strip().startswith('grind')
+    if not route.startswith('native:'):
+        rank = 0
+    elif _grind:
+        rank = 1
+    else:
+        rank = 2
+    grew = False
+    if rank == 1 and _MARATHON_FALLBACK_RANK == 1 and (_MARATHON_FALLBACK is not None):
+        _n_new = code.count('have ')
+        _n_old = _MARATHON_FALLBACK['code'].count('have ')
+        grew = _n_old < _n_new <= 38
+    if rank > _MARATHON_FALLBACK_RANK or grew:
+        _MARATHON_FALLBACK_RANK = rank
+        _MARATHON_FALLBACK = {'verdict': verdict, 'code': code}
+        _marathon_emit(_MARATHON_FALLBACK)
+    return {'status': 'incorrect', 'reason': 'marathon_deferred_unverified_candidate', 'message': 'Not a Lean rejection: this certificate was banked as a fallback because it is unverified (a bare-grind close, or an unverified proposal). Produce a proof whose final step is an explicit term (exact/calc), which can be trusted without a judge.'}
+
+def _marathon_fill_prompt(context: dict[str, Any]) -> str:
+    prob = _MARATHON_PROBLEM or {}
+    e1 = prob.get('eq1_id', '')
+    e2 = prob.get('eq2_id', '')
+    variables = {'problem.id': str(prob.get('id', '')), 'problem.eq1_id': str(e1), 'problem.eq2_id': str(e2), 'problem.eq1_name': f'Equation{e1}', 'problem.eq2_name': f'Equation{e2}', 'problem.equation1': str(prob.get('equation1', '')), 'problem.equation2': str(prob.get('equation2', '')), 'problem.equation1_id': f'Equation{e1}', 'problem.equation2_id': f'Equation{e2}', 'history.attempts': '', 'history.round': '0', 'history.last_error': '', 'history.last_status': ''}
+    variables.update({f'solver.{k}': str(v) for k, v in context.items()})
+    result = PROMPT
+    for key, value in variables.items():
+        result = result.replace('{' + key + '}', value)
+    return re.sub('\\{(problem|solver|history)\\.[a-zA-Z_]+\\}', '', result)
+
+def _marathon_call_llm(context: dict[str, Any], model: str | None) -> dict[str, Any]:
+    remaining = _MARATHON_SLICE_DEADLINE - time.monotonic()
+    if remaining <= 5.0:
+        return {'error': 'marathon slice exhausted; skipping LLM call'}
+    try:
+        from marathon_llm import budget_remaining, call_llm as _proxy_call
+    except Exception as exc:
+        return {'error': f'marathon_llm unavailable: {exc}'}
+    left = budget_remaining()
+    if left != -1 and left < 40000:
+        return {'error': 'marathon token budget nearly exhausted; skipping LLM call'}
+    prompt = _marathon_fill_prompt(context)
+    cfg: dict[str, Any] = {'max_output_tokens': 8192}
+    if model:
+        cfg['model'] = model
+    try:
+        resp = _proxy_call(prompt, config=cfg, max_seconds=max(1.0, remaining - 2.0))
+    except Exception as exc:
+        return {'error': f'marathon_llm call failed: {exc}'}
+    if resp.get('error'):
+        return {'error': str(resp.get('error'))}
+    return {'response': resp.get('response', '')}
+
+def run_marathon() -> None:
+    global _MARATHON_MODE, _MARATHON_PROBLEM, _MARATHON_OUT, _MARATHON_ROUTE
+    global _MARATHON_SLICE_DEADLINE, _MARATHON_WINNER, _MARATHON_FALLBACK, _MARATHON_FALLBACK_RANK
+    global _MARATHON_PPCC_SEEDS, _MARATHON_PPCC_SAT_TRIES, _MARATHON_PPCC_LAST_SAT
+    _MARATHON_MODE = True
+    deadline = time.monotonic() + float(_os.environ.get('JUDGE_MARATHON_BUDGET_SECONDS', '3600'))
+    with open(_os.environ['JUDGE_MARATHON_MANIFEST'], encoding='utf-8') as fh:
+        problems = [json.loads(line) for line in fh if line.strip()]
+    with open(_os.environ['JUDGE_MARATHON_OUTPUT'], 'a', encoding='utf-8') as out:
+        _MARATHON_OUT = out
+        for index, prob in enumerate(problems):
+            remaining_wall = deadline - time.monotonic()
+            remaining_problems = len(problems) - index
+            if remaining_wall <= 2.0:
+                break
+            prob_budget = max(5.0, min(1000.0, remaining_wall - 10.0 * (remaining_problems - 1)))
+            _MARATHON_PROBLEM = prob
+            _MARATHON_ROUTE = ''
+            _MARATHON_WINNER = None
+            _MARATHON_FALLBACK = None
+            _MARATHON_FALLBACK_RANK = -1
+            _MARATHON_PPCC_SEEDS = []
+            _MARATHON_PPCC_SAT_TRIES = 0
+            _MARATHON_PPCC_LAST_SAT = -1
+            _MARATHON_SLICE_DEADLINE = time.monotonic() + prob_budget
+            try:
+                solve(prob, prob_budget)
+            except Exception:
+                pass
+    _MARATHON_OUT = None
+import itertools
+'Pure-Python proof checker for our own TRUE certificates (no Lean).\n\n_mc_verify_true_cert(code, Hl, Hr, Hvars, gL, gR) -> bool  (True only if SOUNDLY verified).\nFail-safe: any shape/token it does not understand -> False (caller banks, as today).\n\nHandles the shapes our solver emits: calc chains, exact-terms, have-lemma tables\n(superposition derivations via congrArg / .symm / .trans), and ground `grind`\nbodies (via ground congruence closure over the emitted h-instances).'
+_mc_HOLE = ('v', '__HOLE__')
+
+def _mc__tok(s):
+    return s.replace('◇', ' ◇ ').replace('*', ' ◇ ').replace('(', ' ( ').replace(')', ' ) ').split()
+
+def _mc__pexpr(tk, i):
+
+    def atom(i):
+        if tk[i] == '(':
+            n, i = _mc__pexpr(tk, i + 1)
+            assert tk[i] == ')'
+            return (n, i + 1)
+        return (('v', tk[i]), i + 1)
+    left, i = atom(i)
+    while i < len(tk) and tk[i] == '◇':
+        right, i = atom(i + 1)
+        left = ('op', left, right)
+    return (left, i)
+
+def _mc_parse_term(s):
+    t, _ = _mc__pexpr(_mc__tok(s), 0)
+    return t
+
+def _mc_subst(t, sig):
+    if t[0] == 'v':
+        return sig.get(t[1], t)
+    return ('op', _mc_subst(t[1], sig), _mc_subst(t[2], sig))
+
+def _mc_var_order(lhs, rhs):
+    order = []
+    seen = set()
+
+    def walk(t):
+        if t[0] == 'v':
+            if t[1] not in seen:
+                seen.add(t[1])
+                order.append(t[1])
+        else:
+            walk(t[1])
+            walk(t[2])
+    walk(lhs)
+    walk(rhs)
+    return order
+
+def _mc__ptok(s):
+    s = s.replace('(', ' ( ').replace(')', ' ) ').replace('.symm', ' .symm ').replace('.trans', ' .trans ')
+    s = s.replace('=>', ' => ').replace('◇', ' ◇ ')
+    return s.split()
+
+def _mc__read_magma_atom(tk, i):
+    if tk[i] == '(':
+        depth = 0
+        j = i
+        while j < len(tk):
+            if tk[j] == '(':
+                depth += 1
+            elif tk[j] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        return (_mc_parse_term(' '.join(tk[i:j + 1])), j + 1)
+    return (('v', tk[i]), i + 1)
+
+class _mc_ProofError(Exception):
+    pass
+
+class _mc_Env:
+
+    def __init__(self, Hl, Hr, Hvars):
+        self.Hl, self.Hr, self.Hvars = (Hl, Hr, Hvars)
+        self.names = {}
+
+def _mc_eval_proof(tk, i, env):
+    (l, r), i = _mc__eval_atom(tk, i, env)
+    while i < len(tk) and tk[i] in ('.symm', '.trans'):
+        if tk[i] == '.symm':
+            l, r = (r, l)
+            i += 1
+        else:
+            (cl, cr), i = _mc__eval_atom(tk, i + 1, env)
+            if l == r and l is None:
+                raise _mc_ProofError('trans on rfl')
+            if r != cl:
+                raise _mc_ProofError(f'trans middle mismatch')
+            r = cr
+    return ((l, r), i)
+
+def _mc__eval_atom(tk, i, env):
+    t = tk[i]
+    if t == '(':
+        (l, r), k = _mc_eval_proof(tk, i + 1, env)
+        assert tk[k] == ')'
+        return ((l, r), k + 1)
+    if t == 'congrArg':
+        assert tk[i + 1] == '('
+        depth = 0
+        j = i + 1
+        while True:
+            if tk[j] == '(':
+                depth += 1
+            elif tk[j] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        lam = tk[i + 2:j]
+        ctx = _mc__lambda_ctx(lam)
+        (pl, pr), k = _mc__eval_atom(tk, j + 1, env)
+        return ((_mc_subst(ctx, {'__HOLE__': pl}), _mc_subst(ctx, {'__HOLE__': pr})), k)
+    if t == 'rfl':
+        return ((('v', '__RFL__'), ('v', '__RFL__')), i + 1)
+    if t == 'h':
+        args = []
+        k = i + 1
+        while k < len(tk) and tk[k] not in (')', '.symm', '.trans'):
+            a, k = _mc__read_magma_atom(tk, k)
+            args.append(a)
+        sig = {env.Hvars[m]: args[m] for m in range(min(len(args), len(env.Hvars)))}
+        return ((_mc_subst(env.Hl, sig), _mc_subst(env.Hr, sig)), k)
+    if t in env.names:
+        entry = env.names[t]
+        if entry[0] == 'eq':
+            return ((entry[1], entry[2]), i + 1)
+        _, vars_, L, R = entry
+        args = []
+        k = i + 1
+        while k < len(tk) and tk[k] not in (')', '.symm', '.trans') and (len(args) < len(vars_)):
+            a, k = _mc__read_magma_atom(tk, k)
+            args.append(a)
+        sig = {vars_[m]: args[m] for m in range(min(len(args), len(vars_)))}
+        return ((_mc_subst(L, sig), _mc_subst(R, sig)), k)
+    raise _mc_ProofError(f'unknown proof head: {t}')
+
+def _mc__lambda_ctx(lam):
+    if lam and lam[0] == '·':
+        return ('op', _mc_HOLE, _mc_parse_term(' '.join(lam[2:])))
+    if lam and lam[-1] == '·':
+        return ('op', _mc_parse_term(' '.join(lam[:-2])), _mc_HOLE)
+    if lam and lam[0] == 'fun':
+        holevar = lam[1]
+        arrow = lam.index('=>')
+        body = ' '.join(lam[arrow + 1:]).replace(holevar, '__HOLE__')
+        return _mc_parse_term(body)
+    raise _mc_ProofError('bad congrArg lambda')
+
+def _mc__split_semis(s):
+    out = []
+    depth = 0
+    cur = ''
+    for ch in s:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ';' and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return [x.strip() for x in out if x.strip()]
+
+def _mc__parse_forall_type(s):
+    m = re.match('∀\\s*\\(([^:]+):[^)]*\\)\\s*,\\s*(.+)$', s.strip())
+    if not m:
+        raise _mc_ProofError('bad forall type')
+    vars_ = m.group(1).split()
+    body = m.group(2)
+    L, R = body.split('=', 1)
+    return (vars_, _mc_parse_term(L), _mc_parse_term(R))
+
+def _mc__verify_forall(vars_, L, R, block, env):
+    local = _mc_Env(env.Hl, env.Hr, env.Hvars)
+    local.names = dict(env.names)
+    stmts = _mc__split_semis(block)
+    for st in stmts:
+        st = st.strip()
+        if st.startswith('intro'):
+            continue
+        if st.startswith('have '):
+            _mc__bind_have(st, local)
+        elif st.startswith('exact '):
+            (el, er), _ = _mc_eval_proof(_mc__ptok(st[len('exact '):]), 0, local)
+            if er == ('v', '__RFL__'):
+                return L == R
+            return (el, er) == (L, R)
+        else:
+            raise _mc_ProofError(f'unhandled stmt in forall: {st[:30]}')
+    raise _mc_ProofError('forall block had no exact')
+
+def _mc__bind_have(st, env):
+    body = st[len('have '):]
+    if ':=' not in body:
+        raise _mc_ProofError('have without :=')
+    head, proof = body.split(':=', 1)
+    proof = proof.strip()
+    if proof.startswith('by '):
+        name = head.split(':')[0].strip()
+        vars_, L, R = _mc__parse_forall_type(head.split(':', 1)[1])
+        if not _mc__verify_forall(vars_, L, R, proof[3:], env):
+            raise _mc_ProofError('nested forall failed')
+        env.names[name] = ('lemma', vars_, L, R)
+        return
+    if proof.startswith('fun '):
+        name = head.split(':')[0].strip()
+        vars_, L, R = _mc__parse_forall_type(head.split(':', 1)[1])
+        arrow = proof.index('=>')
+        body = proof[len('fun '):arrow].split()
+        pterm = proof[arrow + 2:]
+        (pl, pr), _ = _mc_eval_proof(_mc__ptok(pterm), 0, env)
+        ren = {body[k]: ('v', vars_[k]) for k in range(min(len(body), len(vars_)))}
+        if (_mc_subst(pl, ren), _mc_subst(pr, ren)) != (L, R):
+            raise _mc_ProofError('fun-lemma mismatch')
+        env.names[name] = ('lemma', vars_, L, R)
+        return
+    if ':' in head:
+        name = head.split(':')[0].strip()
+        tl, tr = (None, None)
+        typ = head.split(':', 1)[1]
+        L, R = typ.split('=', 1)
+        tl, tr = (_mc_parse_term(L), _mc_parse_term(R))
+        (pl, pr), _ = _mc_eval_proof(_mc__ptok(proof), 0, env)
+        if pr == ('v', '__RFL__'):
+            if tl != tr:
+                raise _mc_ProofError('rfl type mismatch')
+        elif (pl, pr) != (tl, tr):
+            raise _mc_ProofError('typed have mismatch')
+        env.names[name] = ('eq', tl, tr)
+    else:
+        name = head.strip()
+        (pl, pr), _ = _mc_eval_proof(_mc__ptok(proof), 0, env)
+        env.names[name] = ('eq', pl, pr)
+
+def _mc_verify_true_cert(code, Hl, Hr, Hvars, gL, gR):
+    try:
+        return _mc__verify(code, Hl, Hr, Hvars, gL, gR)
+    except Exception:
+        return False
+
+def _mc__verify(code, Hl, Hr, Hvars, gL, gR):
+    env = _mc_Env(Hl, Hr, Hvars)
+    lines = [l for l in code.splitlines()]
+    idx = 0
+    body = [l.rstrip() for l in lines]
+    grind_eqs = []
+    i = 0
+    while i < len(body):
+        s = body[i].strip()
+        if not s or s.startswith(('import', 'set_option', 'def submission')):
+            i += 1
+            continue
+        if s.startswith('intro'):
+            i += 1
+            continue
+        if s.startswith('have '):
+            _mc__bind_have(s, env)
+            entry = list(env.names.values())[-1]
+            if entry[0] == 'eq':
+                grind_eqs.append((entry[1], entry[2]))
+            i += 1
+            continue
+        if s.startswith('exact '):
+            (el, er), _ = _mc_eval_proof(_mc__ptok(s[len('exact '):]), 0, env)
+            if er == ('v', '__RFL__'):
+                return gL == gR
+            return (el, er) == (gL, gR)
+        if s.startswith('calc'):
+            head = s[len('calc'):].strip()
+            cur = _mc_parse_term(head) if head else None
+            i += 1
+            first = True
+            while i < len(body):
+                st = body[i].strip()
+                m = re.match('_\\s*=\\s*(.+?)\\s*:=\\s*(.+)$', st)
+                if not m:
+                    break
+                rhs = _mc_parse_term(m.group(1))
+                just = m.group(2)
+                (jl, jr), _ = _mc_eval_proof(_mc__ptok(just), 0, env)
+                if (cur, rhs) != (jl, jr):
+                    return False
+                cur = rhs
+                i += 1
+                first = False
+            return _mc_parse_term(head) == gL and cur == gR and (not first)
+        if s == 'rfl' or s.startswith('rfl'):
+            return gL == gR
+        if s.startswith('grind'):
+            return False
+        return False
+    return False
+'Proof-producing ground congruence closure -> explicit Lean calc chain.\nGiven H and a TRUE goal that follows from ground H-instances by congruence,\nemit a calc chain of single-position H-instance rewrites that the marathon\nchecker verifies (and Lean accepts). Checker-gated downstream => soundness-safe.'
+
+def _pp__subst(t, sig):
+    if t[0] == 'v':
+        return sig.get(t[1], t)
+    return ('op', _pp__subst(t[1], sig), _pp__subst(t[2], sig))
+
+def _pp__varorder(l, r):
+    order = []
+    seen = set()
+
+    def w(t):
+        if t[0] == 'v':
+            if t[1] not in seen:
+                seen.add(t[1])
+                order.append(t[1])
+        else:
+            w(t[1])
+            w(t[2])
+    w(l)
+    w(r)
+    return order
+
+def _pp_tsize(t):
+    return 1 if t[0] == 'v' else 1 + _pp_tsize(t[1]) + _pp_tsize(t[2])
+
+def _pp_subterms(t, acc):
+    acc.add(t)
+    if t[0] == 'op':
+        _pp_subterms(t[1], acc)
+        _pp_subterms(t[2], acc)
+
+def _pp_replace_at(t, path, new):
+    if not path:
+        return new
+    i = path[0]
+    if i == 0:
+        return ('op', _pp_replace_at(t[1], path[1:], new), t[2])
+    return ('op', t[1], _pp_replace_at(t[2], path[1:], new))
+
+def _pp__ckey(t):
+    return (_pp_tsize(t), _pp_rterm(t))
+
+def _pp_rterm(t, paren=False):
+    if t[0] == 'v':
+        return t[1]
+    s = f'{_pp_rterm(t[1], True)} ◇ {_pp_rterm(t[2], True)}'
+    return f'({s})' if paren else s
+
+class _pp_PPCC:
+
+    def __init__(self):
+        self.uf = {}
+        self.pp = {}
+        self.pl = {}
+        self.nodes = set()
+        self.adj = {}
+
+    def add(self, t):
+        if t in self.uf:
+            return
+        self.uf[t] = t
+        self.pp[t] = None
+        self.pl[t] = None
+        self.nodes.add(t)
+        if t[0] == 'op':
+            self.add(t[1])
+            self.add(t[2])
+
+    def find(self, t):
+        r = t
+        while self.uf[r] != r:
+            r = self.uf[r]
+        while self.uf[t] != r:
+            self.uf[t], t = (r, self.uf[t])
+        return r
+
+    def _reroot(self, a):
+        prev = None
+        plab = None
+        cur = a
+        while cur is not None:
+            nxt = self.pp[cur]
+            nlab = self.pl[cur]
+            self.pp[cur] = prev
+            self.pl[cur] = plab
+            prev = cur
+            plab = nlab
+            cur = nxt
+
+    def merge(self, a, b, reason):
+        self.adj.setdefault(a, []).append((b, reason))
+        self.adj.setdefault(b, []).append((a, reason))
+        if self.find(a) == self.find(b):
+            return
+        self._reroot(a)
+        self.pp[a] = b
+        self.pl[a] = reason
+        self.uf[self.find(a)] = self.find(b)
+
+    def shortest(self, a, b):
+        from collections import deque
+        came = {a: None}
+        q = deque([a])
+        while q:
+            x = q.popleft()
+            if x == b:
+                break
+            for y, reason in self.adj.get(x, []):
+                if y not in came:
+                    came[y] = (x, reason)
+                    q.append(y)
+        if b not in came:
+            return None
+        path = []
+        cur = b
+        while came[cur] is not None:
+            prev, reason = came[cur]
+            path.append((prev, cur, reason))
+            cur = prev
+        path.reverse()
+        return path
+
+    def close(self):
+        ops = sorted((t for t in self.nodes if t[0] == 'op'), key=_pp__ckey)
+        changed = True
+        while changed:
+            changed = False
+            sig = {}
+            for n in ops:
+                k = (self.find(n[1]), self.find(n[2]))
+                if k in sig:
+                    if self.find(n) != self.find(sig[k]):
+                        self.merge(n, sig[k], ('cong',))
+                        changed = True
+                else:
+                    sig[k] = n
+
+    def _anc(self, a):
+        out = []
+        cur = a
+        while cur is not None:
+            out.append(cur)
+            cur = self.pp[cur]
+        return out
+
+    def path_edges(self, a, b):
+        aa = self._anc(a)
+        bb = self._anc(b)
+        sb = set(bb)
+        lca = next((x for x in aa if x in sb))
+        up = []
+        cur = a
+        while cur != lca:
+            up.append((cur, self.pp[cur], self.pl[cur]))
+            cur = self.pp[cur]
+        down = []
+        cur = b
+        while cur != lca:
+            down.append((self.pp[cur], cur, self.pl[cur]))
+            cur = self.pp[cur]
+        down.reverse()
+        return up + down
+
+def _pp_rewrite_chain(cc, a, b, shortest=False):
+    if a == b:
+        return []
+    edges = cc.shortest(a, b) if shortest else cc.path_edges(a, b)
+    if edges is None:
+        return None
+    steps = []
+    for u, v, label in edges:
+        if label[0] == 'inst':
+            args = label[1]
+            direction = 'fwd' if label[2] == u else 'bwd'
+            steps.append(((), args, direction))
+        else:
+            s0 = _pp_rewrite_chain(cc, u[1], v[1], shortest)
+            s1 = _pp_rewrite_chain(cc, u[2], v[2], shortest)
+            if s0 is None or s1 is None:
+                return None
+            for pos, args, d in s0:
+                steps.append(((0,) + pos, args, d))
+            for pos, args, d in s1:
+                steps.append(((1,) + pos, args, d))
+    return steps
+
+def _pp_prove_from_instances(Hl, Hr, Hvars, gL, gR, arg_tuples, extra_pool=True):
+    cc = _pp_PPCC()
+    cc.add(gL)
+    cc.add(gR)
+    tuples = list(arg_tuples)
+    if extra_pool:
+        pool = set()
+        _pp_subterms(gL, pool)
+        _pp_subterms(gR, pool)
+        for tup in arg_tuples:
+            for a in tup:
+                _pp_subterms(a, pool)
+        pool = sorted(pool, key=_pp__ckey)
+        if len(pool) ** len(Hvars) <= 4000:
+            tuples += list(itertools.product(pool, repeat=len(Hvars)))
+    seen = set()
+    for tup in tuples:
+        key = tuple((_pp_rterm(a) for a in tup))
+        if key in seen:
+            continue
+        seen.add(key)
+        sig = {Hvars[k]: tup[k] for k in range(len(Hvars))}
+        L = _pp__subst(Hl, sig)
+        R = _pp__subst(Hr, sig)
+        cc.add(L)
+        cc.add(R)
+        cc.merge(L, R, ('inst', list(tup), L))
+    cc.close()
+    if cc.find(gL) != cc.find(gR):
+        return None
+    return _pp__best_body(cc, Hl, Hr, Hvars, gL, gR)
+import sys as _sys
+if _sys.getrecursionlimit() < 20000:
+    _sys.setrecursionlimit(20000)
+
+def _pp__best_body(cc, Hl, Hr, Hvars, gL, gR):
+    best = None
+    for shortest in (False, True):
+        try:
+            chain = _pp_rewrite_chain(cc, gL, gR, shortest=shortest)
+        except Exception:
+            chain = None
+        if not chain:
+            continue
+        body = _pp__render(Hl, Hr, Hvars, gL, gR, chain)
+        if body is None:
+            continue
+        if best is None or len(body) < len(best) or (len(body) == len(best) and body < best):
+            best = body
+    return best
+
+def _pp__chain_from(cc, gL, gR):
+    try:
+        return _pp_rewrite_chain(cc, gL, gR)
+    except Exception:
+        return None
+
+def _pp__build_cc(Hl, Hr, Hvars, tuples, gL, gR):
+    cc = _pp_PPCC()
+    cc.add(gL)
+    cc.add(gR)
+    for tup in sorted(tuples, key=lambda tp: tuple((_pp_rterm(a) for a in tp))):
+        sig = {Hvars[k]: tup[k] for k in range(min(len(tup), len(Hvars)))}
+        L = _pp__subst(Hl, sig)
+        R = _pp__subst(Hr, sig)
+        cc.add(L)
+        cc.add(R)
+        cc.merge(L, R, ('inst', list(tup), L))
+    cc.close()
+    return cc
+
+def _pp__render(Hl, Hr, Hvars, gL, gR, chain):
+    lines = ['calc ' + _pp_rterm(gL)]
+    cur = gL
+    for pos, args, direction in chain:
+        sig = {Hvars[k]: args[k] for k in range(len(Hvars))}
+        L = _pp__subst(Hl, sig)
+        R = _pp__subst(Hr, sig)
+        to = R if direction == 'fwd' else L
+        nxt = _pp_replace_at(cur, pos, to)
+        hpart = 'h ' + ' '.join((_pp_rterm(a, True) for a in args))
+        core = hpart if direction == 'fwd' else f'({hpart}).symm'
+        just = core if pos == () else f"congrArg (fun __pc_hole => {_pp_rterm(_pp_replace_at(cur, pos, ('v', '__pc_hole')))}) ({core})"
+        lines.append(f'  _ = {_pp_rterm(nxt)} := {just}')
+        cur = nxt
+    if cur != gR:
+        return None
+    gv = _pp__varorder(gL, gR)
+    return 'intro ' + ' '.join(gv) + '\n' + '\n'.join(lines)
+
+def _pp_saturate_and_prove(Hl, Hr, Hvars, gL, gR, seed_tuples=(), budget_s=60.0, pool_cap=40):
+    import time as _t
+    t0 = _t.time()
+    size_cap = max(_pp_tsize(gL), _pp_tsize(gR)) + 6
+    pool = set()
+    _pp_subterms(gL, pool)
+    _pp_subterms(gR, pool)
+    for tup in seed_tuples:
+        for a in tup:
+            _pp_subterms(a, pool)
+    tuples = set((tuple(t) for t in seed_tuples))
+    import itertools as _it
+    closed = False
+    for rd in range(1, 6):
+        pl = sorted(pool, key=_pp__ckey)[:pool_cap]
+        for tup in _it.product(pl, repeat=len(Hvars)):
+            if tup in tuples:
+                continue
+            tuples.add(tup)
+            sig = {Hvars[k]: tup[k] for k in range(len(Hvars))}
+            L = _pp__subst(Hl, sig)
+            R = _pp__subst(Hr, sig)
+            if _pp_tsize(L) <= size_cap:
+                _pp_subterms(L, pool)
+            if _pp_tsize(R) <= size_cap:
+                _pp_subterms(R, pool)
+            if _t.time() - t0 > budget_s:
+                break
+        cc = _pp__build_cc(Hl, Hr, Hvars, tuples, gL, gR)
+        if cc.find(gL) == cc.find(gR):
+            closed = True
+            break
+        if _t.time() - t0 > budget_s:
+            break
+    if not closed:
+        return None
+    chain = _pp__chain_from(cc, gL, gR)
+    if chain is None:
+        return _pp__best_body(cc, Hl, Hr, Hvars, gL, gR)
+    for _ in range(4):
+        used = set((tuple(args) for _, args, _ in chain))
+        if len(used) >= len(tuples):
+            break
+        cc2 = _pp__build_cc(Hl, Hr, Hvars, used, gL, gR)
+        if cc2.find(gL) != cc2.find(gR):
+            break
+        c2 = _pp__chain_from(cc2, gL, gR)
+        if c2 is None:
+            break
+        tuples = used
+        chain = c2
+        cc = cc2
+    return _pp__best_body(cc, Hl, Hr, Hvars, gL, gR)
 
 def solve(problem: dict[str, Any], budget: float) -> str:
     solve_started = time.monotonic()
@@ -7208,7 +7687,7 @@ def solve(problem: dict[str, Any], budget: float) -> str:
         early_aux_budget = min(4.0, max(1.0, budget * 0.02))
         if early_aux_lemmas:
             early_aux_budget = min(8.0, max(5.0 if any((kind in early_aux_lemmas for kind in ('proj_l', 'proj_r'))) else 4.0, budget * 0.025))
-        aux_body, aux_state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': early_aux_lemmas or ['const', 'proj_l', 'proj_r', 'rowconst'], 'budget': early_aux_budget})
+        aux_body, aux_state = standard_aux_superposition_attempt(h_eq, g_eq, {'lemmas': early_aux_lemmas or ['const', 'proj_l', 'proj_r', 'rowconst', 'colconst'], 'budget': early_aux_budget})
         if aux_body:
             result = judge_true_attributed('native:true:standard_aux_superposition_early', aux_body, source='native_early_true_tool', detail={'family': 'standard_aux_superposition', 'used_aux': aux_state.get('used_aux') if isinstance(aux_state, dict) else None})
             if result.get('status') == 'accepted':
@@ -7319,6 +7798,9 @@ def solve(problem: dict[str, Any], budget: float) -> str:
     return status or 'unsolved'
 
 def main() -> None:
+    if _os.environ.get('JUDGE_MARATHON_MANIFEST'):
+        run_marathon()
+        return
     startup = read_msg()
     problem = startup.get('problem', startup)
     budget = float(startup.get('budget', {}).get('timeout_seconds', 3600))
